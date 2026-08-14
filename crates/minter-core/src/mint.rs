@@ -821,6 +821,88 @@ fn cancelled(cancel: &Option<Arc<AtomicBool>>) -> bool {
         .unwrap_or(false)
 }
 
+/// Spacing between the T0 calldata requests of wallets that arrive unarmed.
+const GQL_STAGGER_STEP_MS: u64 = 25;
+
+/// Ceiling on the total spread, so the last wallet is not sent late enough to
+/// lose the drop in order to avoid a rate limit.
+const GQL_STAGGER_MAX_SPREAD_MS: u64 = 1_500;
+
+/// Gap to leave between unarmed wallets' calldata requests at T0.
+///
+/// Five wallets asking at once produced three 429s each holding 2.5 s — a limit
+/// the run inflicted on itself, and not one proxies help with, since all five
+/// were on different IPs and were limited anyway. Spreading is the only lever.
+/// The spread is capped: arriving a second late is recoverable, arriving after
+/// the drop sold out is not.
+fn gql_stagger_step_ms(unarmed: usize) -> u64 {
+    let gaps = unarmed.saturating_sub(1) as u64;
+    if gaps == 0 {
+        return 0;
+    }
+    GQL_STAGGER_STEP_MS.min(GQL_STAGGER_MAX_SPREAD_MS / gaps)
+}
+
+/// Total time one wallet may spend in waits OpenSea asked for.
+///
+/// Bounded because the server decides the length: without a ceiling a wallet
+/// could be parked past the end of the drop by a limit that keeps renewing.
+const RATE_LIMIT_WAIT_BUDGET_MS: u64 = 12_000;
+
+/// The wait OpenSea asked for, when this error is a rate limit and the wallet
+/// can still afford to honour it.
+///
+/// A rate limit is not a failure — it is the server saying "come back in N".
+/// The old path ignored N, slept a flat 100 ms, and spent one of only three GQL
+/// attempts doing it, so a 2.5 s hold was exhausted in 300 ms and the wallet
+/// was reported failed while the mint was still open. These waits therefore
+/// draw on their own budget: a genuine error should still give up after three
+/// tries.
+fn rate_limit_backoff(
+    err: &str,
+    addr: &Address,
+    budget_ms: &mut u64,
+) -> Option<std::time::Duration> {
+    let asked = match opensea::parse_retry_after_ms(err) {
+        Some(ms) => ms,
+        // No explicit instruction, so require unmistakable wording: a bare
+        // "429" also occurs inside wei values and tx hashes.
+        None => {
+            let lower = err.to_lowercase();
+            if lower.contains("too many requests") || lower.contains("rate limit") {
+                1000
+            } else {
+                return None;
+            }
+        }
+    };
+    if *budget_ms == 0 {
+        return None;
+    }
+    let wait = asked.min(*budget_ms);
+    *budget_ms -= wait;
+    // Wallets limited together must not return together — arriving in lockstep
+    // is what produced the limit. Spread them deterministically by address so
+    // the same wallet behaves the same way on every run.
+    let jitter = (addr.as_slice()[19] as u64 % 250) + 25;
+    Some(std::time::Duration::from_millis(wait + jitter))
+}
+
+/// Sleep that notices cancellation.
+///
+/// An honoured rate-limit wait can run to seconds, and the operator pressing
+/// stop must not have to wait it out.
+async fn sleep_cancellable(dur: std::time::Duration, cancel: &Option<Arc<AtomicBool>>) {
+    let deadline = std::time::Instant::now() + dur;
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline || cancelled(cancel) {
+            return;
+        }
+        tokio::time::sleep((deadline - now).min(std::time::Duration::from_millis(100))).await;
+    }
+}
+
 /// OpenSea mint orchestration.
 ///
 /// `cancel`: when set to true (best-effort), countdown aborts and workers stop
@@ -2332,6 +2414,12 @@ pub async fn run_opensea_mint(
                         format!("  Local PUBLIC_SALE calldata ready for {built} wallet(s)"),
                     );
                 } else {
+                    // Keep trying until the phase actually opens rather than
+                    // for a flat 10 s, so the window can never close before the
+                    // one moment a prefetch can succeed. The countdown aborts
+                    // these tasks at T0-50ms, so nothing here holds up the fire.
+                    let pf_deadline = std::time::Instant::now()
+                        + std::time::Duration::from_millis(remaining_ms.max(0) as u64);
                     for w in &wallets {
                         if !w.auth_ok || w.session.is_none() {
                             continue;
@@ -2348,12 +2436,36 @@ pub async fn run_opensea_mint(
 
                         let rep = reporter.clone();
                         prefetch_handles.spawn(async move {
-                            let deadline =
-                                std::time::Instant::now() + std::time::Duration::from_secs(10);
+                            // Back off instead of a fixed 500ms drumbeat. Before
+                            // a stage opens OpenSea refuses every one of these,
+                            // so a fixed interval turns the window into hundreds
+                            // of doomed requests across the wallet set —
+                            // rate-limit pressure built up in exactly the moment
+                            // we need OpenSea to answer. Backing off still
+                            // places attempts right up against T0, which is the
+                            // only moment one can succeed.
+                            let mut backoff = std::time::Duration::from_millis(500);
+                            let mut last_err = String::new();
+                            let mut attempts = 0u32;
                             loop {
-                                if std::time::Instant::now() > deadline {
+                                let now = std::time::Instant::now();
+                                if now >= pf_deadline {
+                                    // Why the wallet is unarmed used to be
+                                    // swallowed by NullReporter, leaving "0
+                                    // prefetched" with no reason anywhere.
+                                    if !last_err.is_empty() {
+                                        log_always(
+                                            rep.as_ref(),
+                                            format!(
+                                                "[{}] pre-fetch gave up after {attempts} tries: {}",
+                                                sign::shorten_address(&addr),
+                                                crate::safe_truncate(&last_err, 160)
+                                            ),
+                                        );
+                                    }
                                     return (addr, None);
                                 }
+                                attempts += 1;
                                 match fetch_and_parse_gql(
                                     &NullReporter,
                                     &session,
@@ -2375,15 +2487,26 @@ pub async fn run_opensea_mint(
                                         log_always(
                                             rep.as_ref(),
                                             format!(
-                                                "[{}] pre-fetch OK",
+                                                "[{}] pre-fetch OK (try {attempts})",
                                                 sign::shorten_address(&addr)
                                             ),
                                         );
                                         return (addr, Some(result));
                                     }
-                                    Err(_) => {
-                                        tokio::time::sleep(std::time::Duration::from_millis(500))
-                                            .await;
+                                    Err(e) => {
+                                        let err_str = format!("{e}");
+                                        // A limit here is self-inflicted. Honour
+                                        // the wait rather than spending the
+                                        // drop's budget arguing with it.
+                                        let wait = opensea::parse_retry_after_ms(&err_str)
+                                            .map(std::time::Duration::from_millis)
+                                            .unwrap_or(backoff);
+                                        last_err = err_str;
+                                        let left = pf_deadline
+                                            .saturating_duration_since(std::time::Instant::now());
+                                        tokio::time::sleep(wait.min(left)).await;
+                                        backoff =
+                                            (backoff * 2).min(std::time::Duration::from_secs(4));
                                     }
                                 }
                             }
@@ -2638,6 +2761,35 @@ pub async fn run_opensea_mint(
 
     let mut handles = tokio::task::JoinSet::new();
 
+    // Wallets that reach T0 unarmed must ask OpenSea for calldata at the very
+    // instant the stage opens. Sending all of them in the same millisecond is
+    // what produces the 429s the run then has to sit out. Spread only those, in
+    // a fixed order; wallets already signed go straight to the RPC and are
+    // never held back by this.
+    let gql_stagger_slots: HashMap<Address, u64> = {
+        let unarmed: Vec<Address> = wallets
+            .iter()
+            .filter(|w| w.auth_ok && w.pre_signed_tx.is_none() && w.prefetched_tx.is_none())
+            .map(|w| w.address)
+            .collect();
+        let step = gql_stagger_step_ms(unarmed.len());
+        if step > 0 {
+            log_always(
+                reporter.as_ref(),
+                format!(
+                    "  {} wallet(s) unarmed at open — spacing their OpenSea requests {}ms apart",
+                    unarmed.len(),
+                    step
+                ),
+            );
+        }
+        unarmed
+            .into_iter()
+            .enumerate()
+            .map(|(i, a)| (a, i as u64 * step))
+            .collect()
+    };
+
     for (_, w) in wallets.iter().enumerate() {
         if !w.auth_ok {
             continue;
@@ -2672,6 +2824,7 @@ pub async fn run_opensea_mint(
             });
         let initial_cached_tx = w.prefetched_tx.clone();
         let initial_pre_signed = w.pre_signed_tx.clone();
+        let stagger_ms = gql_stagger_slots.get(&addr).copied().unwrap_or(0);
         let initial_conditional_hash = w.conditional_hash;
         let max_attempts = max_attempts;
         let reporter = reporter.clone();
@@ -2704,6 +2857,8 @@ pub async fn run_opensea_mint(
             let mut sent_hashes: Vec<B256> = initial_conditional_hash.into_iter().collect();
             // Last failure message for exhaust path only (updated in place via helper).
             let mut last_error = String::new();
+            // Drawn down by every wait OpenSea asks for; see rate_limit_backoff.
+            let mut rate_limit_budget_ms = RATE_LIMIT_WAIT_BUDGET_MS;
             let mut max_fee = max_fee;
             let mut max_priority_fee = max_priority_fee;
             // Cap underpriced/RBF fee escalation: never exceed 4× fee at worker start.
@@ -2722,6 +2877,12 @@ pub async fn run_opensea_mint(
             };
             let mut logged_auto_skip = false;
             let mut logged_reuse = false;
+
+            // Only wallets with no calldata and no signed transaction get a
+            // slot here, so nothing that is ready to broadcast is delayed.
+            if stagger_ms > 0 {
+                sleep_cancellable(std::time::Duration::from_millis(stagger_ms), &cancel_w).await;
+            }
 
             loop {
                 if cancelled(&cancel_w) {
@@ -2910,6 +3071,27 @@ pub async fn run_opensea_mint(
                                     Ok(result) => result,
                                     Err(e) => {
                                         let err_str = format!("{}", e);
+                                        if let Some(wait) = rate_limit_backoff(
+                                            &err_str,
+                                            &addr,
+                                            &mut rate_limit_budget_ms,
+                                        ) {
+                                            log_always(
+                                                reporter.as_ref(),
+                                                format!(
+                                                    "[{}] OpenSea rate limit — waiting {}ms as instructed",
+                                                    sign::shorten_address(&addr),
+                                                    wait.as_millis()
+                                                ),
+                                            );
+                                            last_error = err_str;
+                                            sleep_cancellable(wait, &cancel_w).await;
+                                            // The server asked us to wait; that
+                                            // is not one of the three tries a
+                                            // real error gets.
+                                            attempt = attempt.saturating_sub(1);
+                                            continue;
+                                        }
                                         if attempt > 3 {
                                             break (
                                                 addr,
@@ -2969,6 +3151,24 @@ pub async fn run_opensea_mint(
                             Ok(result) => result,
                             Err(e) => {
                                 let err_str = format!("{}", e);
+                                if let Some(wait) =
+                                    rate_limit_backoff(&err_str, &addr, &mut rate_limit_budget_ms)
+                                {
+                                    log_always(
+                                        reporter.as_ref(),
+                                        format!(
+                                            "[{}] OpenSea rate limit — waiting {}ms as instructed",
+                                            sign::shorten_address(&addr),
+                                            wait.as_millis()
+                                        ),
+                                    );
+                                    last_error = err_str;
+                                    sleep_cancellable(wait, &cancel_w).await;
+                                    // The server asked us to wait; that is not
+                                    // one of the three tries a real error gets.
+                                    attempt = attempt.saturating_sub(1);
+                                    continue;
+                                }
                                 if attempt > 3 {
                                     break (
                                         addr,
@@ -4302,11 +4502,12 @@ pub async fn run_opensea_mint(
 #[cfg(test)]
 mod tests {
     use super::{
-        NOT_ACTIVE_CHAIN_WAIT_MAX_SECS, NotActiveInfo, PHASE_OPEN_LAG_WINDOW_SECS, WalletAuth,
-        assigned_proxy_routes, build_local_public_mint, classify_mint_error, enrich_mint_rpc_error,
-        estimate_fail_policy, fire_lag_ms_from_clock, format_not_active, format_rpc_plan,
+        GQL_STAGGER_MAX_SPREAD_MS, NOT_ACTIVE_CHAIN_WAIT_MAX_SECS, NotActiveInfo,
+        PHASE_OPEN_LAG_WINDOW_SECS, RATE_LIMIT_WAIT_BUDGET_MS, WalletAuth, assigned_proxy_routes,
+        build_local_public_mint, classify_mint_error, enrich_mint_rpc_error, estimate_fail_policy,
+        fire_lag_ms_from_clock, format_not_active, format_rpc_plan, gql_stagger_step_ms,
         in_phase_open_lag_window, parse_not_active, parse_tx_calldata_hex, pre_sign_ready_wallets,
-        resolve_mint_gas_limit,
+        rate_limit_backoff, resolve_mint_gas_limit,
     };
     use crate::proxy::ProxyManager;
     use crate::types::Signer;
@@ -4698,5 +4899,149 @@ mod tests {
     fn parse_not_active_rejects_unrelated() {
         assert!(parse_not_active("timeout").is_none());
         assert!(parse_not_active("execution reverted: InvalidProof").is_none());
+    }
+
+    fn any_addr(last_byte: u8) -> Address {
+        let mut b = [0u8; 20];
+        b[19] = last_byte;
+        Address::from(b)
+    }
+
+    #[test]
+    fn a_lone_wallet_is_never_delayed() {
+        assert_eq!(gql_stagger_step_ms(0), 0);
+        assert_eq!(gql_stagger_step_ms(1), 0);
+    }
+
+    #[test]
+    fn small_runs_get_the_full_gap() {
+        // The five-wallet run that lost three to 429s: 4 gaps of 25ms costs
+        // 100ms total and takes the burst apart.
+        assert_eq!(gql_stagger_step_ms(5), 25);
+        assert_eq!(gql_stagger_step_ms(20), 25);
+    }
+
+    #[test]
+    fn large_runs_compress_rather_than_arrive_late() {
+        // Arriving a second late is recoverable; arriving after a sell-out is
+        // not. The spread is capped, so the step shrinks instead.
+        for n in [61usize, 100, 250, 1000] {
+            let step = gql_stagger_step_ms(n);
+            let spread = step * (n as u64 - 1);
+            assert!(
+                spread <= GQL_STAGGER_MAX_SPREAD_MS,
+                "{n} wallets spread over {spread}ms"
+            );
+        }
+    }
+
+    #[test]
+    fn the_step_never_grows_with_the_wallet_count() {
+        let mut prev = u64::MAX;
+        for n in [2usize, 5, 10, 50, 61, 100, 500] {
+            let step = gql_stagger_step_ms(n);
+            assert!(step <= prev, "step grew at {n}: {prev} -> {step}");
+            prev = step;
+        }
+    }
+
+    #[test]
+    fn honours_the_wait_opensea_asked_for() {
+        let mut budget = RATE_LIMIT_WAIT_BUDGET_MS;
+        let wait = rate_limit_backoff(
+            "Mint action failed: HTTP 429 Too Many Requests retry-after=2500ms",
+            &any_addr(0),
+            &mut budget,
+        )
+        .expect("a 429 with an explicit wait must be honoured");
+        // 2500 asked + the lockstep jitter, and drawn from the budget.
+        assert!(wait.as_millis() >= 2500, "{:?}", wait);
+        assert_eq!(budget, RATE_LIMIT_WAIT_BUDGET_MS - 2500);
+    }
+
+    #[test]
+    fn ordinary_errors_are_not_rate_limits() {
+        let mut budget = RATE_LIMIT_WAIT_BUDGET_MS;
+        for e in [
+            "execution reverted",
+            "no auth session",
+            "HTTP 500 internal error",
+            // A bare "429" inside a value must not read as a rate limit.
+            "insufficient funds: have 1429000000000000",
+        ] {
+            assert!(
+                rate_limit_backoff(e, &any_addr(1), &mut budget).is_none(),
+                "{e}"
+            );
+        }
+        assert_eq!(
+            budget, RATE_LIMIT_WAIT_BUDGET_MS,
+            "budget must be untouched"
+        );
+    }
+
+    #[test]
+    fn unmistakable_wording_without_a_number_still_waits() {
+        let mut budget = RATE_LIMIT_WAIT_BUDGET_MS;
+        assert!(rate_limit_backoff("Too Many Requests", &any_addr(2), &mut budget).is_some());
+        assert!(rate_limit_backoff("opensea rate limit", &any_addr(2), &mut budget).is_some());
+    }
+
+    #[test]
+    fn the_budget_runs_out_so_a_wallet_cannot_be_parked_forever() {
+        let mut budget = RATE_LIMIT_WAIT_BUDGET_MS;
+        let err = "HTTP 429 Too Many Requests retry-after=5000ms";
+        let addr = any_addr(3);
+        let mut honoured = 0;
+        while rate_limit_backoff(err, &addr, &mut budget).is_some() {
+            honoured += 1;
+            assert!(honoured < 100, "backoff never gave up");
+        }
+        assert_eq!(budget, 0);
+        // 12s of budget against a 5s ask: two full waits and a clipped one.
+        assert_eq!(honoured, 3);
+    }
+
+    #[test]
+    fn a_wait_is_clipped_to_what_is_left_not_refused() {
+        // Better to spend the remainder than to fail immediately: the drop may
+        // still be open.
+        let mut budget = 400;
+        let wait = rate_limit_backoff(
+            "429 Too Many Requests retry-after=9000ms",
+            &any_addr(4),
+            &mut budget,
+        )
+        .expect("should spend what is left");
+        assert!(wait.as_millis() < 9000);
+        assert_eq!(budget, 0);
+    }
+
+    #[test]
+    fn limited_wallets_do_not_come_back_in_lockstep() {
+        // Returning together is what produced the limit. Same instruction,
+        // different wallets, different wake-up times.
+        let err = "429 Too Many Requests retry-after=2000ms";
+        let waits: Vec<u128> = (0u8..8)
+            .map(|i| {
+                let mut b = RATE_LIMIT_WAIT_BUDGET_MS;
+                rate_limit_backoff(err, &any_addr(i * 31), &mut b)
+                    .unwrap()
+                    .as_millis()
+            })
+            .collect();
+        let unique: std::collections::HashSet<_> = waits.iter().collect();
+        assert!(
+            unique.len() > 1,
+            "all wallets woke at the same instant: {waits:?}"
+        );
+        // Deterministic: the same wallet must behave the same way twice.
+        let mut b = RATE_LIMIT_WAIT_BUDGET_MS;
+        assert_eq!(
+            rate_limit_backoff(err, &any_addr(0), &mut b)
+                .unwrap()
+                .as_millis(),
+            waits[0]
+        );
     }
 }

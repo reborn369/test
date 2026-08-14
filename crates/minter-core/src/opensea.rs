@@ -311,22 +311,78 @@ fn debug_file_next_to_exe(name: &str) -> std::path::PathBuf {
         })
 }
 
-fn retry_after_secs(headers: &reqwest::header::HeaderMap, body: &str) -> u64 {
-    if let Some(v) = headers.get("retry-after").and_then(|h| h.to_str().ok()) {
-        if let Ok(secs) = v.trim().parse::<u64>() {
-            return secs.max(1).min(60);
-        }
+/// Upper bound on any honoured server wait. Beyond this the drop is over
+/// anyway, and a wallet parked for minutes is worse than one that reports back.
+const RETRY_AFTER_MAX_MS: u64 = 60_000;
+
+/// Seconds as sent by OpenSea, in milliseconds.
+///
+/// OpenSea answers with fractional seconds — `retry-after: 2.5` was observed on
+/// the mint-action query. Parsing that as an integer fails, and the old code
+/// then reported `retry-after=0`, which downstream read as "no wait requested"
+/// and retried immediately into the same limit. Parse as a float and keep
+/// milliseconds so the fraction survives.
+fn parse_retry_after_value(raw: &str) -> Option<u64> {
+    let secs: f64 = raw.trim().parse().ok()?;
+    if !secs.is_finite() || secs <= 0.0 {
+        return None;
+    }
+    Some(((secs * 1000.0).round() as u64).clamp(1, RETRY_AFTER_MAX_MS))
+}
+
+/// How long the server asked us to wait, in ms. 0 when it did not say.
+fn retry_after_ms(headers: &reqwest::header::HeaderMap, body: &str) -> u64 {
+    if let Some(ms) = headers
+        .get("retry-after")
+        .and_then(|h| h.to_str().ok())
+        .and_then(parse_retry_after_value)
+    {
+        return ms;
     }
     // OpenSea often embeds retry-after in JSON meta.
     if let Ok(j) = serde_json::from_str::<serde_json::Value>(body) {
-        if let Some(secs) = j.pointer("/meta/retry-after").and_then(|v| {
-            v.as_u64()
-                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        if let Some(ms) = j.pointer("/meta/retry-after").and_then(|v| {
+            v.as_f64()
+                .map(|f| f.to_string())
+                .or_else(|| v.as_str().map(|s| s.to_string()))
+                .as_deref()
+                .and_then(parse_retry_after_value)
         }) {
-            return secs.max(1).min(60);
+            return ms;
         }
     }
     0
+}
+
+/// Recover a server-requested wait from an error string produced anywhere in
+/// this module.
+///
+/// Errors cross module boundaries as text, so the wait has to survive the round
+/// trip. Everything here writes `retry-after=<n>ms`; older text carrying bare
+/// seconds is still understood so nothing regresses if a path is missed.
+pub fn parse_retry_after_ms(msg: &str) -> Option<u64> {
+    let idx = msg.find("retry-after")?;
+    let tail = &msg[idx + "retry-after".len()..];
+    let digits: String = tail
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let after = &tail[tail.find(&digits)? + digits.len()..];
+    let value: f64 = digits.parse().ok()?;
+    let ms = if after.trim_start().starts_with("ms") {
+        value
+    } else {
+        value * 1000.0
+    };
+    // Also rejects NaN, which no comparison would catch.
+    if !ms.is_finite() || ms <= 0.0 {
+        return None;
+    }
+    Some((ms.round() as u64).clamp(1, RETRY_AFTER_MAX_MS))
 }
 
 fn is_rate_limit_status(status: u16) -> bool {
@@ -366,20 +422,11 @@ pub async fn siwe_auth_with_retries(
                     || msg.to_lowercase().contains("rate limit");
                 if retryable && attempt < max_attempts {
                     // Prefer server-provided wait from error text, else exponential backoff.
-                    let mut wait_secs = 1u64 << (attempt.saturating_sub(1).min(4)); // 1,2,4,8,16
-                    if let Some(idx) = msg.find("retry-after") {
-                        let tail = &msg[idx..];
-                        if let Some(n) = tail
-                            .split(|c: char| !c.is_ascii_digit())
-                            .find(|s| !s.is_empty())
-                            .and_then(|s| s.parse::<u64>().ok())
-                        {
-                            wait_secs = n.max(1).min(30);
-                        }
-                    }
+                    let wait_ms = parse_retry_after_ms(&msg)
+                        .unwrap_or_else(|| 1000u64 << (attempt.saturating_sub(1).min(4))); // 1,2,4,8,16s
                     // Small jitter so parallel wallets don't retry in lockstep.
                     let jitter_ms = (address.as_slice()[19] as u64 % 400) + 100;
-                    let wait = std::time::Duration::from_millis(wait_secs * 1000 + jitter_ms);
+                    let wait = std::time::Duration::from_millis(wait_ms + jitter_ms);
                     eprintln!(
                         "[{}] rate limited (attempt {}/{}), sleep {}ms",
                         crate::sign::shorten_address(address),
@@ -462,11 +509,11 @@ async fn siwe_auth_once(
         let headers = nonce_resp.headers().clone();
         let text = nonce_resp.text().await.unwrap_or_default();
         if is_rate_limit_status(nonce_status) {
-            let ra = retry_after_secs(&headers, &text);
+            let ra = retry_after_ms(&headers, &text);
             bail!(
-                "Nonce failed: HTTP {} Too Many Requests retry-after={}",
+                "Nonce failed: HTTP {} Too Many Requests retry-after={}ms",
                 nonce_status,
-                if ra > 0 { ra } else { 1 }
+                if ra > 0 { ra } else { 1000 }
             );
         }
         bail!(
@@ -532,11 +579,11 @@ async fn siwe_auth_once(
         let headers = verify_resp.headers().clone();
         let text = verify_resp.text().await.unwrap_or_default();
         if is_rate_limit_status(verify_status) {
-            let ra = retry_after_secs(&headers, &text);
+            let ra = retry_after_ms(&headers, &text);
             bail!(
-                "Verify failed: HTTP {} Too Many Requests retry-after={} {}",
+                "Verify failed: HTTP {} Too Many Requests retry-after={}ms {}",
                 verify_status,
-                if ra > 0 { ra } else { 1 },
+                if ra > 0 { ra } else { 1000 },
                 crate::safe_truncate(&text, 200)
             );
         }
@@ -1016,7 +1063,21 @@ pub async fn fetch_mint_calldata(
 
     if resp.status().as_u16() >= 400 {
         let status = resp.status();
+        let headers = resp.headers().clone();
         let text = resp.text().await.unwrap_or_default();
+        // A rate limit here is the expensive one: it lands on the query that
+        // produces the calldata, at the moment the stage opens. OpenSea tells
+        // us how long to wait, so carry that into the error instead of
+        // discarding it and letting the caller retry blindly into the limit.
+        if is_rate_limit_status(status.as_u16()) {
+            let ra = retry_after_ms(&headers, &text);
+            bail!(
+                "Mint action failed: HTTP {} Too Many Requests retry-after={}ms {}",
+                status,
+                if ra > 0 { ra } else { 1000 },
+                crate::safe_truncate(&text, 200)
+            );
+        }
         if text.contains("PERSISTED_QUERY_NOT_FOUND") {
             let mut fallback_req = gql_request(client);
             if !session.access_token.is_empty() {
@@ -1259,6 +1320,87 @@ pub fn stage_label(stage: &StageInfo) -> String {
             format!(" ({})", label)
         }
     )
+}
+
+#[cfg(test)]
+mod retry_after_tests {
+    use super::*;
+
+    #[test]
+    fn fractional_seconds_survive() {
+        // The value OpenSea actually sent on the mint-action query. Parsed as
+        // an integer this failed and reported "no wait", so the caller retried
+        // straight back into the limit.
+        assert_eq!(parse_retry_after_value("2.5"), Some(2500));
+        assert_eq!(parse_retry_after_value("0.25"), Some(250));
+        assert_eq!(parse_retry_after_value(" 3 "), Some(3000));
+    }
+
+    #[test]
+    fn nonsense_and_zero_mean_no_instruction() {
+        for s in ["", "soon", "0", "-1", "NaN", "inf"] {
+            assert_eq!(parse_retry_after_value(s), None, "{s}");
+        }
+    }
+
+    #[test]
+    fn absurd_waits_are_capped() {
+        // A drop is long over after a minute; parking a wallet for an hour is
+        // worse than reporting back.
+        assert_eq!(parse_retry_after_value("86400"), Some(RETRY_AFTER_MAX_MS));
+    }
+
+    #[test]
+    fn recovers_the_wait_from_error_text() {
+        assert_eq!(
+            parse_retry_after_ms(
+                "Mint action failed: HTTP 429 Too Many Requests retry-after=2500ms {}"
+            ),
+            Some(2500)
+        );
+        assert_eq!(
+            parse_retry_after_ms("Nonce failed: HTTP 429 Too Many Requests retry-after=1000ms"),
+            Some(1000)
+        );
+    }
+
+    #[test]
+    fn still_understands_the_older_bare_seconds_form() {
+        // Older messages wrote seconds with no unit. Reading those as ms would
+        // turn a 2 second hold into 2 milliseconds.
+        assert_eq!(parse_retry_after_ms("retry-after=2"), Some(2000));
+        assert_eq!(parse_retry_after_ms("retry-after=2.5"), Some(2500));
+    }
+
+    #[test]
+    fn unrelated_errors_carry_no_wait() {
+        for s in [
+            "execution reverted",
+            "HTTP 500 internal",
+            "retry-after=0ms",
+            "retry-after=",
+        ] {
+            assert_eq!(parse_retry_after_ms(s), None, "{s}");
+        }
+    }
+
+    #[test]
+    fn header_beats_body_and_body_is_a_fallback() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("retry-after", "2.5".parse().unwrap());
+        assert_eq!(retry_after_ms(&h, ""), 2500);
+
+        let empty = reqwest::header::HeaderMap::new();
+        assert_eq!(
+            retry_after_ms(&empty, r#"{"meta":{"retry-after":1.5}}"#),
+            1500
+        );
+        assert_eq!(
+            retry_after_ms(&empty, r#"{"meta":{"retry-after":"4"}}"#),
+            4000
+        );
+        assert_eq!(retry_after_ms(&empty, "not json"), 0);
+    }
 }
 
 #[cfg(test)]

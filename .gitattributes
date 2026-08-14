@@ -1,0 +1,29 @@
+# Line endings are load-bearing here.
+#
+# `install.sh` is fetched with `curl | sudo bash` and `start-minter-vnc.sh` is
+# executed by systemd on Linux. A CR at the end of each line makes the shell
+# report `$'\r': command not found` and the install dies immediately. Windows
+# checkouts default to core.autocrlf=true, which silently commits CRLF, so the
+# endings are pinned per file type instead of left to local config.
+
+# Normalise everything to LF in the repository.
+* text=auto eol=lf
+
+# Anything the server runs must stay LF, on every platform.
+*.sh      text eol=lf
+*.service text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.toml    text eol=lf
+
+# PowerShell and batch stay CRLF — that is what Windows tooling expects.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Never touch binaries.
+*.png binary
+*.ico binary
+*.icns binary
+*.zip binary
+*.gz  binary

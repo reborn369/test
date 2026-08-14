@@ -1,10 +1,40 @@
 # Ubuntu VPS deployment
 
-This deployment runs the unchanged Tauri application inside an isolated Xvfb
-desktop and exposes that desktop through noVNC on loopback port `3021`. The
-mint engine and Tauri IPC stay identical to the Windows application.
+Runs the unchanged Tauri application inside an isolated Xvfb desktop and serves
+that desktop over noVNC on loopback port `3021`. The mint engine and Tauri IPC
+are identical to the Windows build — only the display is virtual.
 
-Required Ubuntu packages:
+**No desktop environment is required on the server.** A plain terminal-only
+Ubuntu VPS is the expected target.
+
+## Install (recommended)
+
+One command on a fresh server. It pulls the prebuilt binary from GitHub
+Releases — no Rust toolchain, no compile:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MaxBetov-pdd/Minter-rs-v2/main/deploy/ubuntu/install.sh | sudo bash
+```
+
+It installs runtime packages, verifies the download against the published
+SHA256, creates the `minter` service user, sets up systemd + noVNC, asks for a
+VNC password, and prints exactly how to connect.
+
+Re-running it upgrades in place: the previous binary is kept under
+`/opt/minter/backups/`, and it refuses to replace a build while a mint looks
+active (override with `MINTER_FORCE=1`).
+
+Useful variables:
+
+| Variable | Purpose |
+|---|---|
+| `MINTER_VERSION=v0.2.0` | install a specific tag instead of the latest |
+| `MINTER_VNC_PASSWORD=…` | non-interactive install |
+| `MINTER_FORCE=1` | replace the binary even if a mint looks active |
+
+## Install from source (alternative)
+
+Only needed to run unreleased code. Requires the full build toolchain:
 
 ```bash
 sudo apt-get install build-essential pkg-config curl ca-certificates git file wget \
@@ -13,11 +43,7 @@ sudo apt-get install build-essential pkg-config curl ca-certificates git file wg
   xvfb xauth x11-utils x11vnc openbox dbus-x11 novnc websockify \
   xdg-utils xdg-desktop-portal xdg-desktop-portal-gtk \
   pcmanfm fonts-dejavu-core
-```
 
-Build and install:
-
-```bash
 cargo build -p minter-desktop --release
 sudo ./deploy/ubuntu/install-built.sh 'eight-or-more-characters'
 ```

@@ -8,9 +8,10 @@
 # 10-minute compile), installs it as a systemd service behind a private noVNC
 # desktop, and prints how to connect.
 #
-# Supported: Debian 12+, Ubuntu 22.04+, Fedora 36+, Arch and their derivatives.
+# Supported: Debian 12+, Ubuntu 22.04+, Fedora 36+, RHEL/Rocky/Alma 9+, Arch and
+# their derivatives.
 # The hard floor is webkit2gtk **4.1** (Tauri v2 will not run on 4.0) and glibc
-# 2.35, which is what the release binary is linked against. Ubuntu 20.04 and
+# 2.34, which is what the release binary is linked against. Ubuntu 20.04 and
 # Debian 11 ship only webkit 4.0, so they cannot be supported at all.
 #
 # noVNC is bound to 127.0.0.1 on purpose: classic VNC auth uses only the first
@@ -24,7 +25,12 @@ INSTALL_DIR="/opt/minter"
 DATA_DIR="/var/lib/minter"
 SERVICE="minter-vps"
 RUN_USER="minter"
-GLIBC_FLOOR="2.35"
+# Measured from the published artifact, not assumed from the builder's own
+# glibc: the release binary's highest required symbol is GLIBC_2.34, which is
+# lower than Ubuntu 22.04's 2.35 and therefore also clears RHEL/Rocky/Alma 9.
+# Re-check with `objdump -T minter-desktop | grep -o 'GLIBC_[0-9.]*' | sort -Vu`
+# if the build base ever changes.
+GLIBC_FLOOR="2.34"
 
 die()  { printf '\n\033[1;31merror:\033[0m %s\n\n' "$*" >&2; exit 1; }
 say()  { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
@@ -77,7 +83,7 @@ sys_glibc="$(printf '%s\n' "$ldd_out" |
 oldest="$(printf '%s\n%s\n' "$GLIBC_FLOOR" "$sys_glibc" | sort -V | sed -n 1p)"
 if [ "$oldest" != "$GLIBC_FLOOR" ]; then
   die "glibc $sys_glibc is older than the required $GLIBC_FLOOR ($DISTRO_NAME).
-       RHEL/Rocky/Alma 9 (glibc 2.34) just miss this floor — build from source there."
+       Ubuntu 20.04 and Debian 11 (glibc 2.31) are below it — build from source there."
 fi
 ok "glibc $sys_glibc (need >= $GLIBC_FLOOR)"
 

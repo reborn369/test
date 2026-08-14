@@ -114,7 +114,10 @@ case "$pm" in
       xdg-utils xdg-desktop-portal xdg-desktop-portal-gtk fonts-dejavu-core >/dev/null
     ;;
   dnf)
-    dnf install -y -q \
+    # --refresh forces a metadata sync. Without it dnf trusts its cache until
+    # metadata_expire (48h on Fedora), so a fresh cloud image with an empty or
+    # stale cache fails with "No match for argument" on packages that do exist.
+    dnf install -y -q --refresh \
       ca-certificates curl jq tar iproute \
       webkit2gtk4.1 xdotool libappindicator-gtk3 librsvg2 \
       xorg-x11-server-Xvfb xorg-x11-xauth xdpyinfo x11vnc openbox dbus-x11 \
@@ -122,7 +125,13 @@ case "$pm" in
       dejavu-sans-fonts >/dev/null
     ;;
   pacman)
-    pacman -Sy --needed --noconfirm \
+    # -Syu, not -Sy. Refreshing the database and installing without upgrading
+    # is the partial-upgrade case Arch explicitly does not support: the new
+    # package is built against current libraries while the rest of the system
+    # stays behind, and dependencies break. On Arch there is no safe way to
+    # install from a freshly synced database except to upgrade with it.
+    warn "Arch: doing a full system upgrade (-Syu) — partial upgrades are unsupported there"
+    pacman -Syu --needed --noconfirm \
       ca-certificates curl jq tar iproute2 \
       webkit2gtk-4.1 xdotool libappindicator-gtk3 librsvg \
       xorg-server-xvfb xorg-xauth xorg-xdpyinfo x11vnc openbox dbus \

@@ -13,7 +13,7 @@ use crate::export;
 use crate::flashbots::{self, BundleTx, FlashbotsClient, FlashbotsConfig, MAINNET_CHAIN_ID};
 use crate::gas;
 use crate::opensea;
-use crate::progress::{FileTeeReporter, MintEvent, MintReporter, NullReporter};
+use crate::progress::{FileTeeReporter, MintEvent, MintReporter};
 use crate::proxy::ProxyManager;
 use crate::rpc;
 use crate::sign;
@@ -821,22 +821,34 @@ fn cancelled(cancel: &Option<Arc<AtomicBool>>) -> bool {
         .unwrap_or(false)
 }
 
-/// Spacing between the T0 calldata requests of wallets that arrive unarmed.
+/// Mint-action requests OpenSea allows before it starts refusing.
+///
+/// Measured against the live endpoint: the fifth request reports
+/// `x-ratelimit-remaining: 0` and the sixth is refused. A refused request costs
+/// a token just like a successful one, which is why the old pre-fetch loop was
+/// so expensive.
+pub const OPENSEA_MINT_ACTION_BUDGET: usize = 5;
+
+/// Roughly how long one token takes to come back, measured: refused at +1s,
+/// +2s and +3s after exhaustion, allowed again at +4.3s.
+pub const OPENSEA_MINT_ACTION_REFILL_MS: u64 = 4_300;
+
+/// Spacing between the T0 calldata requests of wallets sharing one exit IP.
 const GQL_STAGGER_STEP_MS: u64 = 25;
 
-/// Ceiling on the total spread, so the last wallet is not sent late enough to
-/// lose the drop in order to avoid a rate limit.
+/// Ceiling on the spread within a single IP's group.
 const GQL_STAGGER_MAX_SPREAD_MS: u64 = 1_500;
 
-/// Gap to leave between unarmed wallets' calldata requests at T0.
+/// Gap to leave between the calldata requests of wallets on the same proxy.
 ///
-/// Five wallets asking at once produced three 429s each holding 2.5 s — a limit
-/// the run inflicted on itself, and not one proxies help with, since all five
-/// were on different IPs and were limited anyway. Spreading is the only lever.
-/// The spread is capped: arriving a second late is recoverable, arriving after
-/// the drop sold out is not.
-fn gql_stagger_step_ms(unarmed: usize) -> u64 {
-    let gaps = unarmed.saturating_sub(1) as u64;
+/// The budget is per exit IP, so wallets on *different* proxies do not compete
+/// and must not be delayed for each other — an earlier version spread every
+/// wallet in the run, which taxed a well-proxied setup for nothing. Only a
+/// shared IP needs spacing, and even then only to avoid arriving in the same
+/// millisecond; genuine overflow past the five-token budget is handled by
+/// honouring `retry-after` rather than by waiting here.
+fn gql_stagger_step_ms(wallets_on_one_proxy: usize) -> u64 {
+    let gaps = wallets_on_one_proxy.saturating_sub(1) as u64;
     if gaps == 0 {
         return 0;
     }
@@ -2368,7 +2380,7 @@ pub async fn run_opensea_mint(
             if !prefetched && should_prefetch && remaining_ms <= prefetch_lead_ms {
                 log_always(
                     reporter.as_ref(),
-                    format!("\n  Pre-fetching calldata ({left}s before open)..."),
+                    format!("\n  Preparing calldata ({left}s before open)..."),
                 );
                 prefetched = true;
                 if local_public_prefetch {
@@ -2414,104 +2426,26 @@ pub async fn run_opensea_mint(
                         format!("  Local PUBLIC_SALE calldata ready for {built} wallet(s)"),
                     );
                 } else {
-                    // Keep trying until the phase actually opens rather than
-                    // for a flat 10 s, so the window can never close before the
-                    // one moment a prefetch can succeed. The countdown aborts
-                    // these tasks at T0-50ms, so nothing here holds up the fire.
-                    let pf_deadline = std::time::Instant::now()
-                        + std::time::Duration::from_millis(remaining_ms.max(0) as u64);
-                    for w in &wallets {
-                        if !w.auth_ok || w.session.is_none() {
-                            continue;
-                        }
-                        let session = w.session.clone().unwrap();
-                        let pf_slug = slug.clone();
-                        let addr = w.address;
-                        let pf_nft_contract = nft_contract.to_string();
-                        let pf_chain = info.chain.clone();
-                        let pf_stage_token_id = stage_token_id.clone();
-                        let pf_quantity = wallet_quantities.get(&addr).copied().unwrap_or(quantity);
-                        let pf_payment_asset = payment_asset.clone();
-                        let pf_calldata_value = price_wei * U256::from(pf_quantity);
-
-                        let rep = reporter.clone();
-                        prefetch_handles.spawn(async move {
-                            // Back off instead of a fixed 500ms drumbeat. Before
-                            // a stage opens OpenSea refuses every one of these,
-                            // so a fixed interval turns the window into hundreds
-                            // of doomed requests across the wallet set —
-                            // rate-limit pressure built up in exactly the moment
-                            // we need OpenSea to answer. Backing off still
-                            // places attempts right up against T0, which is the
-                            // only moment one can succeed.
-                            let mut backoff = std::time::Duration::from_millis(500);
-                            let mut last_err = String::new();
-                            let mut attempts = 0u32;
-                            loop {
-                                let now = std::time::Instant::now();
-                                if now >= pf_deadline {
-                                    // Why the wallet is unarmed used to be
-                                    // swallowed by NullReporter, leaving "0
-                                    // prefetched" with no reason anywhere.
-                                    if !last_err.is_empty() {
-                                        log_always(
-                                            rep.as_ref(),
-                                            format!(
-                                                "[{}] pre-fetch gave up after {attempts} tries: {}",
-                                                sign::shorten_address(&addr),
-                                                crate::safe_truncate(&last_err, 160)
-                                            ),
-                                        );
-                                    }
-                                    return (addr, None);
-                                }
-                                attempts += 1;
-                                match fetch_and_parse_gql(
-                                    &NullReporter,
-                                    &session,
-                                    &pf_slug,
-                                    &addr,
-                                    &pf_nft_contract,
-                                    &pf_chain,
-                                    &pf_stage_token_id,
-                                    pf_quantity,
-                                    &pf_payment_asset,
-                                    &pf_calldata_value,
-                                    &std::time::Instant::now(),
-                                    0,
-                                    false,
-                                )
-                                .await
-                                {
-                                    Ok(result) => {
-                                        log_always(
-                                            rep.as_ref(),
-                                            format!(
-                                                "[{}] pre-fetch OK (try {attempts})",
-                                                sign::shorten_address(&addr)
-                                            ),
-                                        );
-                                        return (addr, Some(result));
-                                    }
-                                    Err(e) => {
-                                        let err_str = format!("{e}");
-                                        // A limit here is self-inflicted. Honour
-                                        // the wait rather than spending the
-                                        // drop's budget arguing with it.
-                                        let wait = opensea::parse_retry_after_ms(&err_str)
-                                            .map(std::time::Duration::from_millis)
-                                            .unwrap_or(backoff);
-                                        last_err = err_str;
-                                        let left = pf_deadline
-                                            .saturating_duration_since(std::time::Instant::now());
-                                        tokio::time::sleep(wait.min(left)).await;
-                                        backoff =
-                                            (backoff * 2).min(std::time::Duration::from_secs(4));
-                                    }
-                                }
-                            }
-                        });
-                    }
+                    // Deliberately no pre-fetch here. Measured against live
+                    // OpenSea: asking for calldata before a stage opens is
+                    // answered `DropNotMintingError` with an empty action list,
+                    // for a PUBLIC_SALE the wallet was eligible for — so timing
+                    // alone, not eligibility, and it can never succeed early.
+                    //
+                    // It is not merely useless, it is what lost the wallets.
+                    // The mint-action budget is five requests, refilling about
+                    // one every four seconds. The old loop retried every 500ms
+                    // for the whole window, roughly ten doomed requests per
+                    // wallet, so each wallet reached T0 with an empty budget and
+                    // only the one or two that had refilled a token could mint.
+                    // Staying silent leaves all five tokens for the shot that
+                    // counts.
+                    log_always(
+                        reporter.as_ref(),
+                        format!(
+                            "  {stage_type_owned}: calldata is issued only once the stage opens                              — keeping OpenSea's request budget for T0"
+                        ),
+                    );
                 }
             }
 
@@ -2761,32 +2695,57 @@ pub async fn run_opensea_mint(
 
     let mut handles = tokio::task::JoinSet::new();
 
-    // Wallets that reach T0 unarmed must ask OpenSea for calldata at the very
-    // instant the stage opens. Sending all of them in the same millisecond is
-    // what produces the 429s the run then has to sit out. Spread only those, in
-    // a fixed order; wallets already signed go straight to the RPC and are
-    // never held back by this.
+    // Wallets that reach T0 unarmed ask OpenSea for calldata the instant the
+    // stage opens. The request budget is per exit IP, so group them by proxy
+    // and space only within a group: two wallets behind different proxies do
+    // not compete and neither should wait for the other.
     let gql_stagger_slots: HashMap<Address, u64> = {
-        let unarmed: Vec<Address> = wallets
+        let mut by_route: HashMap<Option<String>, Vec<Address>> = HashMap::new();
+        for w in wallets
             .iter()
             .filter(|w| w.auth_ok && w.pre_signed_tx.is_none() && w.prefetched_tx.is_none())
-            .map(|w| w.address)
-            .collect();
-        let step = gql_stagger_step_ms(unarmed.len());
+        {
+            by_route
+                .entry(w.proxy_url.clone())
+                .or_default()
+                .push(w.address);
+        }
+        let busiest = by_route.values().map(Vec::len).max().unwrap_or(0);
+        let unarmed: usize = by_route.values().map(Vec::len).sum();
+        if busiest > OPENSEA_MINT_ACTION_BUDGET {
+            // Past the budget the extra wallets cannot be helped by spacing —
+            // they must wait for a refill. Say so rather than letting it look
+            // like an unexplained stall.
+            log_always(
+                reporter.as_ref(),
+                format!(
+                    "  WARNING: {busiest} wallet(s) share one exit IP but OpenSea allows \
+                     {OPENSEA_MINT_ACTION_BUDGET} calldata requests per IP (~{}s per refill). \
+                     Add proxies — aim for at most {OPENSEA_MINT_ACTION_BUDGET} wallets each, \
+                     or the surplus waits.",
+                    OPENSEA_MINT_ACTION_REFILL_MS / 1000
+                ),
+            );
+        }
+        let step = gql_stagger_step_ms(busiest);
         if step > 0 {
             log_always(
                 reporter.as_ref(),
                 format!(
-                    "  {} wallet(s) unarmed at open — spacing their OpenSea requests {}ms apart",
-                    unarmed.len(),
-                    step
+                    "  {unarmed} wallet(s) unarmed at open across {} route(s); \
+                     spacing same-IP requests {step}ms apart",
+                    by_route.len()
                 ),
             );
         }
-        unarmed
-            .into_iter()
-            .enumerate()
-            .map(|(i, a)| (a, i as u64 * step))
+        by_route
+            .into_values()
+            .flat_map(|group| {
+                group
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(i, a)| (a, i as u64 * step))
+            })
             .collect()
     };
 
@@ -4503,11 +4462,12 @@ pub async fn run_opensea_mint(
 mod tests {
     use super::{
         GQL_STAGGER_MAX_SPREAD_MS, NOT_ACTIVE_CHAIN_WAIT_MAX_SECS, NotActiveInfo,
-        PHASE_OPEN_LAG_WINDOW_SECS, RATE_LIMIT_WAIT_BUDGET_MS, WalletAuth, assigned_proxy_routes,
-        build_local_public_mint, classify_mint_error, enrich_mint_rpc_error, estimate_fail_policy,
-        fire_lag_ms_from_clock, format_not_active, format_rpc_plan, gql_stagger_step_ms,
-        in_phase_open_lag_window, parse_not_active, parse_tx_calldata_hex, pre_sign_ready_wallets,
-        rate_limit_backoff, resolve_mint_gas_limit,
+        OPENSEA_MINT_ACTION_BUDGET, OPENSEA_MINT_ACTION_REFILL_MS, PHASE_OPEN_LAG_WINDOW_SECS,
+        RATE_LIMIT_WAIT_BUDGET_MS, WalletAuth, assigned_proxy_routes, build_local_public_mint,
+        classify_mint_error, enrich_mint_rpc_error, estimate_fail_policy, fire_lag_ms_from_clock,
+        format_not_active, format_rpc_plan, gql_stagger_step_ms, in_phase_open_lag_window,
+        parse_not_active, parse_tx_calldata_hex, pre_sign_ready_wallets, rate_limit_backoff,
+        resolve_mint_gas_limit,
     };
     use crate::proxy::ProxyManager;
     use crate::types::Signer;
@@ -4908,21 +4868,23 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_wallet_is_never_delayed() {
+    fn a_wallet_alone_on_its_proxy_is_never_delayed() {
+        // The common well-proxied case: one wallet per exit IP competes with
+        // nobody and must reach OpenSea at T0+0.
         assert_eq!(gql_stagger_step_ms(0), 0);
         assert_eq!(gql_stagger_step_ms(1), 0);
     }
 
     #[test]
-    fn small_runs_get_the_full_gap() {
-        // The five-wallet run that lost three to 429s: 4 gaps of 25ms costs
-        // 100ms total and takes the burst apart.
+    fn wallets_sharing_an_ip_get_the_full_gap() {
+        // Five wallets on one IP is exactly the budget: space them so they do
+        // not arrive in the same millisecond. 4 gaps of 25ms costs 100ms.
         assert_eq!(gql_stagger_step_ms(5), 25);
         assert_eq!(gql_stagger_step_ms(20), 25);
     }
 
     #[test]
-    fn large_runs_compress_rather_than_arrive_late() {
+    fn a_crowded_ip_compresses_rather_than_arriving_late() {
         // Arriving a second late is recoverable; arriving after a sell-out is
         // not. The spread is capped, so the step shrinks instead.
         for n in [61usize, 100, 250, 1000] {
@@ -4936,13 +4898,24 @@ mod tests {
     }
 
     #[test]
-    fn the_step_never_grows_with_the_wallet_count() {
+    fn the_step_never_grows_with_the_group_size() {
         let mut prev = u64::MAX;
         for n in [2usize, 5, 10, 50, 61, 100, 500] {
             let step = gql_stagger_step_ms(n);
             assert!(step <= prev, "step grew at {n}: {prev} -> {step}");
             prev = step;
         }
+    }
+
+    #[test]
+    fn the_measured_budget_is_recorded_where_the_code_uses_it() {
+        // Both numbers come from probing the live endpoint, not from taste:
+        // the fifth request reports remaining=0, the sixth is refused, and a
+        // token returns at about 4.3s. A hundred wallets therefore need at
+        // least twenty proxies to fire without waiting.
+        assert_eq!(OPENSEA_MINT_ACTION_BUDGET, 5);
+        assert_eq!(OPENSEA_MINT_ACTION_REFILL_MS, 4_300);
+        assert!(100usize.div_ceil(OPENSEA_MINT_ACTION_BUDGET) == 20);
     }
 
     #[test]

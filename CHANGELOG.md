@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-14
+
+### Fixed
+
+- Whitelist mints no longer starve themselves of OpenSea's request budget.
+  Measured against the live endpoint: calldata is issued only once a stage is
+  open — asking earlier returns `DropNotMintingError`, and that was on a public
+  sale the wallet was eligible for, so it is timing alone. The budget is five
+  mint-action requests per exit IP, refilling roughly one every four seconds,
+  and a *refused* request costs a token exactly like a successful one. The
+  pre-fetch loop retried every 500 ms through its whole window — about ten
+  doomed requests per wallet in the five seconds before open — so wallets
+  reached the fire with `x-ratelimit-remaining: 0` and only those that had
+  refilled a token could mint. The pre-fetch for stages that are not open is
+  removed rather than tuned; local `mintPublic` calldata is unaffected, being
+  built offline at no request cost.
+- The wait OpenSea asks for is honoured instead of discarded. `retry-after`
+  arrives as fractional seconds (`2.5`) and, on the mint-action query, inside
+  an HTTP 200 GraphQL error rather than a 429 header. It was parsed as an
+  integer, failed, and was reported as "no wait"; the worker then slept a flat
+  100 ms three times and gave up — 300 ms against a server asking for 2.5 s.
+  Server-requested waits now survive as milliseconds and draw on their own
+  budget, so honouring one no longer consumes the three attempts a genuine
+  error gets.
+- Wallets that reach T0 unarmed are spaced only against others sharing their
+  exit IP, since the budget is per IP. A run now warns when more than five
+  wallets share one proxy — the case where the surplus genuinely has to wait.
+- Pre-fetch failures report why they failed instead of being swallowed.
+
 ## [0.2.0] - 2026-08-14
 
 ### Added
@@ -70,6 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Session / vault Debug redaction
 - Wave A–D hardening (LIVE gate, fee caps, zero-address rejects, OpenSea value checks, etc.)
 
-[Unreleased]: https://github.com/MaxBetov-pdd/Minter-rs-v2/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/MaxBetov-pdd/Minter-rs-v2/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/tag/v0.2.1
 [0.2.0]: https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/tag/v0.2.0
 [0.1.0]: https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/tag/v0.1.0

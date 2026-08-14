@@ -109,14 +109,15 @@ MINTER is a **self-contained desktop app**: a Rust engine (`minter-core`) wrappe
 | Area | What you get |
 |------|--------------|
 | **Vault** | AES-GCM encrypted keys, password-protected, atomic writes, memory zeroized on lock |
-| **Wallets** | Import, A/B/C groups, **balances by network**, per-wallet sticky proxy |
-| **OpenSea drops** | Slug/URL resolve, phase picker, WL / eligibility export |
+| **Wallets** | Import, **free-form named groups**, **balances by network**, per-wallet sticky proxy |
+| **OpenSea drops** | Slug/URL resolve, phase picker, WL / eligibility export — and **auto-load**: a saved WL check pre-selects exactly the wallets eligible for the phase you target |
 | **Tasks** | slug → phase → wallets → **Start** (LIVE; type `LIVE` to confirm by default) |
 | **Mission Control** | Live HUD on OpenSea Start — phase, stats, per-wallet rows, mirrored log |
 | **OpenSea mint** | Wall-clock phase open → **fixed-gas** send (no estimate gate on LIVE) → on-chain confirm |
 | **Raw Mint** | Multi-wallet pre-sign race · Discover (EIP-1167/1967 proxy + 4byte) · simple `mint(uint256)` |
 | **Advanced** | Sweep ETH/NFT, disperse, multicall helpers; Flashbots path on **Ethereum mainnet only** |
-| **RPC** | Private Alchemy multi-chain (your key only) · **Ping networks** (+ via proxy) · latency |
+| **RPC** | Private Alchemy multi-chain (your key only) · **per-endpoint ping** tagged by origin, so a paid node is never confused with the public fallback appended to every chain · the mint log names which endpoint leads and which one accepted each broadcast |
+| **Reliability** | A broadcast that times out is checked against the chain instead of being called a failure, the signed hash is kept, and a run ends with a reconciliation pass — a mint that landed is never reported as lost |
 | **Proxies** | HTTP / SOCKS, health checks, sticky wallet mapping (OpenSea auth path) |
 | **Results** | JSON / CSV export, run history, explorer links, full mint logs |
 | **UI** | Dark-only, EN / RU, phase banner, first-confirm badge + optional beep |
@@ -143,10 +144,15 @@ MINTER is a **self-contained desktop app**: a Rust engine (`minter-core`) wrappe
 
 | Method | When |
 |--------|------|
-| **[GitHub Releases](https://github.com/MaxBetov-pdd/Minter-rs-v2/releases)** | You want a zip + `minter-desktop.exe` |
+| **[Windows zip](https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/latest)** | Run it on your own machine — download, unzip, launch |
+| **[One-command Linux install](deploy/linux/README.md)** | Run it 24/7 on a headless VPS, close to the chain |
 | **Build from source** | You develop or want a custom build |
 
-Unsigned builds may show Windows SmartScreen — **More info → Run anyway**. Code signing is not included in v0.1.x.
+Both release artifacts are built by CI from the same tag and published with
+SHA256 sums. The Linux binary is linked on Ubuntu 22.04 so it runs on Ubuntu
+22.04+, Debian 12+, Fedora 36+, RHEL/Rocky/Alma 9+ and Arch alike.
+
+Unsigned builds may show Windows SmartScreen — **More info → Run anyway**. Code signing is not included yet.
 
 <br>
 
@@ -230,6 +236,8 @@ Security reports: see **[SECURITY.md](SECURITY.md)** (private disclosure).
 
 | Doc | Audience |
 |-----|----------|
+| [`QUICKSTART.md`](QUICKSTART.md) | **Начните отсюда** — RU, от скачивания до первого минта |
+| [`deploy/linux/README.md`](deploy/linux/README.md) | Headless VPS install and operations |
 | [`docs/OPERATOR_GUIDE.md`](docs/OPERATOR_GUIDE.md) | EN first-run + mint flow |
 | [`USER_GUIDE.md`](USER_GUIDE.md) | Full RU operator manual |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Build, PR, tests |
@@ -246,9 +254,16 @@ crates/minter-core/          # mint engine, vault, RPC, OpenSea, raw sniper
 crates/minter-desktop/       # Tauri 2 app + static UI
   src-tauri/                 # Rust shell
   ui/                        # HTML/CSS/JS
+deploy/linux/                # headless VPS: installer, systemd unit, Xvfb+noVNC runner
+deploy/windows/              # persistent tunnel helper (Tailscale)
 scripts/package-public.ps1   # local Windows ship folder / safe zip
-.github/workflows/           # CI + tag release
+.github/workflows/           # CI + tag release (Windows + Linux artifacts)
 ```
+
+Reaching the GUI on a server is a separate, deliberately small repository:
+**[minter-connect](https://github.com/MaxBetov-pdd/minter-connect)** — one
+PowerShell script that sets up the SSH key, opens the tunnel and launches the
+browser. noVNC stays bound to the server's loopback; nothing is ever exposed.
 
 <br>
 

@@ -821,39 +821,6 @@ fn cancelled(cancel: &Option<Arc<AtomicBool>>) -> bool {
         .unwrap_or(false)
 }
 
-/// How close to the fire the countdown stops sleeping and spins instead.
-///
-/// A timer that rounds up by a millisecond or two is irrelevant at T-2s and is
-/// the entire error budget at T-2ms. Spinning costs one core for the last
-/// fraction of a second and removes timer granularity from the result.
-const COUNTDOWN_SPIN_MS: i64 = 20;
-
-/// How long to sleep before re-reading the clock during the countdown.
-///
-/// `None` means do not sleep at all — yield and re-check immediately.
-///
-/// Every slice is clamped to the time actually left, which the old ladder did
-/// not do: at T-52ms it slept a flat 5ms, and a slice that runs past the fire
-/// is lateness that can never be recovered. Sleeping in small fixed steps also
-/// accumulates the timer's rounding error across hundreds of iterations, and on
-/// a two-core box under load each step can return late — a measured run fired
-/// 92 ms after its target.
-fn countdown_sleep_ms(remaining_ms: i64) -> Option<u64> {
-    if remaining_ms <= COUNTDOWN_SPIN_MS {
-        return None;
-    }
-    let slice: i64 = if remaining_ms > 10_000 {
-        200
-    } else if remaining_ms > 2_000 {
-        50
-    } else {
-        5
-    };
-    // Never sleep past the point where the ladder would step down, and never
-    // past the fire itself.
-    Some(slice.min(remaining_ms - COUNTDOWN_SPIN_MS).max(1) as u64)
-}
-
 /// Mint-action requests OpenSea allows before it starts refusing.
 ///
 /// Measured against the live endpoint: the fifth request reports
@@ -2674,10 +2641,19 @@ pub async fn run_opensea_mint(
                 prep_frozen = true;
             }
 
-            match countdown_sleep_ms(remaining_ms) {
-                Some(ms) => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
-                None => tokio::task::yield_now().await,
-            }
+            let sleep_ms = if remaining_ms > 10_000 {
+                200
+            } else if remaining_ms > 2_000 {
+                50
+            } else if remaining_ms > 50 {
+                5
+            } else if remaining_ms > 5 {
+                1
+            } else {
+                tokio::task::yield_now().await;
+                continue;
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
         }
 
         if !prep_frozen {
@@ -4485,13 +4461,13 @@ pub async fn run_opensea_mint(
 #[cfg(test)]
 mod tests {
     use super::{
-        COUNTDOWN_SPIN_MS, GQL_STAGGER_MAX_SPREAD_MS, NOT_ACTIVE_CHAIN_WAIT_MAX_SECS,
-        NotActiveInfo, OPENSEA_MINT_ACTION_BUDGET, OPENSEA_MINT_ACTION_REFILL_MS,
-        PHASE_OPEN_LAG_WINDOW_SECS, RATE_LIMIT_WAIT_BUDGET_MS, WalletAuth, assigned_proxy_routes,
-        build_local_public_mint, classify_mint_error, countdown_sleep_ms, enrich_mint_rpc_error,
-        estimate_fail_policy, fire_lag_ms_from_clock, format_not_active, format_rpc_plan,
-        gql_stagger_step_ms, in_phase_open_lag_window, parse_not_active, parse_tx_calldata_hex,
-        pre_sign_ready_wallets, rate_limit_backoff, resolve_mint_gas_limit,
+        GQL_STAGGER_MAX_SPREAD_MS, NOT_ACTIVE_CHAIN_WAIT_MAX_SECS, NotActiveInfo,
+        OPENSEA_MINT_ACTION_BUDGET, OPENSEA_MINT_ACTION_REFILL_MS, PHASE_OPEN_LAG_WINDOW_SECS,
+        RATE_LIMIT_WAIT_BUDGET_MS, WalletAuth, assigned_proxy_routes, build_local_public_mint,
+        classify_mint_error, enrich_mint_rpc_error, estimate_fail_policy, fire_lag_ms_from_clock,
+        format_not_active, format_rpc_plan, gql_stagger_step_ms, in_phase_open_lag_window,
+        parse_not_active, parse_tx_calldata_hex, pre_sign_ready_wallets, rate_limit_backoff,
+        resolve_mint_gas_limit,
     };
     use crate::proxy::ProxyManager;
     use crate::types::Signer;
@@ -4889,87 +4865,6 @@ mod tests {
         let mut b = [0u8; 20];
         b[19] = last_byte;
         Address::from(b)
-    }
-
-    #[test]
-    fn the_countdown_never_sleeps_past_the_fire() {
-        // The old ladder slept a flat 5ms whenever more than 50ms remained, so
-        // at T-52ms it could wake at T-47ms — but at T-21ms it slept 5ms and
-        // landed at T-16ms, and the last stretch was a 1ms drumbeat whose
-        // rounding is the whole error budget. Nothing may overshoot now.
-        for remaining in [
-            1i64, 5, 19, 20, 21, 25, 60, 100, 1_999, 2_001, 9_999, 60_000,
-        ] {
-            match countdown_sleep_ms(remaining) {
-                None => assert!(
-                    remaining <= COUNTDOWN_SPIN_MS,
-                    "spinning with {remaining}ms left wastes a core"
-                ),
-                Some(ms) => assert!(
-                    (ms as i64) <= remaining - COUNTDOWN_SPIN_MS,
-                    "with {remaining}ms left it sleeps {ms}ms and lands inside the spin window"
-                ),
-            }
-        }
-    }
-
-    #[test]
-    fn the_countdown_spins_only_at_the_very_end() {
-        // Spinning burns a core, so it must stay a short final approach and not
-        // creep out into the whole last second.
-        assert_eq!(countdown_sleep_ms(20), None);
-        assert_eq!(countdown_sleep_ms(0), None);
-        assert!(countdown_sleep_ms(21).is_some());
-        // Far out it must not wake pointlessly often.
-        assert_eq!(countdown_sleep_ms(60_000), Some(200));
-        assert_eq!(countdown_sleep_ms(5_000), Some(50));
-        assert_eq!(countdown_sleep_ms(500), Some(5));
-    }
-
-    /// The measurement that started this: a run fired 92ms after its target.
-    ///
-    /// Reproduces the shape of that machine — two worker threads, background
-    /// tasks doing what the pre-fetch used to do — and checks the countdown
-    /// still lands on time. Deliberately generous: this guards against a
-    /// regression back into tens of milliseconds, not against jitter.
-    #[test]
-    fn the_countdown_lands_on_time_under_load() {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let overshoot_ms = rt.block_on(async {
-            for _ in 0..8 {
-                tokio::spawn(async {
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                        // Some real work, so the countdown competes for a core
-                        // rather than idling next to sleeping tasks.
-                        std::hint::black_box((0..40_000u64).sum::<u64>());
-                    }
-                });
-            }
-            let target = std::time::Instant::now() + std::time::Duration::from_millis(600);
-            loop {
-                let now = std::time::Instant::now();
-                if now >= target {
-                    return now.duration_since(target).as_millis();
-                }
-                let remaining_ms = target.duration_since(now).as_millis() as i64;
-                match countdown_sleep_ms(remaining_ms) {
-                    Some(ms) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-                    }
-                    None => tokio::task::yield_now().await,
-                }
-            }
-        });
-        println!("countdown overshoot under load: {overshoot_ms}ms (was 92ms in production)");
-        assert!(
-            overshoot_ms < 25,
-            "countdown fired {overshoot_ms}ms late under load"
-        );
     }
 
     #[test]

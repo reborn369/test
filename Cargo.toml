@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/minter-core",
+    "crates/minter-desktop/src-tauri",
+]
+default-members = ["crates/minter-desktop/src-tauri"]
+
+[workspace.package]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/MaxBetov-pdd/Minter-rs-v2"
+authors = ["Andark <andarx4nok@gmail.com>"]

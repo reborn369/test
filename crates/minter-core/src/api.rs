@@ -1,0 +1,4018 @@
+//! High-level API for CLI and desktop UIs.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use alloy_primitives::Address;
+use anyhow::{Context, Result, bail};
+use zeroize::Zeroizing;
+
+use crate::amount;
+use crate::auth_cache::AuthCache;
+use crate::disperse::{self, DisperseConfig};
+use crate::flashbots::FlashbotsConfig;
+use crate::multicall::{self, MULTICALL3, MulticallConfig, MulticallStep};
+use crate::opensea;
+use crate::progress::MintReporter;
+use crate::raw_mint::{self, RawMintConfig};
+use crate::raw_sniper::{self, RawSniperConfig, SniperPreset, ValueMode};
+use crate::rpc::RpcClient;
+use crate::settings::Settings;
+use crate::sweep::{self, AutoNftSweepConfig, SweepEthConfig};
+use crate::types::{GasMode, GasParams, Signer, max_retries_from_env};
+use crate::vault::Vault;
+use crate::{BURNER_WARNING, NO_TELEMETRY};
+use alloy_primitives::U256;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+/// Shared session state for any UI.
+///
+/// **Security:** do not `#[derive(Debug)]` — password and private keys must never
+/// appear in logs via `{:?}`. See manual [`Debug`] impl below.
+#[derive(Clone)]
+pub struct Session {
+    vault_path: PathBuf,
+    /// Primary settings store (`config.json`).
+    config_path: PathBuf,
+    /// Optional legacy `.env` (migration + CLI mint env map).
+    env_path: PathBuf,
+    password: Option<Zeroizing<String>>,
+    pub signers: Vec<Signer>,
+    pub settings: Settings,
+    pub env: HashMap<String, String>,
+    pub dry_run: bool,
+    pub network_label: String,
+    pub rpc_status: String,
+    pub proxy_count: usize,
+    pub burner_accepted: bool,
+    pub last_drop: String,
+    pub last_contract: String,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print password, private keys, Alchemy key, or env values.
+        f.debug_struct("Session")
+            .field("vault_path", &self.vault_path)
+            .field("config_path", &self.config_path)
+            .field("env_path", &self.env_path)
+            .field(
+                "password",
+                &if self.password.is_some() {
+                    "[set]"
+                } else {
+                    "[none]"
+                },
+            )
+            .field("signers", &format_args!("[{}]", self.signers.len()))
+            .field(
+                "alchemy",
+                &if self.settings.alchemy_api_key.trim().is_empty() {
+                    "unset"
+                } else {
+                    "set"
+                },
+            )
+            .field("has_rpc", &self.settings.has_rpc())
+            .field("env_entries", &self.env.len())
+            .field("dry_run", &self.dry_run)
+            .field("network_label", &self.network_label)
+            .field("rpc_status", &self.rpc_status)
+            .field("proxy_count", &self.proxy_count)
+            .field("burner_accepted", &self.burner_accepted)
+            .field("last_drop", &self.last_drop)
+            .field("last_contract", &self.last_contract)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SecurityStatus {
+    pub vault_exists: bool,
+    pub unlocked: bool,
+    pub wallet_count: usize,
+    pub dry_run: bool,
+    pub burner_accepted: bool,
+    pub burner_warning: String,
+    pub no_telemetry: String,
+    pub ready: bool,
+    pub ready_reason: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RpcProbeResult {
+    pub url_short: String,
+    pub ok: bool,
+    pub chain_id: Option<u64>,
+    pub latency_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+/// Per-endpoint RPC ping row (RPCs page multi-chain probe).
+///
+/// One row per configured endpoint, not one per chain: a chain routinely has a
+/// paid endpoint *and* the automatically appended public fallback, and both are
+/// used at broadcast time. Collapsing them to a single "best" row hid that.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkProbeRow {
+    pub chain: String,
+    pub url_short: String,
+    pub ok: bool,
+    pub chain_id: Option<u64>,
+    pub latency_ms: Option<u64>,
+    pub via_proxy: bool,
+    pub proxy_label: Option<String>,
+    pub error: Option<String>,
+    /// Where this endpoint came from (`provider key`, `public fallback`, …).
+    pub origin: String,
+    /// 1-based position after sorting by latency; `None` when the probe failed.
+    /// Rank 1 is the endpoint a mint would use for nonce / fee / hedged reads.
+    pub rank: Option<usize>,
+    /// True for rank 1 — the lead endpoint of this chain.
+    pub primary: bool,
+    /// True when a broadcast on this chain would reach this endpoint
+    /// (i.e. rank within the RPC fan-out width).
+    pub used_in_broadcast: bool,
+}
+
+/// Cold-connect and warmed keep-alive latency for one RPC endpoint.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WarmRpcLatencyRow {
+    pub chain: String,
+    pub url_short: String,
+    pub ok: bool,
+    pub chain_id: Option<u64>,
+    pub cold_ms: Option<u64>,
+    pub min_ms: Option<u64>,
+    pub median_ms: Option<u64>,
+    pub p90_ms: Option<u64>,
+    pub sample_count: usize,
+    pub failed_samples: usize,
+    pub via_proxy: bool,
+    pub proxy_label: Option<String>,
+    pub error: Option<String>,
+}
+
+const WARM_RPC_SAMPLES: usize = 10;
+
+fn warm_latency_stats(mut samples: Vec<u64>) -> Option<(u64, u64, u64)> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_unstable();
+    let len = samples.len();
+    let median = if len.is_multiple_of(2) {
+        samples[len / 2 - 1].saturating_add(samples[len / 2]) / 2
+    } else {
+        samples[len / 2]
+    };
+    let p90_index = (len * 9).div_ceil(10).saturating_sub(1).min(len - 1);
+    Some((samples[0], median, samples[p90_index]))
+}
+
+#[cfg(test)]
+mod warm_latency_stats_tests {
+    use super::warm_latency_stats;
+
+    #[test]
+    fn empty_samples_have_no_stats() {
+        assert_eq!(warm_latency_stats(vec![]), None);
+    }
+
+    #[test]
+    fn reports_sorted_min_median_and_nearest_rank_p90() {
+        assert_eq!(
+            warm_latency_stats(vec![10, 2, 7, 4, 9, 1, 8, 3, 6, 5]),
+            Some((1, 5, 9))
+        );
+    }
+
+    #[test]
+    fn one_sample_is_all_percentiles() {
+        assert_eq!(warm_latency_stats(vec![13]), Some((13, 13, 13)));
+    }
+}
+
+async fn measure_warm_rpc_url(
+    chain: String,
+    url: String,
+    via_proxy: bool,
+    proxy_url: Option<String>,
+    proxy_label: Option<String>,
+) -> WarmRpcLatencyRow {
+    let url_short = short_url(&url);
+    let mut row = WarmRpcLatencyRow {
+        chain,
+        url_short,
+        ok: false,
+        chain_id: None,
+        cold_ms: None,
+        min_ms: None,
+        median_ms: None,
+        p90_ms: None,
+        sample_count: 0,
+        failed_samples: 0,
+        via_proxy,
+        proxy_label,
+        error: None,
+    };
+    let rpc = match RpcClient::new_with_proxy(vec![url], proxy_url.as_deref()) {
+        Ok(rpc) => rpc,
+        Err(e) => {
+            row.error = Some(format!("create RPC client: {e}"));
+            return row;
+        }
+    };
+
+    // The first request intentionally records DNS + TCP + TLS + JSON-RPC.
+    let started = Instant::now();
+    match rpc.chain_id().await {
+        Ok(id) => {
+            row.chain_id = Some(id);
+            row.cold_ms = Some(started.elapsed().as_millis() as u64);
+        }
+        Err(e) => {
+            row.error = Some(e.to_string());
+            return row;
+        }
+    }
+
+    // Discard one extra request so connection setup and HTTP/2 negotiation are
+    // outside the measured keep-alive sample set.
+    if let Err(e) = rpc.chain_id().await {
+        row.error = Some(format!("warm-up failed: {e}"));
+        return row;
+    }
+
+    let mut samples = Vec::with_capacity(WARM_RPC_SAMPLES);
+    let mut last_error = None;
+    for _ in 0..WARM_RPC_SAMPLES {
+        let started = Instant::now();
+        match rpc.chain_id().await {
+            Ok(id) if Some(id) == row.chain_id => {
+                samples.push(started.elapsed().as_millis() as u64);
+            }
+            Ok(id) => {
+                row.failed_samples += 1;
+                last_error = Some(format!("chainId changed from {:?} to {id}", row.chain_id));
+            }
+            Err(e) => {
+                row.failed_samples += 1;
+                last_error = Some(e.to_string());
+            }
+        }
+    }
+    row.sample_count = samples.len();
+    if let Some((min_ms, median_ms, p90_ms)) = warm_latency_stats(samples) {
+        row.min_ms = Some(min_ms);
+        row.median_ms = Some(median_ms);
+        row.p90_ms = Some(p90_ms);
+        row.ok = true;
+    }
+    if row.failed_samples > 0 {
+        row.error = Some(format!(
+            "{} sample(s) failed{}",
+            row.failed_samples,
+            last_error.map(|e| format!(": {e}")).unwrap_or_default()
+        ));
+    } else if !row.ok {
+        row.error = Some("no successful warm samples".into());
+    }
+    row
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletInfo {
+    /// 1-based display index.
+    pub index: usize,
+    pub address: String,
+    /// Short proxy label (auto by vault index, unless overridden by caller UI).
+    pub proxy: String,
+    /// 0-based proxy list index used for auto mapping.
+    pub proxy_index: Option<u32>,
+}
+
+/// Safe IPC response for generated burner wallets. Private keys are present
+/// only in the encrypted vault and the owner-only backup file at `backup_path`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratedBurnersInfo {
+    pub count: usize,
+    pub total_wallets: usize,
+    pub backup_path: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletBalanceRow {
+    pub address: String,
+    pub balance_eth: String,
+    pub balance_wei: String,
+    pub ok: bool,
+    pub error: Option<String>,
+    /// Network used for this balance (e.g. base).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyListItem {
+    pub index: u32,
+    pub label: String,
+}
+
+impl Session {
+    pub fn new(vault_path: impl Into<PathBuf>, env_path: impl Into<PathBuf>) -> Self {
+        let env_path = env_path.into();
+        let config_path = env_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.join("config.json"))
+            .unwrap_or_else(|| PathBuf::from("config.json"));
+        Self::with_paths(vault_path, config_path, env_path)
+    }
+
+    pub fn with_paths(
+        vault_path: impl Into<PathBuf>,
+        config_path: impl Into<PathBuf>,
+        env_path: impl Into<PathBuf>,
+    ) -> Self {
+        let vault_path = vault_path.into();
+        let config_path = config_path.into();
+        let env_path = env_path.into();
+
+        let settings = Settings::load(&config_path, Some(&env_path));
+        let mut env = load_env_file(&env_path);
+        // config.json owns connection keys — drop stale .env RPC/Alchemy first
+        settings.apply_connection_to_env(&mut env);
+
+        let mut rpc_status = "—".into();
+        let mut network_label = "Not selected".into();
+        let urls = collect_rpc_urls(&env);
+        if !urls.is_empty() {
+            rpc_status = format!("{}", urls.len());
+            network_label = network_label_from_settings(&settings);
+        }
+
+        let dry_run = settings.dry_run;
+        let proxy_count = settings.proxy_count();
+        Self {
+            vault_path,
+            config_path,
+            env_path,
+            password: None,
+            signers: Vec::new(),
+            settings,
+            env,
+            dry_run,
+            network_label,
+            rpc_status,
+            proxy_count,
+            burner_accepted: false,
+            last_drop: "—".into(),
+            last_contract: "—".into(),
+        }
+    }
+
+    pub fn default_paths() -> Self {
+        Self::with_paths("keys.vault", "config.json", ".env")
+    }
+
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+
+    pub fn env_path(&self) -> &Path {
+        &self.env_path
+    }
+
+    pub fn vault_exists(&self) -> bool {
+        self.vault_path.exists()
+    }
+
+    pub fn is_unlocked(&self) -> bool {
+        self.password.is_some()
+    }
+
+    pub fn has_wallets(&self) -> bool {
+        !self.signers.is_empty()
+    }
+
+    /// Fail closed for live spends when Settings.require_live_confirm is on.
+    fn gate_live(&self, dry_run: bool, confirm: &str) -> Result<()> {
+        crate::safety_policy::ensure_live_confirm(
+            self.settings.require_live_confirm,
+            dry_run,
+            confirm,
+        )
+        .map_err(|e| anyhow::anyhow!(e))
+    }
+
+    pub fn rpc_configured(&self) -> bool {
+        // Check the real source of truth. This used to sniff `rpc_status` for
+        // legacy sentinel strings ("not set" / "not configured" / "not checked")
+        // that the code no longer produces — the current values are "—", a URL
+        // count, "OK 42ms" or "failed", none of which match, so the gate was
+        // always true and `setup_ready` ignored a completely unconfigured RPC.
+        !collect_rpc_urls(&self.env).is_empty()
+    }
+
+    pub fn setup_ready(&self) -> bool {
+        self.has_wallets() && self.rpc_configured()
+    }
+
+    pub fn not_ready_reason(&self) -> &'static str {
+        if !self.has_wallets() {
+            "no wallets"
+        } else if !self.rpc_configured() {
+            "no network/RPC"
+        } else {
+            "setup required"
+        }
+    }
+
+    pub fn accept_burner_warning(&mut self) {
+        self.burner_accepted = true;
+    }
+
+    pub fn unlock(&mut self, password: &str) -> Result<usize> {
+        let vault = Vault::new(&self.vault_path);
+        if !vault.exists() {
+            // Create empty session password for new vault
+            self.password = Some(Zeroizing::new(password.to_string()));
+            self.signers.clear();
+            return Ok(0);
+        }
+        let keys = vault.decrypt_keys(password)?;
+        self.password = Some(Zeroizing::new(password.to_string()));
+        self.rebuild_signers_from_keys(&keys);
+        Ok(self.signers.len())
+    }
+
+    pub fn lock(&mut self) {
+        self.password = None;
+        self.signers.clear();
+    }
+
+    /// Move unlocked key material out of `src` into `self`.
+    ///
+    /// `unlock` is expensive (600k PBKDF2 rounds), so callers run it on a
+    /// detached clone with no lock held, then install the result here. Only the
+    /// password + signers are adopted — settings, env and connection state stay
+    /// as they are, so a settings save that landed during the derivation is not
+    /// clobbered by the stale snapshot.
+    ///
+    /// `src` is left locked, so the surrendered clone keeps no usable copy of
+    /// the password or the private keys.
+    pub fn adopt_unlocked(&mut self, src: &mut Session) {
+        self.password = src.password.take();
+        self.signers = std::mem::take(&mut src.signers);
+    }
+
+    fn rebuild_signers_from_keys(&mut self, keys: &[Zeroizing<String>]) {
+        self.signers = keys
+            .iter()
+            .filter_map(|k| k.strip_prefix("0x").unwrap_or(k).parse().ok())
+            .collect();
+    }
+
+    pub fn list_wallets(&self) -> Vec<WalletInfo> {
+        let proxies = self.proxy_manager();
+        self.signers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let proxy = proxies.short(i);
+                let proxy_index = if proxies.is_empty() {
+                    None
+                } else {
+                    Some((i % proxies.len()) as u32)
+                };
+                WalletInfo {
+                    index: i + 1,
+                    address: format!("{:?}", s.address()),
+                    proxy,
+                    proxy_index,
+                }
+            })
+            .collect()
+    }
+
+    pub fn list_proxies(&self) -> Vec<ProxyListItem> {
+        self.proxy_manager()
+            .list_short()
+            .into_iter()
+            .map(|(i, label)| ProxyListItem {
+                index: i as u32,
+                label,
+            })
+            .collect()
+    }
+
+    pub fn add_key(&mut self, private_key: &str) -> Result<String> {
+        let pw = self
+            .password
+            .as_deref()
+            .context("vault locked — unlock first")?;
+        let vault = Vault::new(&self.vault_path);
+        let addr = vault.add(private_key, pw)?;
+        let keys = vault.decrypt_keys(pw)?;
+        self.rebuild_signers_from_keys(&keys);
+        Ok(format!("{:?}", addr))
+    }
+
+    pub fn import_file(&mut self, path: &Path) -> Result<usize> {
+        let pw = self
+            .password
+            .as_deref()
+            .context("vault locked — unlock first")?;
+        let vault = Vault::new(&self.vault_path);
+        let n = vault.import_from_file(path, pw)?;
+        let keys = vault.decrypt_keys(pw)?;
+        self.rebuild_signers_from_keys(&keys);
+        Ok(n)
+    }
+
+    /// Import keys from free-form text (drag-drop / multi-file merge).
+    pub fn import_keys_text(&mut self, text: &str) -> Result<usize> {
+        let pw = self
+            .password
+            .as_deref()
+            .context("vault locked — unlock first")?;
+        let vault = Vault::new(&self.vault_path);
+        let n = vault.import_from_text(text, pw)?;
+        let keys = vault.decrypt_keys(pw)?;
+        self.rebuild_signers_from_keys(&keys);
+        Ok(n)
+    }
+
+    /// Generate burner wallets without exposing private keys through IPC.
+    /// The Vault writes a recovery file before its atomic encrypted rewrite;
+    /// reloading afterward also verifies that the new vault decrypts cleanly.
+    pub fn generate_burners(&mut self, count: usize) -> Result<GeneratedBurnersInfo> {
+        let pw = self
+            .password
+            .as_deref()
+            .context("vault locked — unlock first")?;
+        let vault = Vault::new(&self.vault_path);
+        let vault_parent = self
+            .vault_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let batch = vault.generate_burners(count, pw, &vault_parent.join("imports"))?;
+        let keys = vault.decrypt_keys(pw)?;
+        self.rebuild_signers_from_keys(&keys);
+        Ok(GeneratedBurnersInfo {
+            count: batch.count,
+            total_wallets: self.signers.len(),
+            backup_path: batch.backup_path.display().to_string(),
+        })
+    }
+
+    /// Import multiple key files; returns total new keys.
+    pub fn import_files(&mut self, paths: &[PathBuf]) -> Result<usize> {
+        let mut total = 0;
+        for p in paths {
+            total += self.import_file(p)?;
+        }
+        Ok(total)
+    }
+
+    /// Native balances for selected (or all) vault wallets.
+    /// `chain`: optional network name (uses chain RPC; empty → default RPC list).
+    pub async fn wallet_balances(
+        &self,
+        wallet_addresses: Option<Vec<String>>,
+        chain: Option<&str>,
+    ) -> Result<Vec<WalletBalanceRow>> {
+        if self.signers.is_empty() {
+            bail!("No wallets unlocked");
+        }
+        let rpc = match chain.map(str::trim).filter(|c| !c.is_empty()) {
+            Some(c) => self.rpc_client_for_chain(c)?,
+            None => self.rpc_client()?,
+        };
+        let filter: Option<std::collections::HashSet<String>> = wallet_addresses.and_then(|v| {
+            let set: std::collections::HashSet<String> = v
+                .into_iter()
+                .map(|a| normalize_address(&a))
+                .filter(|a| a.len() > 2)
+                .collect();
+            if set.is_empty() { None } else { Some(set) }
+        });
+        let mut rows = Vec::new();
+        for s in &self.signers {
+            let addr = s.address();
+            let addr_s = format!("{:?}", addr);
+            if let Some(ref f) = filter {
+                if !f.contains(&normalize_address(&addr_s)) {
+                    continue;
+                }
+            }
+            let chain_label = chain
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(|c| c.to_string());
+            match rpc.balance(&addr).await {
+                Ok(wei) => {
+                    let eth = amount::wei_to_eth_string(wei);
+                    // "funded enough for gas+dust" — UI may raise threshold
+                    let ok = wei > U256::from(10_000_000_000_000u64); // > 0.00001 ETH
+                    rows.push(WalletBalanceRow {
+                        address: addr_s,
+                        balance_eth: eth,
+                        balance_wei: wei.to_string(),
+                        ok,
+                        error: None,
+                        chain: chain_label.clone(),
+                    });
+                }
+                Err(e) => {
+                    rows.push(WalletBalanceRow {
+                        address: addr_s,
+                        balance_eth: "—".into(),
+                        balance_wei: "0".into(),
+                        ok: false,
+                        error: Some(e.to_string()),
+                        chain: chain_label.clone(),
+                    });
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    pub fn remove_wallet(&mut self, address: &str) -> Result<()> {
+        let pw = self
+            .password
+            .as_deref()
+            .context("vault locked — unlock first")?;
+        let vault = Vault::new(&self.vault_path);
+        vault.remove(address, pw)?;
+        let keys = vault.decrypt_keys(pw)?;
+        self.rebuild_signers_from_keys(&keys);
+        Ok(())
+    }
+
+    pub fn reload_env(&mut self) {
+        self.settings = Settings::load(&self.config_path, Some(&self.env_path));
+        self.env = load_env_file(&self.env_path);
+        self.settings.apply_connection_to_env(&mut self.env);
+        self.dry_run = self.settings.dry_run;
+        self.proxy_count = self.settings.proxy_count();
+        self.refresh_rpc_label();
+    }
+
+    fn refresh_rpc_label(&mut self) {
+        let urls = collect_rpc_urls(&self.env);
+        if urls.is_empty() {
+            self.rpc_status = "—".into();
+            self.network_label = "Not selected".into();
+        } else {
+            self.rpc_status = format!("{}", urls.len());
+            self.network_label = network_label_from_settings(&self.settings);
+        }
+    }
+
+    /// Persist settings to config.json and sync in-memory env map.
+    pub fn save_settings(&mut self) -> Result<()> {
+        self.settings.dry_run = self.dry_run;
+        self.settings
+            .save(&self.config_path)
+            .context("write config.json")?;
+        // Optional: keep .env mirror for CLI tools that still open .env
+        // (also strips empty connection keys from .env)
+        let _ = self.settings.save_to_env_file(&self.env_path);
+        self.settings.apply_connection_to_env(&mut self.env);
+        self.proxy_count = self.settings.proxy_count();
+        self.refresh_rpc_label();
+        Ok(())
+    }
+
+    /// Apply full settings snapshot from UI (keys, RPC, gas, flags).
+    pub fn apply_settings(&mut self, settings: Settings) {
+        self.settings = settings;
+        self.dry_run = self.settings.dry_run;
+        self.settings.apply_connection_to_env(&mut self.env);
+        self.proxy_count = self.settings.proxy_count();
+        self.refresh_rpc_label();
+    }
+
+    pub fn apply_sniper_preset(&mut self) {
+        self.settings.apply_sniper_preset();
+    }
+
+    pub fn security_status(&self) -> SecurityStatus {
+        SecurityStatus {
+            vault_exists: self.vault_exists(),
+            unlocked: self.password.is_some(),
+            wallet_count: self.signers.len(),
+            dry_run: self.dry_run,
+            burner_accepted: self.burner_accepted,
+            burner_warning: BURNER_WARNING.to_string(),
+            no_telemetry: NO_TELEMETRY.to_string(),
+            ready: self.setup_ready(),
+            ready_reason: if self.setup_ready() {
+                "ready".into()
+            } else {
+                self.not_ready_reason().into()
+            },
+        }
+    }
+
+    /// Ping RPC for multiple networks (Settings URLs / Alchemy / public fallback).
+    /// `via_proxy`: if true, use first configured proxy for all RPC calls.
+    pub async fn probe_networks(
+        &self,
+        chains: Option<Vec<String>>,
+        via_proxy: bool,
+    ) -> Result<Vec<NetworkProbeRow>> {
+        let chain_list: Vec<String> = match chains {
+            Some(c) if !c.is_empty() => c
+                .into_iter()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            _ => vec![
+                "ethereum".into(),
+                "base".into(),
+                "polygon".into(),
+                "arbitrum".into(),
+                "optimism".into(),
+                "robinhood".into(),
+            ],
+        };
+        let proxy_url = if via_proxy {
+            self.proxy_manager().get(0).map(|s| s.to_string())
+        } else {
+            None
+        };
+        if via_proxy && proxy_url.is_none() {
+            bail!("No proxy configured — add proxies in Settings or uncheck “via proxy”");
+        }
+        let proxy_label = proxy_url.as_ref().map(|u| crate::proxy::short_proxy(u));
+
+        // Fan-out width a real broadcast would use, so the rows can mark which
+        // endpoints actually receive a transaction.
+        let fanout_width = crate::rpc::RpcTuning::from_lookup(|k| {
+            self.env.get(k).cloned().or_else(|| std::env::var(k).ok())
+        })
+        .max_nodes;
+
+        let mut out = Vec::new();
+        for chain in chain_list {
+            let urls = collect_rpc_urls_for_chain_labeled(&self.env, Some(&chain), &[]);
+            if urls.is_empty() {
+                out.push(NetworkProbeRow {
+                    chain: chain.clone(),
+                    url_short: "—".into(),
+                    ok: false,
+                    chain_id: None,
+                    latency_ms: None,
+                    via_proxy,
+                    proxy_label: proxy_label.clone(),
+                    error: Some("no RPC URL for chain".into()),
+                    origin: "—".into(),
+                    rank: None,
+                    primary: false,
+                    used_in_broadcast: false,
+                });
+                continue;
+            }
+            // Probe every configured endpoint, not just the winner. A chain
+            // commonly has a paid endpoint plus the public fallback, and both
+            // receive the transaction at broadcast time.
+            const MAX_PROBE_ENDPOINTS: usize = 6;
+            let mut chain_rows: Vec<NetworkProbeRow> = Vec::new();
+            for (url, origin) in urls.iter().take(MAX_PROBE_ENDPOINTS) {
+                let short = short_url(url);
+                let mut row = NetworkProbeRow {
+                    chain: chain.clone(),
+                    url_short: short,
+                    ok: false,
+                    chain_id: None,
+                    latency_ms: None,
+                    via_proxy,
+                    proxy_label: proxy_label.clone(),
+                    error: None,
+                    origin: origin.label().to_string(),
+                    rank: None,
+                    primary: false,
+                    used_in_broadcast: false,
+                };
+                match RpcClient::new_with_proxy(vec![url.clone()], proxy_url.as_deref()) {
+                    Ok(client) => {
+                        let start = Instant::now();
+                        match client.chain_id().await {
+                            Ok(id) => {
+                                row.ok = true;
+                                row.chain_id = Some(id);
+                                row.latency_ms = Some(start.elapsed().as_millis() as u64);
+                            }
+                            Err(e) => {
+                                row.latency_ms = Some(start.elapsed().as_millis() as u64);
+                                row.error = Some(e.to_string());
+                            }
+                        }
+                    }
+                    Err(e) => row.error = Some(e.to_string()),
+                }
+                chain_rows.push(row);
+            }
+
+            // Rank healthy endpoints by latency — the same rule the mint's
+            // pre-run sort uses — so rank 1 really is the lead node. A failed
+            // probe never gets a rank: a fast failure (connection refused,
+            // NXDOMAIN, 401) is quicker than any real round-trip and must not
+            // outrank a slower *working* endpoint.
+            let mut order: Vec<usize> = (0..chain_rows.len()).filter(|&i| chain_rows[i].ok).collect();
+            order.sort_by_key(|&i| chain_rows[i].latency_ms.unwrap_or(u64::MAX));
+            for (pos, &i) in order.iter().enumerate() {
+                let rank = pos + 1;
+                chain_rows[i].rank = Some(rank);
+                chain_rows[i].primary = rank == 1;
+                chain_rows[i].used_in_broadcast = rank <= fanout_width;
+            }
+            // Present in the order the run would actually use; failures last.
+            chain_rows.sort_by(|a, b| {
+                a.rank
+                    .unwrap_or(usize::MAX)
+                    .cmp(&b.rank.unwrap_or(usize::MAX))
+                    .then_with(|| a.url_short.cmp(&b.url_short))
+            });
+            out.extend(chain_rows);
+        }
+        Ok(out)
+    }
+
+    /// Measure real warmed RPC latency while keeping cold-connect time visible.
+    /// Each endpoint gets one cold request, one discarded warm-up, then ten
+    /// sequential `eth_chainId` samples on the same reqwest connection pool.
+    pub async fn warm_rpc_latency(
+        &self,
+        chains: Option<Vec<String>>,
+        via_proxy: bool,
+    ) -> Result<Vec<WarmRpcLatencyRow>> {
+        let chain_list: Vec<String> = match chains {
+            Some(c) if !c.is_empty() => c
+                .into_iter()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            _ => vec![
+                "ethereum".into(),
+                "base".into(),
+                "polygon".into(),
+                "arbitrum".into(),
+                "optimism".into(),
+                "robinhood".into(),
+            ],
+        };
+        let proxy_url = if via_proxy {
+            self.proxy_manager().get(0).map(str::to_string)
+        } else {
+            None
+        };
+        if via_proxy && proxy_url.is_none() {
+            bail!("No proxy configured — add proxies in Settings or uncheck ‘via proxy’");
+        }
+        let proxy_label = proxy_url.as_ref().map(|u| crate::proxy::short_proxy(u));
+
+        let mut out = Vec::new();
+        let mut tasks = Vec::new();
+        for chain in chain_list {
+            let urls = collect_rpc_urls_for_chain(&self.env, Some(&chain), &[]);
+            if urls.is_empty() {
+                out.push(WarmRpcLatencyRow {
+                    chain,
+                    url_short: "—".into(),
+                    ok: false,
+                    chain_id: None,
+                    cold_ms: None,
+                    min_ms: None,
+                    median_ms: None,
+                    p90_ms: None,
+                    sample_count: 0,
+                    failed_samples: 0,
+                    via_proxy,
+                    proxy_label: proxy_label.clone(),
+                    error: Some("no RPC URL for chain".into()),
+                });
+                continue;
+            }
+            for url in urls.into_iter().take(3) {
+                let task_chain = chain.clone();
+                let task_short = short_url(&url);
+                let task_proxy = proxy_url.clone();
+                let task_proxy_label = proxy_label.clone();
+                let handle = tokio::spawn(measure_warm_rpc_url(
+                    chain.clone(),
+                    url,
+                    via_proxy,
+                    task_proxy,
+                    task_proxy_label,
+                ));
+                tasks.push((task_chain, task_short, handle));
+            }
+        }
+        for (chain, url_short, handle) in tasks {
+            match handle.await {
+                Ok(row) => out.push(row),
+                Err(e) => out.push(WarmRpcLatencyRow {
+                    chain,
+                    url_short,
+                    ok: false,
+                    chain_id: None,
+                    cold_ms: None,
+                    min_ms: None,
+                    median_ms: None,
+                    p90_ms: None,
+                    sample_count: 0,
+                    failed_samples: 0,
+                    via_proxy,
+                    proxy_label: proxy_label.clone(),
+                    error: Some(format!("warm ping task failed: {e}")),
+                }),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Probe configured RPC URLs (up to 5).
+    pub async fn probe_rpc(&mut self) -> Result<Vec<RpcProbeResult>> {
+        // Always refresh env from settings before probe
+        for (k, v) in self.settings.to_env_map() {
+            self.env.insert(k, v);
+        }
+        let urls = collect_rpc_urls(&self.env);
+        if urls.is_empty() {
+            self.rpc_status = "—".into();
+            self.network_label = "Not selected".into();
+            bail!("No RPC configured — open Settings and set Alchemy API key or custom RPC URLs");
+        }
+        let mut out = Vec::new();
+        for url in urls.iter().take(5) {
+            let short = short_url(url);
+            let client = RpcClient::new(vec![url.clone()]);
+            let start = Instant::now();
+            match client.chain_id().await {
+                Ok(id) => {
+                    let ms = start.elapsed().as_millis() as u64;
+                    out.push(RpcProbeResult {
+                        url_short: short,
+                        ok: true,
+                        chain_id: Some(id),
+                        latency_ms: Some(ms),
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    out.push(RpcProbeResult {
+                        url_short: short,
+                        ok: false,
+                        chain_id: None,
+                        latency_ms: None,
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+        let ok_count = out.iter().filter(|r| r.ok).count();
+        if ok_count > 0 {
+            let best = out
+                .iter()
+                .filter(|r| r.ok)
+                .min_by_key(|r| r.latency_ms.unwrap_or(u64::MAX));
+            if let Some(b) = best {
+                let cid = b.chain_id.unwrap_or(0);
+                self.rpc_status = format!("OK {}ms", b.latency_ms.unwrap_or(0));
+                self.network_label = chain_id_label(cid);
+            }
+        } else {
+            self.rpc_status = "failed".into();
+        }
+        Ok(out)
+    }
+
+    pub fn max_retries(&self) -> u32 {
+        if self.settings.max_retries > 0 {
+            self.settings.max_retries
+        } else {
+            max_retries_from_env(&self.env)
+        }
+    }
+
+    pub fn primary_address(&self) -> Option<Address> {
+        self.signers.first().map(|s| s.address())
+    }
+
+    fn gas_params(&self) -> GasParams {
+        GasParams::from_env(&self.env)
+    }
+
+    /// Settings gas + optional per-run overrides (Raw Mint UI).
+    /// - `priority_fee_gwei` / `max_fee_gwei`: empty or "auto" → keep settings
+    /// - both set → Manual; only priority → Hybrid; only max → Auto with max_fee cap
+    fn gas_params_override(
+        &self,
+        priority_fee_gwei: Option<&str>,
+        max_fee_gwei: Option<&str>,
+        gas_multiplier: Option<f64>,
+    ) -> GasParams {
+        let mut g = self.gas_params();
+        if let Some(m) = gas_multiplier {
+            if m > 0.0 {
+                g.gas_multiplier = m;
+            }
+        }
+        let parse_gwei_wei = |s: Option<&str>| -> Option<U256> {
+            let t = s?.trim();
+            if t.is_empty() || t.eq_ignore_ascii_case("auto") {
+                return None;
+            }
+            crate::gas::gwei_str_to_wei(t).ok().filter(|w| !w.is_zero())
+        };
+        let prio = parse_gwei_wei(priority_fee_gwei);
+        let maxf = parse_gwei_wei(max_fee_gwei);
+        if let Some(pg) = prio {
+            g.priority_fee = Some(pg);
+        }
+        if let Some(mf) = maxf {
+            g.max_fee = Some(mf);
+        }
+        match (prio.is_some(), maxf.is_some()) {
+            (true, true) => g.mode = GasMode::Manual,
+            (true, false) => g.mode = GasMode::Hybrid,
+            (false, true) => g.mode = GasMode::Auto, // max_fee used if set
+            (false, false) => {}
+        }
+        g
+    }
+
+    fn rpc_client(&self) -> Result<RpcClient> {
+        let urls = collect_rpc_urls(&self.env);
+        if urls.is_empty() {
+            bail!("No RPC configured — set Alchemy or RPC in Settings");
+        }
+        Ok(RpcClient::new(urls))
+    }
+
+    /// RPC client pinned to a named chain (required for Raw Mint).
+    fn rpc_client_for_chain(&self, chain: &str) -> Result<RpcClient> {
+        let chain = chain.trim();
+        if chain.is_empty() {
+            bail!("Network required — select a chain for Raw Mint");
+        }
+        let urls = collect_rpc_urls_for_chain(&self.env, Some(chain), &[]);
+        if urls.is_empty() {
+            bail!("No RPC for network '{chain}' — set Alchemy or custom RPC in Settings");
+        }
+        Ok(RpcClient::new(urls))
+    }
+
+    /// Resolve expected chain id from name (if known).
+    fn expected_chain_id(chain: &str) -> Option<u64> {
+        let map = crate::types::chain_id_map();
+        let key = chain.trim().to_lowercase();
+        map.get(key.as_str()).copied().or_else(|| {
+            // try without separators
+            let compact = key.replace(['_', '-'], "");
+            map.iter()
+                .find(|(k, _)| k.replace(['_', '-'], "") == compact)
+                .map(|(_, v)| *v)
+        })
+    }
+
+    /// Sweep native ETH from selected (or all) vault wallets to `destination`.
+    /// Live runs require typed `LIVE` when `require_live_confirm` is on.
+    pub async fn sweep_eth(
+        &self,
+        chain: &str,
+        destination: &str,
+        dry_run: bool,
+        confirm: &str,
+        wallet_addresses: Option<Vec<String>>,
+    ) -> Result<Vec<SweepResultRow>> {
+        self.gate_live(dry_run, confirm)?;
+        if self.signers.is_empty() {
+            bail!("No wallets unlocked");
+        }
+        if chain.trim().is_empty() {
+            bail!("Network required — select a chain for Sweep ETH");
+        }
+        let dest: Address = destination
+            .trim()
+            .parse()
+            .context("invalid destination address")?;
+        if dest == Address::ZERO {
+            bail!("destination is the zero address (0x0) — refusing to burn funds (audit M2)");
+        }
+        let selected = select_vault_signers(&self.signers, wallet_addresses)?;
+        let rpc = self.rpc_client_for_chain(chain)?;
+        if let Some(expected) = Self::expected_chain_id(chain) {
+            let actual = rpc.chain_id().await.unwrap_or(0);
+            if actual != 0 && actual != expected {
+                bail!(
+                    "RPC chainId {actual} does not match selected network {} (expected {expected})",
+                    chain.trim()
+                );
+            }
+        }
+        let config = SweepEthConfig {
+            destination: dest,
+            gas: self.gas_params(),
+            dry_run,
+        };
+        let results = sweep::run_sweep_eth(&selected, &rpc, &config).await;
+        Ok(results.into_iter().map(SweepResultRow::from).collect())
+    }
+
+    /// Discover and sweep ERC-721/ERC-1155 NFTs from selected Vault wallets.
+    /// Live runs require typed `LIVE` when `require_live_confirm` is on.
+    pub async fn sweep_nfts(
+        &self,
+        chain: &str,
+        contract: &str,
+        destination: &str,
+        dry_run: bool,
+        confirm: &str,
+        wallet_addresses: Option<Vec<String>>,
+    ) -> Result<Vec<SweepResultRow>> {
+        self.gate_live(dry_run, confirm)?;
+        if self.signers.is_empty() {
+            bail!("No wallets unlocked");
+        }
+        if chain.trim().is_empty() {
+            bail!("Network required — select a chain for Sweep NFTs");
+        }
+        let contract = if contract.trim().is_empty() {
+            None
+        } else {
+            Some(
+                contract
+                    .trim()
+                    .parse::<Address>()
+                    .context("invalid NFT contract address")?,
+            )
+        };
+        let dest: Address = destination
+            .trim()
+            .parse()
+            .context("invalid destination address")?;
+        if dest == Address::ZERO {
+            bail!("destination is the zero address (0x0) — refusing to burn NFTs (audit M2)");
+        }
+        let selected = select_vault_signers(&self.signers, wallet_addresses)?;
+        let rpc = self.rpc_client_for_chain(chain)?;
+        if let Some(expected) = Self::expected_chain_id(chain) {
+            let actual = rpc.chain_id().await.unwrap_or(0);
+            if actual != 0 && actual != expected {
+                bail!(
+                    "RPC chainId {actual} does not match selected network {} (expected {expected})",
+                    chain.trim()
+                );
+            }
+        }
+        let alchemy = {
+            let k = self.settings.alchemy_api_key.trim();
+            if k.is_empty() {
+                None
+            } else {
+                Some(k.to_string())
+            }
+        };
+        let config = AutoNftSweepConfig {
+            contract,
+            destination: dest,
+            gas: self.gas_params(),
+            dry_run,
+            alchemy_api_key: alchemy,
+        };
+        let results = sweep::run_auto_nft_sweep(&selected, &rpc, &config).await;
+        Ok(results.into_iter().map(SweepResultRow::from).collect())
+    }
+
+    /// Build proxy manager from Settings (multi-line proxy list) or proxies.txt.
+    pub fn proxy_manager(&self) -> crate::proxy::ProxyManager {
+        let text = self.settings.proxy_url.trim();
+        if text.is_empty() {
+            crate::proxy::ProxyManager::load_default()
+        } else {
+            crate::proxy::ProxyManager::from_text(text)
+        }
+    }
+
+    /// Run OpenSea mint (sniper path).
+    /// Live runs require typed `LIVE` when `require_live_confirm` is on.
+    pub async fn run_opensea_mint(
+        &self,
+        opts: MintOptions,
+        confirm: &str,
+        reporter: std::sync::Arc<dyn crate::progress::MintReporter>,
+    ) -> Result<crate::mint::MintRunSummary> {
+        self.gate_live(opts.dry_run, confirm)?;
+        if self.signers.is_empty() {
+            bail!("No wallets unlocked");
+        }
+        if opts.slug.trim().is_empty() {
+            bail!("Collection slug required");
+        }
+        let proxies = self.proxy_manager();
+        let pw = self.password.as_ref().map(|z| z.as_str());
+        crate::mint::run_opensea_mint(
+            &self.signers,
+            &self.env,
+            &proxies,
+            &opts,
+            pw,
+            reporter,
+            None,
+        )
+        .await
+    }
+
+    /// OpenSea mint with optional cancel flag (desktop Stop button).
+    /// Live runs require typed `LIVE` when `require_live_confirm` is on.
+    pub async fn run_opensea_mint_cancellable(
+        &self,
+        opts: MintOptions,
+        confirm: &str,
+        reporter: std::sync::Arc<dyn crate::progress::MintReporter>,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::mint::MintRunSummary> {
+        self.gate_live(opts.dry_run, confirm)?;
+        if self.signers.is_empty() {
+            bail!("No wallets unlocked");
+        }
+        if opts.slug.trim().is_empty() {
+            bail!("Collection slug required");
+        }
+        cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+        let proxies = self.proxy_manager();
+        let pw = self.password.as_ref().map(|z| z.as_str());
+        crate::mint::run_opensea_mint(
+            &self.signers,
+            &self.env,
+            &proxies,
+            &opts,
+            pw,
+            reporter,
+            Some(cancel),
+        )
+        .await
+    }
+
+    /// Resolve chain id from RPC (preferred chain or ethereum / any).
+    async fn resolve_chain_id(&self, preferred: Option<&str>) -> u64 {
+        let mut urls = collect_rpc_urls_for_chain(&self.env, preferred, &[]);
+        if urls.is_empty() && preferred.is_some() {
+            urls = collect_rpc_urls_for_chain(&self.env, Some("ethereum"), &[]);
+        }
+        if urls.is_empty() {
+            urls = collect_rpc_urls(&self.env);
+        }
+        if urls.is_empty() {
+            return 1;
+        }
+        let rpc = RpcClient::new(urls);
+        // Do not silently authenticate/sign with mainnet's chain id when the
+        // configured RPC is unavailable. Callers will surface the invalid id
+        // through the auth/RPC request instead of masking the outage.
+        rpc.chain_id().await.unwrap_or(0)
+    }
+
+    /// Warm OpenSea SIWE auth into cache for selected (or all) wallets.
+    /// Speeds up the next mint Start (CACHED OK path).
+    pub async fn warm_auth(
+        &self,
+        wallet_addresses: Option<Vec<String>>,
+    ) -> Result<Vec<AuthTestRow>> {
+        if self.signers.is_empty() {
+            bail!("No wallets unlocked");
+        }
+        let filter: Option<std::collections::HashSet<String>> = wallet_addresses.and_then(|v| {
+            let set: std::collections::HashSet<String> = v
+                .into_iter()
+                .map(|a| normalize_address(&a))
+                .filter(|a| a.len() > 2)
+                .collect();
+            if set.is_empty() { None } else { Some(set) }
+        });
+        let chain_id = self.resolve_chain_id(None).await;
+        let proxies = self.proxy_manager();
+        let pw = self.password.as_ref().map(|z| z.as_str());
+        let mut cache = crate::auth_cache::AuthCache::load(pw);
+        let mut rows = Vec::new();
+        let selected: Vec<(usize, &Signer)> = self
+            .signers
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                filter
+                    .as_ref()
+                    .map(|f| f.contains(&normalize_address(&format!("{:?}", s.address()))))
+                    .unwrap_or(true)
+            })
+            .collect();
+        if selected.is_empty() {
+            bail!("No matching wallets for warm auth");
+        }
+        // Bounded concurrency similar to mint auth
+        let conc = if proxies.is_empty() {
+            2usize
+        } else {
+            proxies.len().clamp(2, 6)
+        };
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(conc));
+        let mut handles = Vec::new();
+        for (vault_idx, signer) in selected {
+            let addr = signer.address();
+            let proxy = proxies.get(vault_idx).map(|s| s.to_string());
+            let proxy_short = proxies.short(vault_idx);
+            let signer = signer.clone();
+            let sem = sem.clone();
+            handles.push(tokio::spawn(async move {
+                let _p = sem.acquire().await.ok();
+                let start = Instant::now();
+                let result = opensea::siwe_auth(&addr, &signer, chain_id, proxy.as_deref()).await;
+                (
+                    addr,
+                    proxy_short,
+                    start.elapsed().as_millis() as u64,
+                    result,
+                )
+            }));
+        }
+        for h in handles {
+            match h.await {
+                Ok((addr, proxy_short, latency_ms, result)) => match result {
+                    Ok(session) => {
+                        let addr_s = format!("{:?}", addr);
+                        cache.save(&addr_s, chain_id, &session.access_token);
+                        let masked = mask_token(&session.access_token);
+                        rows.push(AuthTestRow {
+                            address: addr_s,
+                            ok: true,
+                            chain_id,
+                            latency_ms,
+                            token_masked: Some(masked),
+                            error: None,
+                            proxy: proxy_short,
+                        });
+                    }
+                    Err(e) => {
+                        rows.push(AuthTestRow {
+                            address: format!("{:?}", addr),
+                            ok: false,
+                            chain_id,
+                            latency_ms,
+                            token_masked: None,
+                            error: Some(e.to_string()),
+                            proxy: proxy_short,
+                        });
+                    }
+                },
+                Err(e) => {
+                    rows.push(AuthTestRow {
+                        address: "join".into(),
+                        ok: false,
+                        chain_id,
+                        latency_ms: 0,
+                        token_masked: None,
+                        error: Some(e.to_string()),
+                        proxy: "—".into(),
+                    });
+                }
+            }
+        }
+        if let Err(e) = cache.flush() {
+            crate::rlog!("auth cache flush after warm_auth: {e}");
+        }
+        Ok(rows)
+    }
+
+    /// Test OpenSea SIWE auth for each vault wallet (or primary only).
+    pub async fn test_auth(&self, all_wallets: bool) -> Result<Vec<AuthTestRow>> {
+        if self.signers.is_empty() {
+            bail!("No wallets unlocked");
+        }
+        let chain_id = self.resolve_chain_id(Some("ethereum")).await;
+        let proxies = self.proxy_manager();
+        let signers: Vec<_> = if all_wallets {
+            self.signers.iter().collect()
+        } else {
+            self.signers.iter().take(1).collect()
+        };
+        let mut rows = Vec::new();
+        for (i, signer) in signers.into_iter().enumerate() {
+            let addr = signer.address();
+            let proxy = proxies.get(i).map(|s| s.to_string());
+            let start = Instant::now();
+            match opensea::siwe_auth(&addr, signer, chain_id, proxy.as_deref()).await {
+                Ok(session) => {
+                    let masked = mask_token(&session.access_token);
+                    rows.push(AuthTestRow {
+                        address: format!("{:?}", addr),
+                        ok: true,
+                        chain_id,
+                        latency_ms: start.elapsed().as_millis() as u64,
+                        token_masked: Some(masked),
+                        error: None,
+                        proxy: proxies.short(i),
+                    });
+                }
+                Err(e) => {
+                    rows.push(AuthTestRow {
+                        address: format!("{:?}", addr),
+                        ok: false,
+                        chain_id,
+                        latency_ms: start.elapsed().as_millis() as u64,
+                        token_masked: None,
+                        error: Some(e.to_string()),
+                        proxy: proxies.short(i),
+                    });
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// OpenSea eligibility stages for primary wallet + slug.
+    pub async fn check_eligibility(&self, slug: &str) -> Result<EligibilityResult> {
+        // Scope to the primary wallet. Passing `None` means "all unlocked
+        // wallets", so a single-wallet check used to fire a full SIWE auth for
+        // every wallet in the vault — burning OpenSea rate limit (the 429s this
+        // codebase works hard to avoid) and writing a full WL export — then
+        // discarded every row but the first.
+        let primary = self
+            .primary_address()
+            .ok_or_else(|| anyhow::anyhow!("No wallets unlocked"))?;
+        let report = self
+            .check_eligibility_wallets(slug, Some(vec![format!("{:?}", primary)]))
+            .await?;
+        let row = report
+            .wallets
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("No wallets unlocked"))?;
+        if let Some(err) = row.error {
+            bail!("{}", err);
+        }
+        Ok(EligibilityResult {
+            slug: report.slug,
+            address: row.address,
+            chain_id: report.chain_id,
+            stages: row.stages,
+        })
+    }
+
+    /// Multi-wallet OpenSea WL / eligibility check (uses proxies by vault index).
+    ///
+    /// Uses auth cache when available and runs with bounded concurrency (like mint/warm_auth).
+    /// Previously this was fully sequential full-SIWE per wallet, which could hang the UI for
+    /// many minutes under OpenSea rate limits (no progress until every wallet finished).
+    ///
+    /// `wallet_addresses`: if set and non-empty, only those vault wallets; else all unlocked.
+    pub async fn check_eligibility_wallets(
+        &self,
+        slug: &str,
+        wallet_addresses: Option<Vec<String>>,
+    ) -> Result<WalletEligibilityReport> {
+        self.check_eligibility_wallets_streaming(slug, wallet_addresses, None, None, None)
+            .await
+    }
+
+    /// Streaming variant: publishes each wallet's row as soon as it finishes and
+    /// honours a cancel token.
+    ///
+    /// The batched version returned nothing until all N wallets were done, so a
+    /// 200-wallet run looked frozen for over a minute. Workers here are drained
+    /// with a `JoinSet`, so a finished row reaches the UI immediately.
+    ///
+    /// - `concurrency`: worker count (see [`crate::batch::resolve_concurrency`];
+    ///   forced to 1 when no proxies are configured).
+    /// - `cancel`: stop between wallets; already-checked rows are still
+    ///   returned and exported.
+    pub async fn check_eligibility_wallets_streaming(
+        &self,
+        slug: &str,
+        wallet_addresses: Option<Vec<String>>,
+        concurrency: Option<usize>,
+        reporter: Option<Arc<dyn crate::batch::BatchReporter>>,
+        cancel: Option<crate::batch::BatchCancel>,
+    ) -> Result<WalletEligibilityReport> {
+        if self.signers.is_empty() {
+            bail!("No wallets unlocked");
+        }
+        let slug = parse_collection_slug(slug);
+        if slug.is_empty() {
+            bail!("Collection slug required");
+        }
+
+        let filter: Option<std::collections::HashSet<String>> = wallet_addresses.and_then(|v| {
+            let set: std::collections::HashSet<String> = v
+                .into_iter()
+                .map(|a| normalize_address(&a))
+                .filter(|a| a.len() > 2)
+                .collect();
+            if set.is_empty() { None } else { Some(set) }
+        });
+
+        let selected: Vec<(usize, Signer)> = self
+            .signers
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                filter
+                    .as_ref()
+                    .map(|f| f.contains(&normalize_address(&format!("{:?}", s.address()))))
+                    .unwrap_or(true)
+            })
+            .map(|(i, s)| (i, s.clone()))
+            .collect();
+
+        if selected.is_empty() {
+            bail!("No matching wallets in vault for the selection");
+        }
+
+        let chain_id = self.resolve_chain_id(None).await;
+        let proxies = self.proxy_manager();
+        // Operator-selected worker count, forced serial when there are no
+        // proxies (one IP + parallel SIWE = 429 storm).
+        let conc = crate::batch::resolve_concurrency(concurrency, proxies.len());
+        let sem = Arc::new(tokio::sync::Semaphore::new(conc));
+        let pw = self.password.as_ref().map(|z| z.as_str());
+        let cache = Arc::new(tokio::sync::Mutex::new(AuthCache::load(pw)));
+        let slug_owned = slug.clone();
+        let n = selected.len();
+        let cancel = cancel.unwrap_or_default();
+        crate::batch::report(
+            reporter.as_ref(),
+            crate::batch::BatchEvent::message(
+                BATCH_KIND_WL_CHECK,
+                0,
+                n,
+                format!("checking {n} wallet(s) · {conc} worker(s)"),
+            ),
+        );
+
+        // Selection order, used to re-sort the completion-ordered results below.
+        let order_index: Vec<String> = selected
+            .iter()
+            .map(|(_, s)| normalize_address(&format!("{:?}", s.address())))
+            .collect();
+
+        let mut set: tokio::task::JoinSet<WalletEligibilityRow> = tokio::task::JoinSet::new();
+        for (ord, (vault_idx, signer)) in selected.into_iter().enumerate() {
+            let addr = signer.address();
+            let proxy = proxies.get(vault_idx).map(|s| s.to_string());
+            let proxy_short = proxies.short(vault_idx);
+            let sem = sem.clone();
+            let cache = cache.clone();
+            let slug = slug_owned.clone();
+            // Mild stagger so concurrent workers don't open SIWE in lockstep.
+            let stagger_ms = (ord as u64 % conc as u64) * 250;
+            let cancel_w = cancel.clone();
+            set.spawn(async move {
+                let _permit = match sem.acquire().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return WalletEligibilityRow {
+                            address: format!("{:?}", addr),
+                            ok: false,
+                            proxy: proxy_short,
+                            latency_ms: 0,
+                            error: Some("semaphore closed".into()),
+                            stages: vec![],
+                            eligible_labels: vec![],
+                            not_eligible_labels: vec![],
+                        };
+                    }
+                };
+                if stagger_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(stagger_ms)).await;
+                }
+                // Queued workers can wait a long time behind the semaphore;
+                // don't start a fresh SIWE round for a run already stopped.
+                if cancel_w.is_cancelled() {
+                    return WalletEligibilityRow {
+                        address: format!("{:?}", addr),
+                        ok: false,
+                        proxy: proxy_short,
+                        latency_ms: 0,
+                        error: Some("skipped (stopped by operator)".into()),
+                        stages: vec![],
+                        eligible_labels: vec![],
+                        not_eligible_labels: vec![],
+                    };
+                }
+
+                let start = Instant::now();
+                let addr_str = format!("{:?}", addr);
+
+                // Prefer cached SIWE token (same path as mint CACHED OK).
+                let mut auth = {
+                    let guard = cache.lock().await;
+                    guard.get(&addr_str, chain_id).and_then(|token| {
+                        let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
+                        match opensea::build_client_with_cookie_jar_and_proxy(
+                            cookie_jar.clone(),
+                            proxy.as_deref(),
+                        ) {
+                            Ok(client) => Some(opensea::AuthSession {
+                                access_token: token.to_string(),
+                                address: addr_str.clone(),
+                                client,
+                                cookie_jar,
+                            }),
+                            Err(_) => None,
+                        }
+                    })
+                };
+
+                if auth.is_none() {
+                    // Fewer rate-limit sleep rounds than mint: WL should fail fast rather than
+                    // block the UI for minutes on a 429 storm.
+                    match opensea::siwe_auth_with_retries(
+                        &addr,
+                        &signer,
+                        chain_id,
+                        proxy.as_deref(),
+                        3,
+                    )
+                    .await
+                    {
+                        Ok(session) => {
+                            {
+                                let mut guard = cache.lock().await;
+                                guard.save(&addr_str, chain_id, &session.access_token);
+                            }
+                            auth = Some(session);
+                        }
+                        Err(e) => {
+                            return WalletEligibilityRow {
+                                address: addr_str,
+                                ok: false,
+                                proxy: proxy_short,
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                error: Some(format!("auth: {e}")),
+                                stages: vec![],
+                                eligible_labels: vec![],
+                                not_eligible_labels: vec![],
+                            };
+                        }
+                    }
+                }
+
+                let auth = auth.expect("auth set above");
+                match opensea::check_eligibility(&auth, &slug, &addr).await {
+                    Ok(stages) => {
+                        let stage_rows = stage_rows_from(&stages, None);
+                        // PUBLIC_SALE never counts as "WL eligible" (os.py + product rule).
+                        let eligible_labels: Vec<String> = stage_rows
+                            .iter()
+                            .filter(|s| is_wl_eligible_stage_row(s))
+                            .map(|s| s.label.clone())
+                            .collect();
+                        let not_eligible_labels: Vec<String> = stage_rows
+                            .iter()
+                            .filter(|s| !is_wl_eligible_stage_row(s))
+                            .map(|s| {
+                                if is_public_sale_stage_type(&s.stage_type) {
+                                    format!("{} (public — not WL)", s.label)
+                                } else {
+                                    format!("{} ({})", s.label, s.eligible)
+                                }
+                            })
+                            .collect();
+                        WalletEligibilityRow {
+                            address: addr_str,
+                            ok: true,
+                            proxy: proxy_short,
+                            latency_ms: start.elapsed().as_millis() as u64,
+                            error: None,
+                            stages: stage_rows,
+                            eligible_labels,
+                            not_eligible_labels,
+                        }
+                    }
+                    Err(e) => WalletEligibilityRow {
+                        address: addr_str,
+                        ok: false,
+                        proxy: proxy_short,
+                        latency_ms: start.elapsed().as_millis() as u64,
+                        error: Some(e.to_string()),
+                        stages: vec![],
+                        eligible_labels: vec![],
+                        not_eligible_labels: vec![],
+                    },
+                }
+            });
+        }
+
+        // Drain as workers finish (not in spawn order) so each row reaches the
+        // UI the moment it is ready.
+        let mut wallets = Vec::with_capacity(n);
+        let mut was_cancelled = false;
+        while let Some(joined) = set.join_next().await {
+            let row = match joined {
+                Ok(row) => row,
+                // After `abort_all()` every queued task drains as
+                // `JoinError::Cancelled`. Those wallets were never checked, so
+                // recording them as failed rows would flood the report (and the
+                // export) with fake "task: cancelled" entries.
+                Err(e) if e.is_cancelled() => continue,
+                Err(e) => WalletEligibilityRow {
+                    address: "join".into(),
+                    ok: false,
+                    proxy: "—".into(),
+                    latency_ms: 0,
+                    error: Some(format!("task: {e}")),
+                    stages: vec![],
+                    eligible_labels: vec![],
+                    not_eligible_labels: vec![],
+                },
+            };
+            wallets.push(row);
+            let done = wallets.len();
+            if let Some(last) = wallets.last() {
+                crate::batch::report(
+                    reporter.as_ref(),
+                    crate::batch::BatchEvent::row(
+                        BATCH_KIND_WL_CHECK,
+                        done,
+                        n,
+                        serde_json::to_value(last).unwrap_or(serde_json::Value::Null),
+                    ),
+                );
+            }
+            if cancel.is_cancelled() && !was_cancelled {
+                was_cancelled = true;
+                // Abort the queue; in-flight workers still land above.
+                set.abort_all();
+                crate::batch::report(
+                    reporter.as_ref(),
+                    crate::batch::BatchEvent::cancelled(BATCH_KIND_WL_CHECK, done, n),
+                );
+            }
+        }
+
+        // Rows arrive in completion order, which is a race between workers.
+        // Restore the selection order so the export and the final report are
+        // stable across runs (the UI already showed rows as they landed).
+        {
+            let order: std::collections::HashMap<String, usize> = order_index
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (a.clone(), i))
+                .collect();
+            wallets.sort_by_key(|w| {
+                order
+                    .get(&normalize_address(&w.address))
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            });
+        }
+
+        // One disk encrypt for the whole eligibility auth batch.
+        if let Ok(mut guard) = cache.try_lock() {
+            if let Err(e) = guard.flush() {
+                crate::rlog!("auth cache flush after eligibility: {e}");
+            }
+        } else {
+            let mut guard = cache.lock().await;
+            if let Err(e) = guard.flush() {
+                crate::rlog!("auth cache flush after eligibility: {e}");
+            }
+        }
+
+        // Export: CSV + one .txt per WL phase + not_eligible.txt (no PUBLIC_SALE as eligible).
+        let (export_dir, export_csv, export_not_eligible) = match export_wl_report(&slug, &wallets)
+        {
+            Ok(p) => {
+                crate::rlog!("WL export → {}", p.dir.display());
+                (
+                    Some(p.dir.display().to_string()),
+                    Some(p.csv.display().to_string()),
+                    Some(p.not_eligible.display().to_string()),
+                )
+            }
+            Err(e) => {
+                crate::rlog!("WL export failed: {e}");
+                (None, None, None)
+            }
+        };
+
+        Ok(WalletEligibilityReport {
+            slug,
+            chain_id,
+            wallets,
+            export_dir,
+            export_csv,
+            export_not_eligible,
+        })
+    }
+
+    /// List drop stages for mint phase picker (collection_drop_info + recommended).
+    ///
+    /// Same OpenSea access path as WL Check: first-wallet proxy + auth cache.
+    /// Previously used `siwe_auth(..., None)` (direct IP only) while WL/mint used
+    /// proxies — so WL could succeed and Tasks → Load phases fail on the same machine.
+    pub async fn list_drop_phases(&self, slug: &str) -> Result<DropPhasesResult> {
+        if self.signers.is_empty() {
+            bail!("No wallets unlocked");
+        }
+        let slug = parse_collection_slug(slug);
+        if slug.is_empty() {
+            bail!("Collection slug required");
+        }
+        let signer = &self.signers[0];
+        let addr = signer.address();
+        let addr_str = format!("{:?}", addr);
+        let chain_id = self.resolve_chain_id(None).await;
+        let proxies = self.proxy_manager();
+        // Wallet 0 sticky proxy — same mapping as WL Check / mint for vault index 0.
+        let proxy = proxies.get(0).map(|s| s.to_string());
+        let pw = self.password.as_ref().map(|z| z.as_str());
+        let mut cache = AuthCache::load(pw);
+
+        let cached_token = cache.get(&addr_str, chain_id).map(|t| t.to_string());
+        let auth = if let Some(token) = cached_token {
+            let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
+            match opensea::build_client_with_cookie_jar_and_proxy(
+                cookie_jar.clone(),
+                proxy.as_deref(),
+            ) {
+                Ok(client) => opensea::AuthSession {
+                    access_token: token,
+                    address: addr_str.clone(),
+                    client,
+                    cookie_jar,
+                },
+                Err(_) => {
+                    let session = opensea::siwe_auth(&addr, signer, chain_id, proxy.as_deref())
+                        .await
+                        .context("OpenSea SIWE auth failed")?;
+                    cache.save(&addr_str, chain_id, &session.access_token);
+                    if let Err(e) = cache.flush() {
+                        crate::rlog!("auth cache flush after list_drop_phases: {e}");
+                    }
+                    session
+                }
+            }
+        } else {
+            let session = opensea::siwe_auth(&addr, signer, chain_id, proxy.as_deref())
+                .await
+                .context("OpenSea SIWE auth failed")?;
+            cache.save(&addr_str, chain_id, &session.access_token);
+            if let Err(e) = cache.flush() {
+                crate::rlog!("auth cache flush after list_drop_phases: {e}");
+            }
+            session
+        };
+
+        let info = opensea::collection_drop_info(&auth, &slug, &addr)
+            .await
+            .context("collection drop info failed")?;
+        if info.stages.is_empty() {
+            bail!("No drop stages found for '{}'", slug);
+        }
+        let recommended = recommended_phase_index(&info);
+        let stage_rows = stage_rows_from(&info.stages, Some(recommended));
+        Ok(DropPhasesResult {
+            slug: info.slug,
+            name: info.name,
+            chain: info.chain,
+            address: addr_str,
+            recommended_index: recommended,
+            stages: stage_rows,
+        })
+    }
+
+    /// Deep latency: RPC chainId + block + fees (+ nonce if wallets) and proxy health.
+    pub async fn measure_latency(&self) -> Result<LatencyReport> {
+        let urls = collect_rpc_urls(&self.env);
+        if urls.is_empty() {
+            bail!("No RPC configured — set Alchemy or RPC in Settings");
+        }
+        let mut rpc_rows = Vec::new();
+        for url in urls.iter().take(8) {
+            let short = short_url(url);
+            let rpc = RpcClient::new(vec![url.clone()]);
+            let mut row = LatencyRpcRow {
+                url_short: short,
+                ok: false,
+                chain_id_ms: None,
+                chain_id: None,
+                block_ms: None,
+                block_number: None,
+                fees_ms: None,
+                base_fee_gwei: None,
+                priority_gwei: None,
+                nonce_ms: None,
+                nonce: None,
+                error: None,
+            };
+            let start = Instant::now();
+            match rpc.chain_id().await {
+                Ok(id) => {
+                    row.chain_id = Some(id);
+                    row.chain_id_ms = Some(start.elapsed().as_millis() as u64);
+                    row.ok = true;
+                }
+                Err(e) => {
+                    row.error = Some(e.to_string());
+                    rpc_rows.push(row);
+                    continue;
+                }
+            }
+            let start = Instant::now();
+            if let Ok(b) = rpc.block_number().await {
+                row.block_number = Some(b);
+                row.block_ms = Some(start.elapsed().as_millis() as u64);
+            }
+            let start = Instant::now();
+            if let Ok((base, prio)) = rpc.fee_history().await {
+                row.fees_ms = Some(start.elapsed().as_millis() as u64);
+                // `to::<u128>()` panics on overflow, and these values come
+                // straight from an untrusted (often public) RPC endpoint.
+                row.base_fee_gwei =
+                    Some((base / U256::from(1_000_000_000u64)).saturating_to::<u64>());
+                row.priority_gwei =
+                    Some((prio / U256::from(1_000_000_000u64)).saturating_to::<u64>());
+            }
+            if let Some(signer) = self.signers.first() {
+                let addr = signer.address();
+                let start = Instant::now();
+                if let Ok(n) = rpc.nonce(&addr).await {
+                    row.nonce = Some(n);
+                    row.nonce_ms = Some(start.elapsed().as_millis() as u64);
+                }
+            }
+            rpc_rows.push(row);
+        }
+
+        let proxies = self.proxy_manager();
+        let n = self.signers.len().max(1).min(proxies.len().max(1));
+        let proxy_health = proxies.probe_for_wallets(n).await;
+        let proxy_rows: Vec<ProxyHealthRow> = proxy_health
+            .into_iter()
+            .map(|h| {
+                let status = h.short_status();
+                ProxyHealthRow {
+                    label: h.label,
+                    ok: h.ok,
+                    latency_ms: h.latency_ms,
+                    status,
+                }
+            })
+            .collect();
+
+        Ok(LatencyReport {
+            rpc: rpc_rows,
+            proxies: proxy_rows,
+        })
+    }
+
+    /// Discover mint-like functions on a contract (for Raw Mint UI).
+    pub async fn discover_raw_functions(
+        &self,
+        contract: &str,
+        chain: &str,
+    ) -> Result<Vec<DiscoveredFunction>> {
+        if chain.trim().is_empty() {
+            bail!("Network required — select a chain for Raw Mint");
+        }
+        let contract: Address = contract
+            .trim()
+            .parse()
+            .context("invalid contract address")?;
+        let rpc = self.rpc_client_for_chain(chain)?;
+        if let Some(expected) = Self::expected_chain_id(chain) {
+            let actual = rpc.chain_id().await.unwrap_or(0);
+            if actual != 0 && actual != expected {
+                bail!(
+                    "RPC chainId {actual} does not match selected network {} (expected {expected})",
+                    chain.trim()
+                );
+            }
+        }
+        let found =
+            raw_mint::discover_functions_on_chain(&rpc, &contract, Some(chain.trim())).await?;
+        Ok(found
+            .into_iter()
+            .map(|(signature, source)| DiscoveredFunction { signature, source })
+            .collect())
+    }
+
+    /// Raw contract mint for selected (or all) vault wallets.
+    ///
+    /// `wallet_addresses`: if set and non-empty, only those vault wallets; else all unlocked.
+    pub fn flashbots_config(&self) -> FlashbotsConfig {
+        let mut c = FlashbotsConfig::from_env(&self.env);
+        if !self.settings.flashbots_relay_url.trim().is_empty() {
+            c.relay_url = self.settings.flashbots_relay_url.trim().to_string();
+        }
+        if self.settings.flashbots_max_blocks > 0 {
+            c.max_blocks = self.settings.flashbots_max_blocks.min(20);
+        }
+        if self.settings.flashbots_resubmit_ms >= 200 {
+            c.resubmit_ms = self.settings.flashbots_resubmit_ms;
+        }
+        c
+    }
+
+    pub async fn raw_mint(
+        &self,
+        chain: &str,
+        contract: &str,
+        function: &str,
+        params: Vec<String>,
+        value_eth: &str,
+        dry_run: bool,
+        confirm: &str,
+        wallet_addresses: Option<Vec<String>>,
+        use_flashbots: bool,
+        priority_fee_gwei: Option<&str>,
+        max_fee_gwei: Option<&str>,
+        gas_multiplier: Option<f64>,
+        gas_limit: Option<u64>,
+    ) -> Result<Vec<SweepResultRow>> {
+        self.gate_live(dry_run, confirm)?;
+        if self.signers.is_empty() {
+            bail!("No wallets unlocked");
+        }
+        if chain.trim().is_empty() {
+            bail!("Network required — select a chain for Raw Mint");
+        }
+        if use_flashbots {
+            let c = chain.trim().to_lowercase();
+            if c != "ethereum" && c != "mainnet" && c != "eth" {
+                bail!("Flashbots bundle is only supported on Ethereum mainnet");
+            }
+        }
+        let filter: Option<std::collections::HashSet<String>> = wallet_addresses.and_then(|v| {
+            let set: std::collections::HashSet<String> = v
+                .into_iter()
+                .map(|a| normalize_address(&a))
+                .filter(|a| a.len() > 2)
+                .collect();
+            if set.is_empty() { None } else { Some(set) }
+        });
+        let selected: Vec<Signer> = self
+            .signers
+            .iter()
+            .filter(|s| {
+                filter
+                    .as_ref()
+                    .map(|f| f.contains(&normalize_address(&format!("{:?}", s.address()))))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        if selected.is_empty() {
+            bail!("No matching wallets in vault for the selection");
+        }
+        let contract: Address = contract
+            .trim()
+            .parse()
+            .context("invalid contract address")?;
+        if function.trim().is_empty() {
+            bail!("Function signature required");
+        }
+        let value = if value_eth.trim().is_empty() || value_eth.trim() == "0" {
+            U256::ZERO
+        } else {
+            amount::eth_to_wei(value_eth.trim()).context("invalid ETH value")?
+        };
+        let rpc = self.rpc_client_for_chain(chain)?;
+        if let Some(expected) = Self::expected_chain_id(chain) {
+            let actual = rpc.chain_id().await.unwrap_or(0);
+            if actual != 0 && actual != expected {
+                bail!(
+                    "RPC chainId {actual} does not match selected network {} (expected {expected})",
+                    chain.trim()
+                );
+            }
+        }
+        let config = RawMintConfig {
+            contract,
+            function: function.trim().to_string(),
+            params,
+            value,
+            gas: self.gas_params_override(priority_fee_gwei, max_fee_gwei, gas_multiplier),
+            dry_run,
+            use_flashbots,
+            flashbots: self.flashbots_config(),
+            gas_limit: gas_limit.filter(|&g| g >= 21_000),
+        };
+        let results = raw_mint::run_raw_mint(&selected, &rpc, &config).await;
+        Ok(results.into_iter().map(SweepResultRow::from).collect())
+    }
+
+    /// Probe contract for Raw UI (MintBay status / basic code check).
+    pub async fn probe_raw(
+        &self,
+        chain: &str,
+        contract: &str,
+        quantity: u32,
+        preset: &str,
+    ) -> Result<RawProbeRow> {
+        if chain.trim().is_empty() {
+            bail!("Network required");
+        }
+        let contract: Address = contract
+            .trim()
+            .parse()
+            .context("invalid contract address")?;
+        let rpc = self.rpc_client_for_chain(chain)?;
+        if let Some(expected) = Self::expected_chain_id(chain) {
+            let actual = rpc.chain_id().await.unwrap_or(0);
+            if actual != 0 && actual != expected {
+                bail!(
+                    "RPC chainId {actual} does not match selected network {} (expected {expected})",
+                    chain.trim()
+                );
+            }
+        }
+        let qty = quantity.max(1) as u64;
+        let preset_l = preset.trim().to_lowercase();
+        // MintBay status probe only when explicitly requested (tab removed from UI).
+        let is_mintbay = preset_l == "mintbaypublic" || preset_l == "mintbay";
+
+        if is_mintbay {
+            match raw_sniper::fetch_mintbay_status(&rpc, &contract).await {
+                Ok(st) => {
+                    let wall = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let open = st.is_public_open(wall);
+                    let phase = match st.current_phase_type {
+                        1 => "Allowlist",
+                        2 => "Public",
+                        _ => "Paused",
+                    };
+                    let value = st.mint_value(qty);
+                    let per = if !st.resolved_phase_id.is_zero() {
+                        st.phase_mint_price.saturating_add(st.collector_fee)
+                    } else {
+                        st.public_mint_price.saturating_add(st.collector_fee)
+                    };
+                    let phase_start = {
+                        // Saturating: `to::<u128>()` panics on huge words from
+                        // arbitrary contracts.
+                        let s = u128::try_from(st.phase_start).unwrap_or(u128::MAX);
+                        if s > 0 && s < (i64::MAX as u128) {
+                            Some(s as i64)
+                        } else {
+                            None
+                        }
+                    };
+                    let seconds_to_start =
+                        phase_start.and_then(|s| if s > wall { Some(s - wall) } else { None });
+                    let value_eth = amount::wei_to_eth_string(value);
+                    let fee_eth = amount::wei_to_eth_string(st.collector_fee);
+                    let per_eth = amount::wei_to_eth_string(per);
+                    let minted = st.total_minted.to_string();
+                    let max = st.max_supply.to_string();
+                    let summary = {
+                        let mut parts = vec![format!("MintBay · {phase}")];
+                        if st.minting_paused {
+                            parts.push("paused".into());
+                        } else if open {
+                            parts.push("OPEN".into());
+                        } else if let Some(sec) = seconds_to_start {
+                            let m = sec / 60;
+                            if m >= 120 {
+                                parts.push(format!("in ~{}h", m / 60));
+                            } else if m >= 1 {
+                                parts.push(format!("in ~{m}m"));
+                            } else {
+                                parts.push(format!("in {sec}s"));
+                            }
+                        } else {
+                            parts.push("not open".into());
+                        }
+                        parts.push(format!("~{value_eth} ETH (×{qty})"));
+                        if !st.max_supply.is_zero() {
+                            parts.push(format!("{minted}/{max}"));
+                        }
+                        parts.join(" · ")
+                    };
+                    Ok(RawProbeRow {
+                        ok: true,
+                        summary,
+                        phase_type: Some(phase.into()),
+                        open,
+                        value_eth: Some(value_eth),
+                        value_wei: Some(value.to_string()),
+                        per_nft_eth: Some(per_eth),
+                        max_supply: Some(max),
+                        total_minted: Some(minted),
+                        collector_fee_eth: Some(fee_eth),
+                        phase_start,
+                        seconds_to_start,
+                        minting_paused: st.minting_paused,
+                        error: None,
+                    })
+                }
+                Err(e) => {
+                    // Full chain for UI (RPC timeouts, wrong network, etc.)
+                    let full = format!("{e:#}");
+                    Ok(RawProbeRow {
+                        ok: false,
+                        summary: format!("Probe failed (check Network=Robinhood + RPC). {full}"),
+                        phase_type: None,
+                        open: false,
+                        value_eth: None,
+                        value_wei: None,
+                        per_nft_eth: None,
+                        max_supply: None,
+                        total_minted: None,
+                        collector_fee_eth: None,
+                        phase_start: None,
+                        seconds_to_start: None,
+                        minting_paused: false,
+                        error: Some(full),
+                    })
+                }
+            }
+        } else {
+            // Basic: has code?
+            match rpc.get_code(&contract).await {
+                Ok(code) if !code.is_empty() => Ok(RawProbeRow {
+                    ok: true,
+                    summary: format!(
+                        "Contract OK · code {} bytes · set price manually",
+                        code.len()
+                    ),
+                    phase_type: None,
+                    open: false,
+                    value_eth: None,
+                    value_wei: None,
+                    per_nft_eth: None,
+                    max_supply: None,
+                    total_minted: None,
+                    collector_fee_eth: None,
+                    phase_start: None,
+                    seconds_to_start: None,
+                    minting_paused: false,
+                    error: None,
+                }),
+                Ok(_) => Ok(RawProbeRow {
+                    ok: false,
+                    summary: "No bytecode at address".into(),
+                    phase_type: None,
+                    open: false,
+                    value_eth: None,
+                    value_wei: None,
+                    per_nft_eth: None,
+                    max_supply: None,
+                    total_minted: None,
+                    collector_fee_eth: None,
+                    phase_start: None,
+                    seconds_to_start: None,
+                    minting_paused: false,
+                    error: Some("empty code".into()),
+                }),
+                Err(e) => Ok(RawProbeRow {
+                    ok: false,
+                    summary: format!("Probe error: {e}"),
+                    phase_type: None,
+                    open: false,
+                    value_eth: None,
+                    value_wei: None,
+                    per_nft_eth: None,
+                    max_supply: None,
+                    total_minted: None,
+                    collector_fee_eth: None,
+                    phase_start: None,
+                    seconds_to_start: None,
+                    minting_paused: false,
+                    error: Some(e.to_string()),
+                }),
+            }
+        }
+    }
+
+    /// Raw sniper: pre-sign race — clock fire at `at_time`, blast send (no estimate at T0).
+    /// Live runs require typed `LIVE` when `require_live_confirm` is on (`input.confirm`).
+    pub async fn raw_sniper(
+        &self,
+        input: RawSniperInput,
+        cancel: Arc<AtomicBool>,
+        reporter: Option<Arc<dyn MintReporter>>,
+    ) -> Result<Vec<SweepResultRow>> {
+        let dry_run = input.dry_run.unwrap_or(false);
+        self.gate_live(dry_run, input.confirm.as_deref().unwrap_or(""))?;
+        if self.signers.is_empty() {
+            bail!("No wallets unlocked");
+        }
+        let chain = input.chain.trim();
+        if chain.is_empty() {
+            bail!("Network required — select a chain for Raw Sniper");
+        }
+        let filter: Option<std::collections::HashSet<String>> =
+            input.wallet_addresses.and_then(|v| {
+                let set: std::collections::HashSet<String> = v
+                    .into_iter()
+                    .map(|a| normalize_address(&a))
+                    .filter(|a| a.len() > 2)
+                    .collect();
+                if set.is_empty() { None } else { Some(set) }
+            });
+        let selected: Vec<Signer> = self
+            .signers
+            .iter()
+            .filter(|s| {
+                filter
+                    .as_ref()
+                    .map(|f| f.contains(&normalize_address(&format!("{:?}", s.address()))))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        if selected.is_empty() {
+            bail!("No matching wallets in vault for the selection");
+        }
+        let contract: Address = input
+            .contract
+            .trim()
+            .parse()
+            .context("invalid contract address")?;
+
+        let preset = match input.preset.as_deref().unwrap_or("simpleMintUint") {
+            "mintBayPublic" | "mintbay" | "mintBay" => SniperPreset::MintBayPublic,
+            "custom" => SniperPreset::Custom,
+            _ => SniperPreset::SimpleMintUint,
+        };
+        // UI uses fixed value; MintBay auto only if explicitly requested.
+        let value_mode = match input.value_mode.as_deref().unwrap_or("fixed") {
+            "auto" => ValueMode::Auto,
+            _ => ValueMode::Fixed,
+        };
+        let fixed_value = {
+            let s = input.value_eth.as_deref().unwrap_or("0").trim();
+            if s.is_empty() || s == "0" {
+                U256::ZERO
+            } else {
+                amount::eth_to_wei(s).context("invalid value ETH")?
+            }
+        };
+        let qty = input.quantity.unwrap_or(1).max(1);
+        let function = match preset {
+            SniperPreset::MintBayPublic | SniperPreset::SimpleMintUint => input
+                .function
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("mint(uint256)")
+                .to_string(),
+            SniperPreset::Custom => {
+                let f = input.function.as_deref().unwrap_or("").trim();
+                if f.is_empty() {
+                    bail!("Function signature required for Custom preset");
+                }
+                f.to_string()
+            }
+        };
+        let at_time = raw_sniper::parse_sniper_at_time(input.at_time.as_deref())?;
+        // Timeout: with at_time default 5 min; without default 120 min unless specified
+        let timeout_secs = input
+            .timeout_secs
+            .unwrap_or(if at_time.is_some() { 300 } else { 7200 });
+
+        let rpc = self.rpc_client_for_chain(chain)?;
+        if let Some(expected) = Self::expected_chain_id(chain) {
+            let actual = rpc.chain_id().await.unwrap_or(0);
+            if actual != 0 && actual != expected {
+                bail!(
+                    "RPC chainId {actual} does not match selected network {} (expected {expected})",
+                    chain.trim()
+                );
+            }
+        }
+
+        let gas_mult = input
+            .gas_multiplier
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|m| *m > 0.0);
+        // Hard gas limit required for race path; default 650k (typical mint winners).
+        let gas_limit = Some(input.gas_limit.filter(|&g| g >= 21_000).unwrap_or(650_000));
+        let fee_refresh = input
+            .fee_refresh_at_fire
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(crate::safety_policy::FeeRefreshMode::parse)
+            .unwrap_or_else(|| self.settings.fee_refresh_mode());
+        let config = RawSniperConfig {
+            contract,
+            preset,
+            function,
+            params: input.params.unwrap_or_default(),
+            quantity: qty as u64,
+            value_mode,
+            fixed_value,
+            gas: self.gas_params_override(
+                input.priority_fee_gwei.as_deref(),
+                input.max_fee_gwei.as_deref(),
+                gas_mult,
+            ),
+            dry_run,
+            at_time,
+            timeout_secs,
+            concurrency: input.concurrency.unwrap_or(64).max(1) as usize,
+            gas_limit,
+            fee_refresh,
+        };
+
+        cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+        let results =
+            raw_sniper::run_raw_sniper(&selected, &rpc, &config, Some(cancel), reporter).await;
+        Ok(results.into_iter().map(SweepResultRow::from).collect())
+    }
+
+    /// One-wallet Multicall3 batch (several calls, one tx).
+    /// Live runs require typed `LIVE` when `require_live_confirm` is on.
+    pub async fn multicall(
+        &self,
+        chain: &str,
+        from_address: &str,
+        steps: Vec<MulticallStepInput>,
+        dry_run: bool,
+        multicall_address: Option<String>,
+        confirm: &str,
+    ) -> Result<Vec<SweepResultRow>> {
+        self.gate_live(dry_run, confirm)?;
+        if self.signers.is_empty() {
+            bail!("No wallets unlocked");
+        }
+        if chain.trim().is_empty() {
+            bail!("Network required — select a chain for Multicall");
+        }
+        if steps.is_empty() {
+            bail!("Add at least one call");
+        }
+        let from_norm = normalize_address(from_address);
+        let from = self
+            .signers
+            .iter()
+            .find(|s| normalize_address(&format!("{:?}", s.address())) == from_norm)
+            .cloned()
+            .context("Source wallet not found in vault")?;
+
+        let mut built: Vec<MulticallStep> = Vec::new();
+        for (i, s) in steps.into_iter().enumerate() {
+            let target: Address = s
+                .target
+                .trim()
+                .parse()
+                .with_context(|| format!("call #{}: invalid target", i + 1))?;
+            let allow_failure = s.allow_failure.unwrap_or(false);
+            let label = s.label.clone().unwrap_or_else(|| format!("call{}", i + 1));
+            let value_eth = s.value_eth.as_deref().unwrap_or("0");
+            let step = if let Some(ref data) = s.calldata {
+                if !data.trim().is_empty() {
+                    multicall::step_from_calldata(target, data, value_eth, allow_failure, label)?
+                } else if let Some(ref fn_sig) = s.function {
+                    multicall::step_from_function(
+                        target,
+                        fn_sig,
+                        &s.params.unwrap_or_default(),
+                        value_eth,
+                        allow_failure,
+                        label,
+                    )?
+                } else {
+                    bail!("call #{}: need function or calldata", i + 1);
+                }
+            } else if let Some(ref fn_sig) = s.function {
+                multicall::step_from_function(
+                    target,
+                    fn_sig,
+                    &s.params.unwrap_or_default(),
+                    value_eth,
+                    allow_failure,
+                    label,
+                )?
+            } else {
+                bail!("call #{}: need function or calldata", i + 1);
+            };
+            built.push(step);
+        }
+
+        let mc_addr = if let Some(ref a) = multicall_address {
+            let t = a.trim();
+            if t.is_empty() {
+                MULTICALL3
+            } else {
+                t.parse().context("invalid multicall address")?
+            }
+        } else {
+            MULTICALL3
+        };
+
+        let rpc = self.rpc_client_for_chain(chain)?;
+        if let Some(expected) = Self::expected_chain_id(chain) {
+            let actual = rpc.chain_id().await.unwrap_or(0);
+            if actual != 0 && actual != expected {
+                bail!(
+                    "RPC chainId {actual} does not match selected network {} (expected {expected})",
+                    chain.trim()
+                );
+            }
+        }
+
+        let config = MulticallConfig {
+            multicall: mc_addr,
+            steps: built,
+            gas: self.gas_params(),
+            dry_run,
+        };
+        let result = multicall::run_multicall(&from, &rpc, &config).await;
+        Ok(vec![SweepResultRow::from(result)])
+    }
+
+    /// Disperse native coin from one vault wallet to many destinations (fixed amount each).
+    /// Live runs require typed `LIVE` when `require_live_confirm` is on.
+    pub async fn disperse(
+        &self,
+        chain: &str,
+        from_address: &str,
+        to_addresses: Vec<String>,
+        amount_eth: &str,
+        dry_run: bool,
+        confirm: &str,
+    ) -> Result<Vec<SweepResultRow>> {
+        self.gate_live(dry_run, confirm)?;
+        if self.signers.is_empty() {
+            bail!("No wallets unlocked");
+        }
+        if chain.trim().is_empty() {
+            bail!("Network required — select a chain for Disperse");
+        }
+        let from_norm = normalize_address(from_address);
+        let from = self
+            .signers
+            .iter()
+            .find(|s| normalize_address(&format!("{:?}", s.address())) == from_norm)
+            .cloned()
+            .context("Source wallet not found in vault")?;
+        let destinations = disperse::parse_destinations(&to_addresses)?;
+        // Remove source from destinations if present
+        let from_addr = from.address();
+        let destinations: Vec<_> = destinations
+            .into_iter()
+            .filter(|d| *d != from_addr)
+            .collect();
+        if destinations.is_empty() {
+            bail!("Select at least one destination wallet (not the source)");
+        }
+        let amount = amount::eth_to_wei(amount_eth.trim()).context("invalid amount ETH")?;
+        if amount.is_zero() {
+            bail!("Amount must be greater than 0");
+        }
+        let rpc = self.rpc_client_for_chain(chain)?;
+        if let Some(expected) = Self::expected_chain_id(chain) {
+            let actual = rpc.chain_id().await.unwrap_or(0);
+            if actual != 0 && actual != expected {
+                bail!(
+                    "RPC chainId {actual} does not match selected network {} (expected {expected})",
+                    chain.trim()
+                );
+            }
+        }
+        let config = DisperseConfig {
+            amount,
+            gas: self.gas_params(),
+            dry_run,
+        };
+        let results = disperse::run_disperse(&from, &destinations, &rpc, &config).await;
+        Ok(results.into_iter().map(SweepResultRow::from).collect())
+    }
+
+    /// Clear encrypted OpenSea auth cache on disk.
+    pub fn clear_auth_cache(&self) -> Result<String> {
+        let pw = self.password.as_ref().map(|z| z.as_str());
+        let mut cache = AuthCache::load(pw);
+        let n = cache.len();
+        cache.clear()?;
+        Ok(format!("Cleared auth cache ({n} token(s))"))
+    }
+}
+
+/// One call in a Multicall batch (from UI / Tauri).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MulticallStepInput {
+    pub target: String,
+    /// Function sig e.g. `mint(uint256)` (ignored if calldata set).
+    pub function: Option<String>,
+    pub params: Option<Vec<String>>,
+    /// Raw hex calldata `0x…` (overrides function).
+    pub calldata: Option<String>,
+    pub value_eth: Option<String>,
+    pub allow_failure: Option<bool>,
+    pub label: Option<String>,
+}
+
+/// Probe result for Raw Mint status bar.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawProbeRow {
+    pub ok: bool,
+    pub summary: String,
+    pub phase_type: Option<String>,
+    pub open: bool,
+    pub value_eth: Option<String>,
+    pub value_wei: Option<String>,
+    pub per_nft_eth: Option<String>,
+    pub max_supply: Option<String>,
+    pub total_minted: Option<String>,
+    pub collector_fee_eth: Option<String>,
+    pub phase_start: Option<i64>,
+    pub seconds_to_start: Option<i64>,
+    pub minting_paused: bool,
+    pub error: Option<String>,
+}
+
+/// Input for raw contract sniper (desktop / API).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawSniperInput {
+    pub chain: String,
+    pub contract: String,
+    pub preset: Option<String>,
+    pub function: Option<String>,
+    pub params: Option<Vec<String>>,
+    pub quantity: Option<u32>,
+    pub value_mode: Option<String>,
+    pub value_eth: Option<String>,
+    pub dry_run: Option<bool>,
+    /// Typed LIVE confirmation for live runs (when require_live_confirm is on).
+    #[serde(default)]
+    pub confirm: Option<String>,
+    /// One-time desktop confirmation capability. Core ignores it; the Tauri
+    /// command consumes it before handing the request to the sniper engine.
+    #[serde(default)]
+    pub confirmation_id: Option<String>,
+    pub at_time: Option<String>,
+    pub timeout_secs: Option<u64>,
+    pub wallet_addresses: Option<Vec<String>>,
+    pub concurrency: Option<u32>,
+    /// Priority fee in gwei (empty / "auto" → settings).
+    pub priority_fee_gwei: Option<String>,
+    /// Max fee in gwei (optional).
+    pub max_fee_gwei: Option<String>,
+    /// Gas limit multiplier string e.g. "1.3".
+    pub gas_multiplier: Option<String>,
+    /// Hard gas limit (optional).
+    pub gas_limit: Option<u64>,
+    /// Fee refresh at fire: mainnetOnly | always | never (default settings / mainnetOnly).
+    pub fee_refresh_at_fire: Option<String>,
+}
+
+/// Serializable sweep/mint row for desktop UI.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SweepResultRow {
+    pub address: String,
+    pub status: String,
+    pub tx_hash: Option<String>,
+    pub gas_used: Option<u64>,
+    pub block_number: Option<u64>,
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<String>,
+}
+
+impl From<crate::types::MintResult> for SweepResultRow {
+    fn from(r: crate::types::MintResult) -> Self {
+        Self {
+            address: format!("{:?}", r.address),
+            status: r.status.to_string(),
+            tx_hash: r.tx_hash.map(|h| format!("{:?}", h)),
+            gas_used: r.gas_used,
+            block_number: r.block_number,
+            error: r.error,
+            contract: None,
+            token_id: None,
+            token_type: None,
+            amount: None,
+        }
+    }
+}
+
+impl From<crate::sweep::NftSweepResult> for SweepResultRow {
+    fn from(row: crate::sweep::NftSweepResult) -> Self {
+        let r = row.result;
+        Self {
+            address: format!("{:?}", r.address),
+            status: r.status.to_string(),
+            tx_hash: r.tx_hash.map(|h| format!("{:?}", h)),
+            gas_used: r.gas_used,
+            block_number: r.block_number,
+            error: r.error,
+            contract: row.contract.map(|v| format!("{v:?}")),
+            token_id: row.token_id.map(|v| v.to_string()),
+            token_type: row.token_type,
+            amount: row.amount.map(|v| v.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthTestRow {
+    pub address: String,
+    pub ok: bool,
+    pub chain_id: u64,
+    pub latency_ms: u64,
+    pub token_masked: Option<String>,
+    pub error: Option<String>,
+    pub proxy: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StageRow {
+    /// 0-based index in the stages list (for MintOptions.phase_index).
+    pub index: usize,
+    pub label: String,
+    pub stage_type: String,
+    pub eligible: String,
+    pub price_eth: Option<String>,
+    pub max_mintable: Option<i64>,
+    pub stage_index: Option<i64>,
+    pub recommended: bool,
+    /// Unix seconds when phase opens. None / 0 = already open or unknown.
+    pub start_time: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EligibilityResult {
+    pub slug: String,
+    pub address: String,
+    pub chain_id: u64,
+    pub stages: Vec<StageRow>,
+}
+
+/// Batch-event `kind` for the WL / eligibility screen.
+pub const BATCH_KIND_WL_CHECK: &str = "wlCheck";
+
+/// One wallet's OpenSea stage eligibility (WL check).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletEligibilityRow {
+    pub address: String,
+    pub ok: bool,
+    pub proxy: String,
+    pub latency_ms: u64,
+    pub error: Option<String>,
+    pub stages: Vec<StageRow>,
+    /// Non-public stages where wallet is eligible (PUBLIC_SALE never listed here).
+    pub eligible_labels: Vec<String>,
+    /// Not eligible / public-only / unknown labels for UI.
+    pub not_eligible_labels: Vec<String>,
+}
+
+/// Multi-wallet eligibility report for the WL Check page.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletEligibilityReport {
+    pub slug: String,
+    pub chain_id: u64,
+    pub wallets: Vec<WalletEligibilityRow>,
+    /// `results/wl_{slug}_{ts}/` directory after export (if written).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_dir: Option<String>,
+    /// Path to `eligibility.csv` (address,stage,max_mint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_csv: Option<String>,
+    /// Path to `not_eligible.txt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_not_eligible: Option<String>,
+}
+
+/// True if stage type is OpenSea public sale (never treated as WL eligible for export).
+pub fn is_public_sale_stage_type(stage_type: &str) -> bool {
+    stage_type.eq_ignore_ascii_case("PUBLIC_SALE")
+}
+
+/// WL-eligible for export/UI chips: OpenSea says eligible, and **not** PUBLIC_SALE.
+pub fn is_wl_eligible_stage_row(s: &StageRow) -> bool {
+    if is_public_sale_stage_type(&s.stage_type) {
+        return false;
+    }
+    let e = s.eligible.to_lowercase();
+    e.starts_with("eligible") && !e.contains("not") && !e.contains("public")
+}
+
+/// Build os.py-style export from multi-wallet report rows.
+fn export_wl_report(
+    slug: &str,
+    wallets: &[WalletEligibilityRow],
+) -> anyhow::Result<crate::export::WlExportPaths> {
+    use crate::export::{WlCsvRow, wl_stage_file_key, write_wl_eligibility_export};
+    use std::collections::BTreeMap;
+
+    let mut csv_rows: Vec<WlCsvRow> = Vec::new();
+    let mut by_stage: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut not_eligible: Vec<String> = Vec::new();
+
+    for w in wallets {
+        if !w.ok {
+            not_eligible.push(w.address.clone());
+            continue;
+        }
+        let mut has_wl = false;
+        for s in &w.stages {
+            if !is_wl_eligible_stage_row(s) {
+                continue;
+            }
+            has_wl = true;
+            let key = wl_stage_file_key(&s.stage_type, s.stage_index);
+            let max = s
+                .max_mintable
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "".into());
+            csv_rows.push(WlCsvRow {
+                address: w.address.clone(),
+                stage: key.clone(),
+                max_mint: max,
+            });
+            by_stage.entry(key).or_default().push(w.address.clone());
+        }
+        if !has_wl {
+            // Public-only, no stages, or not eligible on any WL phase.
+            not_eligible.push(w.address.clone());
+        }
+    }
+
+    let stage_wallets: Vec<(String, Vec<String>)> = by_stage.into_iter().collect();
+    write_wl_eligibility_export(slug, &csv_rows, &stage_wallets, &not_eligible)
+}
+
+#[cfg(test)]
+mod session_debug_tests {
+    use super::*;
+
+    #[test]
+    fn adopt_unlocked_moves_password_and_leaves_source_locked() {
+        let mut target = Session::default_paths();
+        let mut src = Session::default_paths();
+        src.password = Some(Zeroizing::new("pw".into()));
+        assert!(src.is_unlocked());
+        assert!(!target.is_unlocked());
+
+        target.adopt_unlocked(&mut src);
+
+        assert!(target.is_unlocked(), "target must receive the password");
+        // The surrendered clone must not keep a usable copy of the secret.
+        assert!(
+            !src.is_unlocked(),
+            "source clone must be left locked, not holding a second copy"
+        );
+        assert!(src.signers.is_empty());
+    }
+
+    #[test]
+    fn adopt_unlocked_does_not_clobber_target_settings() {
+        // The snapshot used for the (slow) derivation is stale by the time it
+        // returns, so adopting must touch only the key material.
+        let mut target = Session::default_paths();
+        target.settings.require_live_confirm = true;
+        target.dry_run = true;
+
+        let mut src = Session::default_paths();
+        src.password = Some(Zeroizing::new("pw".into()));
+        src.settings.require_live_confirm = false;
+        src.dry_run = false;
+
+        target.adopt_unlocked(&mut src);
+
+        assert!(target.is_unlocked());
+        assert!(
+            target.settings.require_live_confirm,
+            "a settings save during unlock must survive"
+        );
+        assert!(
+            target.dry_run,
+            "dry_run must not be reverted by the snapshot"
+        );
+    }
+
+    #[test]
+    fn debug_never_prints_password_or_env_secrets() {
+        let mut s = Session::default_paths();
+        s.password = Some(Zeroizing::new("super-secret-vault-pw".into()));
+        s.settings.alchemy_api_key = "alchemy_secret_key_xyz".into();
+        s.env
+            .insert("ALCHEMY_API_KEY".into(), "alchemy_secret_key_xyz".into());
+        s.env
+            .insert("RPC_URL".into(), "https://evil.example/v2/secret".into());
+        let dbg = format!("{s:?}");
+        assert!(
+            !dbg.contains("super-secret-vault-pw"),
+            "password leaked in Debug: {dbg}"
+        );
+        assert!(
+            !dbg.contains("alchemy_secret_key_xyz"),
+            "alchemy key leaked: {dbg}"
+        );
+        assert!(!dbg.contains("evil.example"), "RPC URL leaked: {dbg}");
+        assert!(dbg.contains("[set]") || dbg.contains("password"), "{dbg}");
+        assert!(dbg.contains("signers"), "{dbg}");
+    }
+}
+
+#[cfg(test)]
+mod sweep_selection_tests {
+    use super::*;
+
+    fn signers() -> Vec<Signer> {
+        (1u8..=2)
+            .map(|i| format!("{i:064x}").parse().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn none_is_all_but_explicit_empty_fails_closed() {
+        let signers = signers();
+        assert_eq!(select_vault_signers(&signers, None).unwrap().len(), 2);
+        let err = select_vault_signers(&signers, Some(vec![])).unwrap_err();
+        assert!(err.to_string().contains("Select at least one"));
+    }
+
+    #[test]
+    fn exact_subset_is_selected_and_unknown_wallet_is_rejected() {
+        let signers = signers();
+        let wanted = format!("{:?}", signers[1].address());
+        let selected = select_vault_signers(&signers, Some(vec![wanted])).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].address(), signers[1].address());
+
+        let unknown = "0x000000000000000000000000000000000000dead".to_string();
+        let err = select_vault_signers(&signers, Some(vec![unknown])).unwrap_err();
+        assert!(err.to_string().contains("not present"));
+    }
+}
+
+#[cfg(test)]
+mod recommended_phase_tests {
+    use super::*;
+
+    fn stage(stage_type: &str, idx: i64, start_time: Option<f64>) -> opensea::StageInfo {
+        opensea::StageInfo {
+            stage_type: stage_type.to_string(),
+            stage_index: Some(idx),
+            label: None,
+            start_time,
+            end_time: None,
+            is_eligible: Some(true),
+            max_mintable: Some(2),
+            price_eth: None,
+            price_wei: None,
+            payment_token_contract: None,
+            payment_token_chain: None,
+            raw: serde_json::json!({}),
+        }
+    }
+
+    fn info(stages: Vec<opensea::StageInfo>) -> opensea::CollectionInfo {
+        opensea::CollectionInfo {
+            slug: "t".into(),
+            name: "T".into(),
+            chain: "ethereum".into(),
+            contracts: vec![],
+            drop_type: None,
+            stages,
+            minter_quantity_minted: None,
+        }
+    }
+
+    #[test]
+    fn started_presale_beats_future_presale() {
+        let now = chrono::Utc::now().timestamp() as f64;
+        // #0 opens in 1h, #1 opened 1h ago → recommend #1 (already started).
+        let i = info(vec![
+            stage("SIGNED_PRESALE", 0, Some(now + 3600.0)),
+            stage("SIGNED_PRESALE", 1, Some(now - 3600.0)),
+        ]);
+        assert_eq!(recommended_phase_index(&i), 1);
+    }
+
+    #[test]
+    fn presale_still_beats_public() {
+        let now = chrono::Utc::now().timestamp() as f64;
+        let i = info(vec![
+            stage("PUBLIC_SALE", 0, Some(now - 3600.0)),
+            stage("ALLOW_LIST", 1, Some(now - 3600.0)),
+        ]);
+        assert_eq!(recommended_phase_index(&i), 1);
+    }
+
+    #[test]
+    fn missing_start_time_counts_as_started() {
+        let now = chrono::Utc::now().timestamp() as f64;
+        let i = info(vec![
+            stage("SIGNED_PRESALE", 0, Some(now + 3600.0)),
+            stage("SIGNED_PRESALE", 1, None),
+        ]);
+        assert_eq!(recommended_phase_index(&i), 1);
+    }
+}
+
+#[cfg(test)]
+mod wl_classify_tests {
+    use super::*;
+
+    fn row(stage_type: &str, eligible: &str, idx: Option<i64>) -> StageRow {
+        StageRow {
+            index: 0,
+            label: format!("{stage_type}"),
+            stage_type: stage_type.into(),
+            eligible: eligible.into(),
+            price_eth: None,
+            max_mintable: Some(1),
+            stage_index: idx,
+            recommended: false,
+            start_time: None,
+        }
+    }
+
+    #[test]
+    fn public_sale_never_wl_eligible() {
+        assert!(!is_wl_eligible_stage_row(&row(
+            "PUBLIC_SALE",
+            "eligible",
+            Some(0)
+        )));
+        assert!(!is_wl_eligible_stage_row(&row(
+            "PUBLIC_SALE",
+            "eligible (public)",
+            Some(0)
+        )));
+    }
+
+    #[test]
+    fn signed_presale_eligible_is_wl() {
+        assert!(is_wl_eligible_stage_row(&row(
+            "SIGNED_PRESALE",
+            "eligible",
+            Some(0)
+        )));
+        assert!(!is_wl_eligible_stage_row(&row(
+            "SIGNED_PRESALE",
+            "not eligible",
+            Some(0)
+        )));
+    }
+}
+
+#[cfg(test)]
+mod rpc_collect_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn eth_alchemy_url_only_does_not_pollute_l2() {
+        let mut env = HashMap::new();
+        env.insert(
+            "RPC_URL".into(),
+            "https://eth-mainnet.g.alchemy.com/v2/testKey123".into(),
+        );
+        env.insert(
+            "RPC_URLS".into(),
+            "https://eth-mainnet.g.alchemy.com/v2/testKey123".into(),
+        );
+
+        let base = collect_rpc_urls_for_chain(&env, Some("base"), &[]);
+        assert!(
+            base.iter()
+                .any(|u| u.contains("base-mainnet.g.alchemy.com")),
+            "expected base alchemy from extracted key, got {base:?}"
+        );
+        assert!(
+            !base.iter().any(|u| u.contains("eth-mainnet")),
+            "base must not use eth-mainnet URL: {base:?}"
+        );
+
+        let arb = collect_rpc_urls_for_chain(&env, Some("arbitrum"), &[]);
+        assert!(arb.iter().any(|u| u.contains("arb-mainnet.g.alchemy.com")));
+        assert!(!arb.iter().any(|u| u.contains("eth-mainnet")));
+
+        let poly = collect_rpc_urls_for_chain(&env, Some("polygon"), &[]);
+        assert!(
+            poly.iter()
+                .any(|u| u.contains("polygon-mainnet.g.alchemy.com"))
+        );
+
+        let op = collect_rpc_urls_for_chain(&env, Some("optimism"), &[]);
+        assert!(op.iter().any(|u| u.contains("opt-mainnet.g.alchemy.com")));
+
+        let eth = collect_rpc_urls_for_chain(&env, Some("ethereum"), &[]);
+        assert!(eth.iter().any(|u| u.contains("eth-mainnet.g.alchemy.com")));
+    }
+
+    #[test]
+    fn public_fallback_when_no_keys() {
+        let env = HashMap::new();
+        let base = collect_rpc_urls_for_chain(&env, Some("base"), &[]);
+        assert!(
+            base.iter()
+                .any(|u| u.contains("base.org") || u.contains("base.")),
+            "expected public base RPC, got {base:?}"
+        );
+        let rh = collect_rpc_urls_for_chain(&env, Some("robinhood"), &[]);
+        assert!(rh.iter().any(|u| u.contains("robinhood")));
+    }
+
+    #[test]
+    fn extract_alchemy_key_from_url_ok() {
+        assert_eq!(
+            extract_alchemy_key_from_url("https://eth-mainnet.g.alchemy.com/v2/AbCdEf123?foo=1")
+                .as_deref(),
+            Some("AbCdEf123")
+        );
+        // Public Alchemy hosts have no key path — ignore
+        assert!(
+            extract_alchemy_key_from_url("https://base-mainnet.g.alchemy.com/public").is_none()
+        );
+    }
+
+    #[test]
+    fn alchemy_key_builds_private_slugs_not_public() {
+        let mut env = HashMap::new();
+        env.insert("ALCHEMY_API_KEY".into(), "myKey99".into());
+        for (chain, host) in [
+            ("base", "base-mainnet.g.alchemy.com/v2/myKey99"),
+            ("robinhood", "robinhood-mainnet.g.alchemy.com/v2/myKey99"),
+            ("zora", "zora-mainnet.g.alchemy.com/v2/myKey99"),
+            ("apechain", "apechain-mainnet.g.alchemy.com/v2/myKey99"),
+            ("shape", "shape-mainnet.g.alchemy.com/v2/myKey99"),
+            ("monad", "monad-mainnet.g.alchemy.com/v2/myKey99"),
+            ("blast", "blast-mainnet.g.alchemy.com/v2/myKey99"),
+        ] {
+            let urls = collect_rpc_urls_for_chain(&env, Some(chain), &[]);
+            assert!(
+                urls.iter().any(|u| u.contains(host)),
+                "chain {chain}: expected private Alchemy {host}, got {urls:?}"
+            );
+            assert!(
+                !urls.iter().any(|u| u.contains("alchemy.com/public")),
+                "chain {chain}: must never use Alchemy public: {urls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_fallback_is_appended_even_with_a_paid_provider_key() {
+        // Configuring one paid endpoint still yields a two-endpoint run: the
+        // public fallback is appended unconditionally. Operators read this as
+        // "I have one node", so the origin label has to make it explicit.
+        let mut env = HashMap::new();
+        env.insert("ALCHEMY_API_KEY".into(), "myKey99".into());
+        let labeled = collect_rpc_urls_for_chain_labeled(&env, Some("robinhood"), &[]);
+        assert_eq!(labeled.len(), 2, "{labeled:?}");
+        assert_eq!(labeled[0].1, RpcOrigin::Provider);
+        assert!(labeled[0].0.contains("robinhood-mainnet.g.alchemy.com"));
+        assert_eq!(labeled[1].1, RpcOrigin::Public);
+        assert!(labeled[1].0.contains("rpc.mainnet.chain.robinhood.com"));
+    }
+
+    #[test]
+    fn labeled_collector_matches_the_plain_url_list_exactly() {
+        // The plain list delegates to the labeled one; if they ever drift, the
+        // RPCs page would describe a different set than a mint actually uses.
+        let mut env = HashMap::new();
+        env.insert("ALCHEMY_API_KEY".into(), "myKey99".into());
+        env.insert(
+            "ROBINHOOD_RPC_URLS".into(),
+            "https://one.example,https://two.example".into(),
+        );
+        for chain in ["robinhood", "ethereum", "base", "megaeth"] {
+            let plain = collect_rpc_urls_for_chain(&env, Some(chain), &[]);
+            let labeled: Vec<String> = collect_rpc_urls_for_chain_labeled(&env, Some(chain), &[])
+                .into_iter()
+                .map(|(u, _)| u)
+                .collect();
+            assert_eq!(plain, labeled, "chain {chain}");
+        }
+    }
+
+    #[test]
+    fn settings_urls_outrank_provider_and_public_and_keep_their_origin() {
+        let mut env = HashMap::new();
+        env.insert("ALCHEMY_API_KEY".into(), "myKey99".into());
+        env.insert("ROBINHOOD_RPC_URL".into(), "https://mine.example".into());
+        let labeled = collect_rpc_urls_for_chain_labeled(&env, Some("robinhood"), &[]);
+        assert_eq!(labeled[0], ("https://mine.example".to_string(), RpcOrigin::Settings));
+        assert!(labeled.iter().any(|(_, o)| *o == RpcOrigin::Provider));
+        assert!(labeled.iter().any(|(_, o)| *o == RpcOrigin::Public));
+    }
+
+    #[test]
+    fn extra_urls_are_custom_and_come_first() {
+        let env = HashMap::new();
+        let labeled = collect_rpc_urls_for_chain_labeled(
+            &env,
+            Some("robinhood"),
+            &["https://extra.example".to_string()],
+        );
+        assert_eq!(labeled[0], ("https://extra.example".to_string(), RpcOrigin::Custom));
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DropPhasesResult {
+    pub slug: String,
+    pub name: String,
+    pub chain: String,
+    pub address: String,
+    pub recommended_index: usize,
+    pub stages: Vec<StageRow>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LatencyRpcRow {
+    pub url_short: String,
+    pub ok: bool,
+    pub chain_id_ms: Option<u64>,
+    pub chain_id: Option<u64>,
+    pub block_ms: Option<u64>,
+    pub block_number: Option<u64>,
+    pub fees_ms: Option<u64>,
+    pub base_fee_gwei: Option<u64>,
+    pub priority_gwei: Option<u64>,
+    pub nonce_ms: Option<u64>,
+    pub nonce: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyHealthRow {
+    pub label: String,
+    pub ok: bool,
+    pub latency_ms: Option<u64>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LatencyReport {
+    pub rpc: Vec<LatencyRpcRow>,
+    pub proxies: Vec<ProxyHealthRow>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredFunction {
+    pub signature: String,
+    pub source: String,
+}
+
+fn recommended_phase_index(info: &opensea::CollectionInfo) -> usize {
+    let stages = &info.stages;
+    stages
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| opensea::stage_effective_eligible(s))
+        .filter(|(_, s)| opensea::available_mint_quantity(info, s).unwrap_or(1) > 0)
+        .min_by_key(|(_, s)| {
+            let is_public = s.stage_type == "PUBLIC_SALE";
+            // Started = start_time <= wall clock now (missing start_time counts as started).
+            // Comparing against 0 marked every real (past) timestamp as "not started".
+            let now = chrono::Utc::now().timestamp();
+            let has_started = s.start_time.map(|t| t as i64 <= now).unwrap_or(true);
+            (
+                is_public as usize,
+                !has_started as usize,
+                s.stage_index.unwrap_or(0),
+            )
+        })
+        .map(|(i, _)| i)
+        .unwrap_or_else(|| {
+            stages
+                .iter()
+                .position(opensea::stage_effective_eligible)
+                .unwrap_or(0)
+        })
+}
+
+fn stage_rows_from(stages: &[opensea::StageInfo], recommended: Option<usize>) -> Vec<StageRow> {
+    stages
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let start_time = s
+                .start_time
+                .and_then(|t| if t > 0.0 { Some(t as i64) } else { None });
+            StageRow {
+                index: i,
+                label: opensea::stage_label(s),
+                stage_type: s.stage_type.clone(),
+                eligible: opensea::stage_eligibility_label(s).to_string(),
+                // Prefer the exact wei value: `format!("{f64}")` can emit
+                // scientific notation (1e-7) and loses precision on small
+                // prices. Fall back to the f64 only when wei is absent.
+                price_eth: s
+                    .price_wei
+                    .map(crate::amount::wei_to_eth_string)
+                    .or_else(|| s.price_eth.map(|p| format!("{p}"))),
+                max_mintable: s.max_mintable,
+                stage_index: s.stage_index,
+                recommended: recommended == Some(i),
+                start_time,
+            }
+        })
+        .collect()
+}
+
+/// Mint options independent of stdin / CLI prompts.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MintOptions {
+    pub slug: String,
+    pub quantity: u32,
+    pub dry_run: bool,
+    /// Prefer recommended phase when `phase_index` is None.
+    pub auto_phase: bool,
+    /// 0-based stage index (overrides auto when set).
+    pub phase_index: Option<usize>,
+    /// Schedule: RFC3339 or unix timestamp string.
+    pub at_time: Option<String>,
+    /// Override env USE_GQL when Some.
+    pub use_gql: Option<bool>,
+    /// Override env SKIP_PREFLIGHT when Some.
+    pub skip_preflight: Option<bool>,
+    /// Override env QUIET when Some.
+    pub quiet: Option<bool>,
+    /// Optional priority fee override (gwei string).
+    pub priority_fee_gwei: Option<String>,
+    /// Gas limit override. `None` = settings/env; `Some(0)` = auto estimate; `Some(n)` = fixed.
+    pub gas_limit: Option<u64>,
+    /// If set (non-empty), only these vault addresses mint (case-insensitive).
+    pub wallet_addresses: Option<Vec<String>>,
+    /// RPC chain override (e.g. "ethereum", "base"). None = use collection chain.
+    pub chain_override: Option<String>,
+    /// Optional wallet address → proxy list index (overrides vault-index mapping).
+    pub proxy_overrides: Option<std::collections::HashMap<String, u32>>,
+    /// Wallets that must access OpenSea directly even when proxies are configured.
+    /// This is separate from `proxy_overrides`: a missing override still means
+    /// automatic round-robin proxy assignment for backwards compatibility.
+    pub direct_wallet_addresses: Option<Vec<String>>,
+    /// Optional per-wallet mint quantity (address → qty). Default = `quantity`.
+    pub wallet_quantities: Option<std::collections::HashMap<String, u32>>,
+    /// If true, skip eth_estimateGas on open (use fixed gas limit) — faster, slightly riskier.
+    pub skip_estimate_on_open: Option<bool>,
+    /// When true, fire via Flashbots bundle (Ethereum mainnet only).
+    pub use_flashbots: Option<bool>,
+    /// Experimental Robinhood conditional mempool submission before T0.
+    pub conditional_submit_enabled: Option<bool>,
+    /// How many milliseconds before T0 to submit the conditional transaction.
+    pub conditional_lead_ms: Option<u64>,
+}
+
+impl Default for MintOptions {
+    fn default() -> Self {
+        Self {
+            slug: String::new(),
+            quantity: 1,
+            dry_run: true,
+            auto_phase: true,
+            phase_index: None,
+            at_time: None,
+            use_gql: None,
+            skip_preflight: None,
+            quiet: None,
+            priority_fee_gwei: None,
+            gas_limit: None,
+            wallet_addresses: None,
+            chain_override: None,
+            proxy_overrides: None,
+            direct_wallet_addresses: None,
+            wallet_quantities: None,
+            skip_estimate_on_open: Some(true),
+            use_flashbots: None,
+            conditional_submit_enabled: None,
+            conditional_lead_ms: None,
+        }
+    }
+}
+
+/// Human network label from configured RPCs (never "from Settings").
+fn network_label_from_settings(settings: &Settings) -> String {
+    if !settings.has_rpc() {
+        return "Not selected".into();
+    }
+    let eth = !settings.rpc_url_ethereum.trim().is_empty();
+    let base = !settings.rpc_url_base.trim().is_empty();
+    let poly = !settings.rpc_url_polygon.trim().is_empty();
+    let custom = !settings.rpc_urls.trim().is_empty();
+    let alchemy = !settings.alchemy_api_key.trim().is_empty();
+    let mut named: Vec<&str> = Vec::new();
+    if eth {
+        named.push("Ethereum");
+    }
+    if base {
+        named.push("Base");
+    }
+    if poly {
+        named.push("Polygon");
+    }
+    // Alchemy / multi / custom → operator picks chain per task
+    if alchemy || custom || named.len() != 1 {
+        return "Auto".into();
+    }
+    named[0].to_string()
+}
+
+fn chain_id_label(id: u64) -> String {
+    match id {
+        1 => "Ethereum".into(),
+        8453 => "Base".into(),
+        137 => "Polygon".into(),
+        42161 => "Arbitrum".into(),
+        10 => "Optimism".into(),
+        56 => "BSC".into(),
+        43114 => "Avalanche".into(),
+        81457 => "Blast".into(),
+        7777777 => "Zora".into(),
+        33139 => "ApeChain".into(),
+        360 => "Shape".into(),
+        143 => "Monad".into(),
+        4326 => "MegaETH".into(),
+        4663 => "Robinhood Chain".into(),
+        0 => "Not selected".into(),
+        other => format!("chainId {other}"),
+    }
+}
+
+/// Normalize address for comparison (`0x` + lowercase).
+pub fn normalize_address(addr: &str) -> String {
+    let a = addr.trim().to_lowercase();
+    if a.starts_with("0x") {
+        a
+    } else {
+        format!("0x{a}")
+    }
+}
+
+/// Resolve an optional public-address subset against unlocked signers.
+///
+/// `None` is the only representation of "all". Every explicit selection is
+/// validated and must match the Vault exactly, preventing an empty or stale UI
+/// selection from accidentally broadening a sweep to every wallet.
+fn select_vault_signers(
+    signers: &[Signer],
+    wallet_addresses: Option<Vec<String>>,
+) -> Result<Vec<Signer>> {
+    let Some(addresses) = wallet_addresses else {
+        return Ok(signers.to_vec());
+    };
+    if addresses.is_empty() {
+        bail!("Select at least one source wallet for Sweep");
+    }
+    let mut requested = std::collections::HashSet::new();
+    for raw in addresses {
+        let address: Address = raw
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid selected wallet address: {raw}"))?;
+        if address == Address::ZERO {
+            bail!("selected wallet is the zero address");
+        }
+        requested.insert(address);
+    }
+    if requested.is_empty() {
+        bail!("Select at least one source wallet for Sweep");
+    }
+    let selected: Vec<Signer> = signers
+        .iter()
+        .filter(|signer| requested.contains(&signer.address()))
+        .cloned()
+        .collect();
+    if selected.len() != requested.len() {
+        bail!(
+            "{} selected wallet(s) are not present in the unlocked Vault",
+            requested.len().saturating_sub(selected.len())
+        );
+    }
+    Ok(selected)
+}
+
+/// Parse OpenSea collection URL or bare slug.
+pub fn parse_collection_slug(raw: &str) -> String {
+    let raw = raw.trim().trim_end_matches('/');
+    let marker = "opensea.io/collection/";
+    if let Some(idx) = raw.find(marker) {
+        let after = &raw[idx + marker.len()..];
+        after
+            .split('/')
+            .next()
+            .unwrap_or(after)
+            .split('?')
+            .next()
+            .unwrap_or(after)
+            .to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+fn add_unique_url(urls: &mut Vec<String>, url: String) {
+    let url = url.trim().to_string();
+    if !url.is_empty() && !urls.contains(&url) {
+        urls.push(url);
+    }
+}
+
+fn env_first<'a>(env: &'a HashMap<String, String>, names: &[&str]) -> Option<&'a str> {
+    // Filter *inside* find_map: a present-but-empty key (a blank `FOO=` line in
+    // .env) must not shadow a later alias that does have a value.
+    names.iter().find_map(|name| {
+        env.get(*name)
+            .map(|v| v.as_str())
+            .filter(|v| !v.trim().is_empty())
+    })
+}
+
+/// Mask a bearer token for display as `head…tail`, counting **chars**.
+///
+/// Byte-slicing an untrusted token panics when a multi-byte char straddles the
+/// cut point, so all token masking goes through this.
+fn mask_token(token: &str) -> String {
+    if token.trim().is_empty() {
+        return "(empty)".into();
+    }
+    let chars: Vec<char> = token.chars().collect();
+    if chars.len() > 16 {
+        let head: String = chars[..8].iter().collect();
+        let tail: String = chars[chars.len() - 8..].iter().collect();
+        format!("{head}…{tail}")
+    } else {
+        "••••".into()
+    }
+}
+
+fn rpc_env_names(chain: Option<&str>) -> Vec<String> {
+    let chain = match chain {
+        Some(c) if !c.is_empty() => c,
+        _ => return vec![],
+    };
+    let normalized = chain
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let mut aliases = vec![normalized.clone()];
+    if normalized == "ETHEREUM" {
+        aliases.push("MAINNET".to_string());
+    }
+    if normalized == "MATIC" {
+        aliases.push("POLYGON".to_string());
+    }
+    let mut names = Vec::new();
+    for alias in &aliases {
+        names.push(format!("RPC_URL_{}", alias));
+        names.push(format!("{}_RPC_URL", alias));
+        names.push(format!("RPC_URLS_{}", alias));
+        names.push(format!("{}_RPC_URLS", alias));
+    }
+    names
+}
+
+fn provider_chain_slugs(
+    chain: &str,
+) -> (
+    Option<&'static str>,
+    Option<&'static str>,
+    Option<&'static str>,
+) {
+    match chain.to_lowercase().as_str() {
+        "ethereum" | "mainnet" => (Some("eth-mainnet"), Some("eth-mainnet"), Some("mainnet")),
+        "base" => (
+            Some("base-mainnet"),
+            Some("open-platform:base"),
+            Some("base"),
+        ),
+        "matic" | "polygon" => (
+            Some("polygon-mainnet"),
+            Some("polygon-mainnet"),
+            Some("polygon"),
+        ),
+        "arbitrum" => (
+            Some("arb-mainnet"),
+            Some("arbitrum-mainnet"),
+            Some("arbitrum"),
+        ),
+        "arbitrum_nova" | "arbitrum-nova" | "nova" => (None, None, Some("nova")),
+        "optimism" => (Some("opt-mainnet"), Some("opt-mainnet"), Some("optimism")),
+        "avalanche" => (
+            Some("avax-mainnet"),
+            Some("avalanche-mainnet"),
+            Some("avalanche"),
+        ),
+        "bsc" => (None, Some("bsc-mainnet"), None),
+        "blast" => (Some("blast-mainnet"), None, Some("blast")),
+        // Alchemy private only: https://{slug}.g.alchemy.com/v2/{API_KEY}
+        // Never use Alchemy /public endpoints — operator key only.
+        "ape_chain" | "apechain" => (Some("apechain-mainnet"), None, Some("apechain")),
+        "zora" => (Some("zora-mainnet"), None, None),
+        "monad" => (Some("monad-mainnet"), None, None),
+        "megaeth" | "mega_eth" => (None, None, None),
+        "robinhood" | "robinhood_chain" | "robinhood-chain" => {
+            (Some("robinhood-mainnet"), None, None)
+        }
+        "shape" => (Some("shape-mainnet"), None, None),
+        _ => (None, None, None),
+    }
+}
+
+/// Well-known public RPC endpoints when no key/custom URL is configured.
+fn public_rpc_fallback(chain: &str) -> Vec<&'static str> {
+    match chain.to_lowercase().as_str() {
+        "ethereum" | "mainnet" | "eth" => vec![
+            "https://ethereum.publicnode.com",
+            "https://cloudflare-eth.com",
+            "https://rpc.ankr.com/eth",
+        ],
+        "base" => vec![
+            "https://mainnet.base.org",
+            "https://base.publicnode.com",
+            "https://base.llamarpc.com",
+        ],
+        "matic" | "polygon" => vec![
+            "https://polygon-bor.publicnode.com",
+            "https://polygon-rpc.com",
+            "https://rpc.ankr.com/polygon",
+        ],
+        "arbitrum" | "arb" => vec![
+            "https://arb1.arbitrum.io/rpc",
+            "https://arbitrum-one.publicnode.com",
+            "https://rpc.ankr.com/arbitrum",
+        ],
+        "optimism" | "op" => vec![
+            "https://mainnet.optimism.io",
+            "https://optimism.publicnode.com",
+            "https://rpc.ankr.com/optimism",
+        ],
+        "megaeth" | "mega_eth" => vec!["https://mainnet.megaeth.com/rpc"],
+        "monad" => vec!["https://rpc.monad.xyz", "https://rpc1.monad.xyz"],
+        "robinhood" | "robinhood_chain" | "robinhood-chain" => {
+            vec!["https://rpc.mainnet.chain.robinhood.com"]
+        }
+        "shape" => vec!["https://mainnet.shape.network"],
+        "zora" => vec!["https://rpc.zora.energy"],
+        "apechain" | "ape_chain" => vec!["https://rpc.apechain.com/http"],
+        "blast" => vec!["https://rpc.blast.io"],
+        _ => vec![],
+    }
+}
+
+/// Pull Alchemy API key from Settings field or from any `*.g.alchemy.com/v2/<key>` URL in env.
+fn extract_alchemy_key_from_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    let lower = url.to_ascii_lowercase();
+    if !lower.contains("alchemy.com") {
+        return None;
+    }
+    let marker = "/v2/";
+    let idx = lower.find(marker)?;
+    let rest = &url[idx + marker.len()..];
+    let key = rest.split(['?', '#', '/']).next().unwrap_or("").trim();
+    if key.is_empty() || key == "YOUR_ALCHEMY_KEY" {
+        None
+    } else {
+        Some(key.to_string())
+    }
+}
+
+fn alchemy_api_key_from_env(env: &HashMap<String, String>) -> Option<String> {
+    if let Some(k) = env_first(env, &["ALCHEMY_API_KEY", "ALCHEMYAPIKEY", "alchemyapikey"]) {
+        let k = k.trim();
+        if !k.is_empty() && k != "YOUR_ALCHEMY_KEY" {
+            return Some(k.to_string());
+        }
+    }
+    // User often pastes only eth-mainnet Alchemy into RPC_URL / RPC_URLS — reuse key for L2s.
+    for v in env.values() {
+        for part in v.split(',') {
+            if let Some(key) = extract_alchemy_key_from_url(part) {
+                return Some(key);
+            }
+        }
+    }
+    None
+}
+
+/// Named chain may use generic RPC_URL only for Ethereum (generic is usually mainnet).
+fn allow_generic_rpc_for_chain(chain: Option<&str>) -> bool {
+    match chain.map(str::trim).filter(|c| !c.is_empty()) {
+        None => true,
+        Some(c) => matches!(
+            c.to_ascii_lowercase().as_str(),
+            "ethereum" | "mainnet" | "eth"
+        ),
+    }
+}
+
+fn provider_rpc_urls_for_chain(env: &HashMap<String, String>, chain: Option<&str>) -> Vec<String> {
+    let Some(chain) = chain.filter(|c| !c.is_empty()) else {
+        return vec![];
+    };
+    let (alchemy_slug, nodereal_slug, tenderly_slug) = provider_chain_slugs(chain);
+    let mut urls = Vec::new();
+
+    // Private Alchemy only (`/v2/{key}`). Never `*.g.alchemy.com/public`.
+    if let (Some(key), Some(slug)) = (alchemy_api_key_from_env(env), alchemy_slug) {
+        add_unique_url(
+            &mut urls,
+            format!("https://{}.g.alchemy.com/v2/{}", slug, key),
+        );
+    }
+
+    if let (Some(key), Some(slug)) = (
+        env_first(
+            env,
+            &["NODEREAL_API_KEY", "NODEREALAPIKEY", "noderealapikey"],
+        ),
+        nodereal_slug,
+    ) {
+        let url = if let Some(path) = slug.strip_prefix("open-platform:") {
+            format!("https://open-platform.nodereal.io/{}/{}", key, path)
+        } else {
+            format!("https://{}.nodereal.io/v1/{}", slug, key)
+        };
+        add_unique_url(&mut urls, url);
+    }
+
+    if let (Some(key), Some(slug)) = (
+        env_first(
+            env,
+            &[
+                "TENDERLY_API_KEY",
+                "TENDERLY_NODE_ACCESS_KEY",
+                "TENDERLYAPIKEY",
+                "tenderlyapikey",
+            ],
+        ),
+        tenderly_slug,
+    ) {
+        add_unique_url(
+            &mut urls,
+            format!("https://{}.gateway.tenderly.co/{}", slug, key),
+        );
+    }
+
+    urls
+}
+
+/// Collect RPC URLs for a collection chain (Settings / env / provider keys).
+/// Where a configured RPC endpoint came from.
+///
+/// Surfaced on the RPCs page and in the mint log because the list is assembled
+/// from several sources and a well-known public endpoint is appended to every
+/// supported chain automatically — so "I configured one paid node" routinely
+/// means "this run broadcasts to a paid node *and* a public one". Without the
+/// origin the operator cannot tell them apart from the URL alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcOrigin {
+    /// Explicit URL passed by the caller for this run.
+    Custom,
+    /// A `*_RPC_URL(S)` key from Settings / `.env`.
+    Settings,
+    /// Built from a provider API key (Alchemy / Infura / …).
+    Provider,
+    /// Well-known public endpoint appended automatically for the chain.
+    Public,
+    /// Generic `RPC_URL(S)` fallback (Ethereum-ish chains only).
+    Generic,
+}
+
+impl RpcOrigin {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Custom => "custom",
+            Self::Settings => "settings",
+            Self::Provider => "provider key",
+            Self::Public => "public fallback",
+            Self::Generic => "generic",
+        }
+    }
+}
+
+fn add_unique_labeled(urls: &mut Vec<(String, RpcOrigin)>, url: String, origin: RpcOrigin) {
+    let url = url.trim().to_string();
+    if !url.is_empty() && !urls.iter().any(|(u, _)| *u == url) {
+        urls.push((url, origin));
+    }
+}
+
+pub fn collect_rpc_urls_for_chain(
+    env: &HashMap<String, String>,
+    chain: Option<&str>,
+    extra: &[String],
+) -> Vec<String> {
+    collect_rpc_urls_for_chain_labeled(env, chain, extra)
+        .into_iter()
+        .map(|(url, _)| url)
+        .collect()
+}
+
+/// Same list and order as [`collect_rpc_urls_for_chain`], with each endpoint
+/// tagged by where it came from. The plain version delegates here so the two
+/// can never drift apart.
+pub fn collect_rpc_urls_for_chain_labeled(
+    env: &HashMap<String, String>,
+    chain: Option<&str>,
+    extra: &[String],
+) -> Vec<(String, RpcOrigin)> {
+    let mut urls: Vec<(String, RpcOrigin)> = Vec::new();
+    for url in extra {
+        add_unique_labeled(&mut urls, url.clone(), RpcOrigin::Custom);
+    }
+    for name in rpc_env_names(chain) {
+        if let Some(value) = env.get(&name) {
+            if name.contains("URLS") {
+                for url in value.split(',') {
+                    add_unique_labeled(&mut urls, url.to_string(), RpcOrigin::Settings);
+                }
+            } else {
+                add_unique_labeled(&mut urls, value.clone(), RpcOrigin::Settings);
+            }
+        }
+    }
+    for url in provider_rpc_urls_for_chain(env, chain) {
+        add_unique_labeled(&mut urls, url, RpcOrigin::Provider);
+    }
+    if let Some(c) = chain.filter(|c| !c.is_empty()) {
+        for url in public_rpc_fallback(c) {
+            add_unique_labeled(&mut urls, url.to_string(), RpcOrigin::Public);
+        }
+    }
+    // Generic RPC_URL / RPC_URLS are almost always Ethereum. Never attach them to
+    // Base/Polygon/… — that made "Ping networks" report chainId=1 for every L2.
+    if urls.is_empty() && allow_generic_rpc_for_chain(chain) {
+        if let Some(url) = env.get("RPC_URL") {
+            add_unique_labeled(&mut urls, url.clone(), RpcOrigin::Generic);
+        }
+        if let Some(urls_str) = env.get("RPC_URLS") {
+            for url in urls_str.split(',') {
+                add_unique_labeled(&mut urls, url.to_string(), RpcOrigin::Generic);
+            }
+        }
+        for u in collect_rpc_urls(env) {
+            add_unique_labeled(&mut urls, u, RpcOrigin::Generic);
+        }
+    }
+    urls
+}
+
+pub fn load_env_file(path: &Path) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if !path.exists() {
+        return map;
+    }
+    if let Ok(iter) = dotenvy::from_path_iter(path) {
+        for item in iter.flatten() {
+            map.insert(item.0, item.1);
+        }
+    }
+    // Second pass is a *fallback only*, never an override. `dotenvy` handles
+    // escapes (\n, \t, \\) and multi-line quoted values correctly; the simple
+    // line parser below does not, so letting it overwrite corrupted any value
+    // containing those sequences. It still runs so that lines dotenvy rejects
+    // (e.g. unusual keys) are not silently lost.
+    if let Ok(content) = std::fs::read_to_string(path) {
+        for line in content.lines() {
+            if let Some((k, v)) = parse_env_line(line) {
+                map.entry(k).or_insert(v);
+            }
+        }
+    }
+    map
+}
+
+fn parse_env_line(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let line = line
+        .strip_prefix("export ")
+        .or_else(|| line.strip_prefix("export\t"))
+        .unwrap_or(line)
+        .trim();
+    let (key, val) = line.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    let val = val.trim();
+    let val = if val.len() >= 2
+        && ((val.starts_with('"') && val.ends_with('"'))
+            || (val.starts_with('\'') && val.ends_with('\'')))
+    {
+        val[1..val.len() - 1].to_string()
+    } else {
+        val.to_string()
+    };
+    Some((key.to_string(), val))
+}
+
+/// Collect common RPC URL env keys (simplified for desktop/core).
+pub fn collect_rpc_urls(env: &HashMap<String, String>) -> Vec<String> {
+    let mut urls = Vec::new();
+    let push = |urls: &mut Vec<String>, u: &str| {
+        let u = u.trim().to_string();
+        if !u.is_empty() && !urls.contains(&u) {
+            urls.push(u);
+        }
+    };
+    for key in [
+        "RPC_URL",
+        "RPC_URLS",
+        "RPC_URL_ETHEREUM",
+        "RPC_URL_BASE",
+        "RPC_URL_POLYGON",
+        "ETHEREUM_RPC_URL",
+        "BASE_RPC_URL",
+        "POLYGON_RPC_URL",
+        "RPC_URLS_ETHEREUM",
+        "RPC_URLS_BASE",
+    ] {
+        if let Some(v) = env.get(key) {
+            if key.contains("URLS") {
+                for part in v.split(',') {
+                    push(&mut urls, part);
+                }
+            } else {
+                push(&mut urls, v);
+            }
+        }
+    }
+    // Provider auto-URLs (key field or scraped from pasted Alchemy URLs)
+    if let Some(key) = alchemy_api_key_from_env(env) {
+        push(
+            &mut urls,
+            &format!("https://eth-mainnet.g.alchemy.com/v2/{}", key),
+        );
+        push(
+            &mut urls,
+            &format!("https://base-mainnet.g.alchemy.com/v2/{}", key),
+        );
+        push(
+            &mut urls,
+            &format!("https://polygon-mainnet.g.alchemy.com/v2/{}", key),
+        );
+        push(
+            &mut urls,
+            &format!("https://arb-mainnet.g.alchemy.com/v2/{}", key),
+        );
+        push(
+            &mut urls,
+            &format!("https://opt-mainnet.g.alchemy.com/v2/{}", key),
+        );
+    }
+    urls
+}
+
+fn short_url(url: &str) -> String {
+    // Char-based (not byte slicing): non-ASCII URLs must not panic.
+    let chars: Vec<char> = url.chars().collect();
+    if chars.len() > 42 {
+        let head: String = chars[..30].iter().collect();
+        let tail: String = chars[chars.len() - 8..].iter().collect();
+        format!("{}...{}", head, tail)
+    } else {
+        url.to_string()
+    }
+}

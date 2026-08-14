@@ -1,0 +1,6 @@
+# Pinned toolchain for local + CI (P0 hygiene).
+# https://github.com/MaxBetov-pdd/Minter-rs-v2
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

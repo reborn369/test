@@ -1,0 +1,51 @@
+# Build
+/target
+**/src-tauri/target/
+*.pdb
+*.zip
+*.exe
+
+# Local Python tooling
+venv/
+.venv/
+__pycache__/
+
+# Secrets & local runtime (never commit)
+.env
+.env.*
+!.env.example
+*.vault
+keys.vault
+wallet_meta.json
+tasks.json
+runs_history.json
+config.json
+auth_cache.bin
+auth_cache.json
+privkeys.txt
+proxies.txt
+# Operator key/address dumps. `privkeys.txt` alone did not cover the names the
+# app and the generator actually produce (e.g. wallets_100_private_keys.txt),
+# so a plain `git add .` would have staged real private keys.
+wallets*.txt
+*private_key*
+*privkey*
+*mnemonic*
+*seed_phrase*
+*.key
+*.pem
+results/
+logs/
+debug_*.json
+
+# Public/ is a local runtime / ship folder — never commit binaries or secrets
+Public/**
+
+# local dumps / tooling
+*.png
+!crates/minter-desktop/ui/logo.png
+!crates/minter-desktop/src-tauri/icons/**
+mcps/
+.DS_Store
+Thumbs.db
+dist/

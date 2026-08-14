@@ -1,0 +1,1622 @@
+use alloy_primitives::{Address, Bytes, U256};
+use anyhow::{Context, Result, bail};
+use std::collections::{HashMap, HashSet};
+
+use crate::abi::function_selector;
+use crate::gas;
+use crate::rpc::RpcClient;
+use crate::sign::*;
+use crate::types::*;
+
+use crate::types::Signer;
+
+const ERC721_INTERFACE_ID: [u8; 4] = [0x80, 0xac, 0x58, 0xcd];
+const ERC721_ENUMERABLE_INTERFACE_ID: [u8; 4] = [0x78, 0x0e, 0x9d, 0x63];
+const ERC1155_INTERFACE_ID: [u8; 4] = [0xd9, 0xb6, 0x7a, 0x26];
+/// Cap on tokens enumerated via the Alchemy NFT API, mirroring the on-chain
+/// MAX_ENUMERATE guard, so a broken/looping pageKey can't grow unbounded (audit L12).
+const MAX_ALCHEMY_TOKENS: usize = 10_000;
+
+fn encode_address(addr: &Address) -> Vec<u8> {
+    let mut buf = vec![0u8; 32];
+    buf[12..].copy_from_slice(addr.as_slice());
+    buf
+}
+
+fn encode_u256(val: U256) -> Vec<u8> {
+    val.to_be_bytes::<32>().to_vec()
+}
+
+fn encode_bytes4(interface_id: [u8; 4]) -> Vec<u8> {
+    let mut buf = vec![0u8; 32];
+    buf[..4].copy_from_slice(&interface_id);
+    buf
+}
+
+fn decode_u256(data: &[u8]) -> Result<U256> {
+    if data.len() < 32 {
+        bail!("expected >= 32 bytes, got {}", data.len());
+    }
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(&data[..32]);
+    Ok(U256::from_be_bytes(buf))
+}
+
+fn parse_token_id_str(s: &str) -> Option<U256> {
+    if let Some(hex) = s.strip_prefix("0x") {
+        U256::from_str_radix(hex, 16).ok()
+    } else {
+        U256::from_str_radix(s, 10).ok()
+    }
+}
+
+fn alchemy_nft_domain(chain_id: u64) -> Option<&'static str> {
+    match chain_id {
+        1 => Some("eth-mainnet.g.alchemy.com"),
+        8453 => Some("base-mainnet.g.alchemy.com"),
+        137 => Some("polygon-mainnet.g.alchemy.com"),
+        42161 => Some("arb-mainnet.g.alchemy.com"),
+        10 => Some("opt-mainnet.g.alchemy.com"),
+        4663 => Some("robinhood-mainnet.g.alchemy.com"),
+        _ => None,
+    }
+}
+
+async fn supports_interface(
+    rpc: &RpcClient,
+    contract: &Address,
+    interface_id: [u8; 4],
+) -> Result<bool> {
+    let mut data = function_selector("supportsInterface(bytes4)").to_vec();
+    data.extend(encode_bytes4(interface_id));
+    let result = rpc
+        .eth_call(&Address::ZERO, contract, &Bytes::from(data))
+        .await
+        .context("supportsInterface eth_call failed")?;
+    Ok(result.len() >= 32 && result[31] != 0)
+}
+
+async fn balance_of(rpc: &RpcClient, contract: &Address, owner: &Address) -> Result<U256> {
+    let mut data = function_selector("balanceOf(address)").to_vec();
+    data.extend(encode_address(owner));
+    let result = rpc
+        .eth_call(&Address::ZERO, contract, &Bytes::from(data))
+        .await
+        .context("balanceOf eth_call failed")?;
+    decode_u256(&result)
+}
+
+async fn token_of_owner_by_index(
+    rpc: &RpcClient,
+    contract: &Address,
+    owner: &Address,
+    index: U256,
+) -> Result<U256> {
+    let mut data = function_selector("tokenOfOwnerByIndex(address,uint256)").to_vec();
+    data.extend(encode_address(owner));
+    data.extend(encode_u256(index));
+    let result = rpc
+        .eth_call(&Address::ZERO, contract, &Bytes::from(data))
+        .await
+        .context("tokenOfOwnerByIndex eth_call failed")?;
+    decode_u256(&result)
+}
+
+fn build_safe_transfer_calldata(from: &Address, to: &Address, token_id: U256) -> Bytes {
+    let mut data = function_selector("safeTransferFrom(address,address,uint256)").to_vec();
+    data.extend(encode_address(from));
+    data.extend(encode_address(to));
+    data.extend(encode_u256(token_id));
+    Bytes::from(data)
+}
+
+async fn fetch_token_ids_alchemy(
+    api_key: &str,
+    domain: &str,
+    contract: &Address,
+    owner: &Address,
+) -> Result<Vec<U256>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+
+    let mut all_ids = Vec::new();
+    let mut page_key: Option<String> = None;
+
+    loop {
+        let mut url = format!(
+            "https://{}/nft/v2/{}/getNFTsForOwner?owner={:?}&contractAddresses%5B%5D={:?}&pageSize=100",
+            domain, api_key, owner, contract
+        );
+        if let Some(ref pk) = page_key {
+            url.push_str(&format!("&pageKey={}", pk));
+        }
+
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .context("Alchemy NFT API request failed")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!(
+                "Alchemy NFT API {}: {}",
+                status,
+                crate::safe_truncate(&text, 300)
+            );
+        }
+        let data: serde_json::Value =
+            serde_json::from_str(&text).context("failed to parse Alchemy NFT API response")?;
+
+        if let Some(nfts) = data.get("ownedNfts").and_then(|v| v.as_array()) {
+            for nft in nfts {
+                if let Some(tid) = nft
+                    .get("id")
+                    .and_then(|v| v.get("tokenId"))
+                    .and_then(|v| v.as_str())
+                    .and_then(parse_token_id_str)
+                {
+                    all_ids.push(tid);
+                } else if let Some(tid) = nft
+                    .get("tokenId")
+                    .and_then(|v| v.as_str())
+                    .and_then(parse_token_id_str)
+                {
+                    all_ids.push(tid);
+                }
+            }
+        }
+
+        page_key = data
+            .get("pageKey")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        if all_ids.len() >= MAX_ALCHEMY_TOKENS {
+            crate::rlog!(
+                "Alchemy NFT pagination cap ({}) reached — stopping enumeration (audit L12)",
+                MAX_ALCHEMY_TOKENS
+            );
+            break;
+        }
+        if page_key.is_none() {
+            break;
+        }
+    }
+
+    Ok(all_ids)
+}
+
+pub struct SweepConfig {
+    pub contract: Address,
+    pub destination: Address,
+    pub gas: GasParams,
+    pub dry_run: bool,
+    pub alchemy_api_key: Option<String>,
+}
+
+pub async fn run_sweep(
+    signers: &[Signer],
+    rpc: &RpcClient,
+    config: &SweepConfig,
+) -> Vec<MintResult> {
+    let chain_id = match rpc.chain_id().await {
+        // Chain id 0 is never valid; signing with it produces a tx no network
+        // will accept (and, on a broken node, an unreplayable signature).
+        Ok(0) => {
+            crate::rlog!("RPC returned invalid chain id 0 — refusing to sign");
+            return vec![];
+        }
+        Ok(id) => id,
+        Err(e) => {
+            crate::rlog!("Failed to get chain ID: {}", e);
+            return vec![];
+        }
+    };
+
+    let is_erc721 = match supports_interface(rpc, &config.contract, ERC721_INTERFACE_ID).await {
+        Ok(v) => v,
+        Err(e) => {
+            crate::rlog!(
+                "Warning: supportsInterface(ERC721) call failed ({e}); proceeding on the assumption this IS an ERC721 — verify the contract address (audit L11)"
+            );
+            true
+        }
+    };
+    let has_enumerable = supports_interface(rpc, &config.contract, ERC721_ENUMERABLE_INTERFACE_ID)
+        .await
+        .unwrap_or(false);
+
+    if !is_erc721 {
+        crate::rlog!("Warning: contract may not be ERC721, proceeding anyway");
+    }
+
+    let alchemy_domain = alchemy_nft_domain(chain_id);
+    let can_use_alchemy = config.alchemy_api_key.is_some() && alchemy_domain.is_some();
+
+    if !has_enumerable {
+        if can_use_alchemy {
+            crate::rlog!("No ERC721Enumerable — will use Alchemy NFT API to discover token IDs");
+        } else {
+            crate::rlog!(
+                "Warning: no ERC721Enumerable and no Alchemy API key — cannot auto-discover token IDs"
+            );
+        }
+    }
+
+    let (base_fee, network_priority) = rpc
+        .fee_history()
+        .await
+        .unwrap_or((U256::from(1_000_000_000u64), U256::from(1_000_000_000u64)));
+    let (max_fee, max_priority_fee) =
+        match gas::calculate_fees(&config.gas, base_fee, network_priority) {
+            Ok(f) => f,
+            Err(e) => {
+                crate::rlog!("Gas calculation failed: {}", e);
+                return vec![];
+            }
+        };
+
+    crate::rlog!("\nSweep Summary:");
+    crate::rlog!("  Contract:    {:?}", config.contract);
+    crate::rlog!("  Destination: {:?}", config.destination);
+    crate::rlog!("  Chain ID:    {}", chain_id);
+    crate::rlog!("  Wallets:     {}", signers.len());
+    crate::rlog!(
+        "  Gas:         max={}gwei priority={}gwei",
+        max_fee / U256::from(1_000_000_000u64),
+        max_priority_fee / U256::from(1_000_000_000u64)
+    );
+    if config.dry_run {
+        crate::rlog!("  Mode:        DRY RUN");
+    }
+
+    let mut results: Vec<MintResult> = Vec::new();
+
+    for signer in signers {
+        let addr = signer.address();
+
+        if addr == config.destination {
+            crate::rlog!("\n[{}] skip (is destination)", shorten_address(&addr));
+            continue;
+        }
+
+        crate::rlog!("\n=== Wallet {} ===", shorten_address(&addr));
+
+        let balance = match balance_of(rpc, &config.contract, &addr).await {
+            Ok(b) => b,
+            Err(e) => {
+                crate::rlog!("  balanceOf failed: {}", e);
+                results.push(MintResult {
+                    address: addr,
+                    tx_hash: None,
+                    status: WalletStatus::Failed,
+                    gas_used: None,
+                    block_number: None,
+                    error: Some(format!("balanceOf: {}", e)),
+                });
+                continue;
+            }
+        };
+
+        if balance == U256::ZERO {
+            crate::rlog!("  No NFTs owned");
+            continue;
+        }
+
+        // Saturating conversion: a broken/malicious contract can return a huge
+        // balanceOf which would panic `to::<u128>()`. Cap enumeration too.
+        const MAX_ENUMERATE: u64 = 10_000;
+        let count = u64::try_from(balance)
+            .unwrap_or(u64::MAX)
+            .min(MAX_ENUMERATE);
+        crate::rlog!("  Owns {} NFT(s)", count);
+
+        let mut token_ids: Vec<U256> = Vec::new();
+
+        if has_enumerable {
+            for i in 0..count {
+                match token_of_owner_by_index(rpc, &config.contract, &addr, U256::from(i)).await {
+                    Ok(token_id) => {
+                        token_ids.push(token_id);
+                    }
+                    Err(e) => {
+                        crate::rlog!("  tokenOfOwnerByIndex({}) failed: {}", i, e);
+                    }
+                }
+            }
+        } else if can_use_alchemy {
+            let api_key = config.alchemy_api_key.as_ref().unwrap();
+            let domain = alchemy_domain.unwrap();
+            crate::rlog!("  Fetching token IDs via Alchemy NFT API...");
+            match fetch_token_ids_alchemy(api_key, domain, &config.contract, &addr).await {
+                Ok(ids) => {
+                    for id in &ids {
+                        token_ids.push(*id);
+                    }
+                    crate::rlog!("  Alchemy returned {} token(s)", token_ids.len());
+                }
+                Err(e) => {
+                    crate::rlog!("  Alchemy NFT API failed: {}", e);
+                    results.push(MintResult {
+                        address: addr,
+                        tx_hash: None,
+                        status: WalletStatus::Failed,
+                        gas_used: None,
+                        block_number: None,
+                        error: Some(format!("alchemy: {}", e)),
+                    });
+                    continue;
+                }
+            }
+        } else {
+            crate::rlog!("  Cannot enumerate: no ERC721Enumerable and no Alchemy API key");
+            continue;
+        }
+
+        if token_ids.is_empty() {
+            crate::rlog!("  No token IDs discovered");
+            continue;
+        }
+
+        crate::rlog!(
+            "  Transferring {} NFT(s) to {:?}",
+            token_ids.len(),
+            config.destination
+        );
+        for (i, tid) in token_ids.iter().enumerate() {
+            crate::rlog!("    [{}/{}] tokenId={}", i + 1, token_ids.len(), tid);
+        }
+
+        let mut nonce = match rpc.nonce(&addr).await {
+            Ok(n) => n,
+            Err(e) => {
+                crate::rlog!("  nonce failed: {}", e);
+                results.push(MintResult {
+                    address: addr,
+                    tx_hash: None,
+                    status: WalletStatus::Failed,
+                    gas_used: None,
+                    block_number: None,
+                    error: Some(format!("nonce: {}", e)),
+                });
+                continue;
+            }
+        };
+
+        let gas_multiplier = config.gas.gas_multiplier;
+
+        for (i, token_id) in token_ids.iter().enumerate() {
+            let calldata = build_safe_transfer_calldata(&addr, &config.destination, *token_id);
+
+            let gas_limit = match rpc
+                .estimate_gas(&addr, &config.contract, U256::ZERO, &calldata)
+                .await
+            {
+                Ok(g) => {
+                    crate::rlog!(
+                        "  [{}/{}] tokenId={} estimateGas={}",
+                        i + 1,
+                        token_ids.len(),
+                        token_id,
+                        g
+                    );
+                    gas::apply_gas_limit(g, gas_multiplier, chain_id, 21_000)
+                }
+                Err(e) => {
+                    crate::rlog!(
+                        "  [{}/{}] tokenId={} estimateGas FAILED: {}",
+                        i + 1,
+                        token_ids.len(),
+                        token_id,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            if config.dry_run {
+                crate::rlog!(
+                    "  [{}/{}] tokenId={} DRY RUN OK",
+                    i + 1,
+                    token_ids.len(),
+                    token_id
+                );
+                results.push(MintResult {
+                    address: addr,
+                    tx_hash: None,
+                    status: WalletStatus::DryRunOk,
+                    gas_used: Some(gas_limit),
+                    block_number: None,
+                    error: None,
+                });
+                continue;
+            }
+
+            let tx = BuiltTx {
+                chain_id,
+                nonce,
+                to: config.contract,
+                value: U256::ZERO,
+                data: calldata,
+                gas_limit,
+                max_fee,
+                max_priority_fee,
+            };
+
+            let (raw, _signed_hash) = match sign_transaction(signer, &tx) {
+                Ok((r, h)) => (r, h),
+                Err(e) => {
+                    crate::rlog!(
+                        "  [{}/{}] tokenId={} sign FAILED: {}",
+                        i + 1,
+                        token_ids.len(),
+                        token_id,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let tx_hash = match rpc.race_send(&raw).await {
+                Ok(h) => {
+                    crate::rlog!(
+                        "  [{}/{}] tokenId={} sent tx={}",
+                        i + 1,
+                        token_ids.len(),
+                        token_id,
+                        shorten_hash(&h)
+                    );
+                    h
+                }
+                Err(e) => {
+                    crate::rlog!(
+                        "  [{}/{}] tokenId={} send FAILED: {}",
+                        i + 1,
+                        token_ids.len(),
+                        token_id,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            match rpc.wait_for_receipt(&tx_hash, 120).await {
+                Ok(receipt) => {
+                    nonce += 1;
+                    let info = crate::rpc::parse_receipt(&receipt);
+                    if info.success {
+                        crate::rlog!(
+                            "  [{}/{}] tokenId={} CONFIRMED block={} gas={}",
+                            i + 1,
+                            token_ids.len(),
+                            token_id,
+                            info.block_number,
+                            info.gas_used
+                        );
+                        results.push(MintResult {
+                            address: addr,
+                            tx_hash: Some(tx_hash),
+                            status: WalletStatus::Confirmed,
+                            gas_used: Some(info.gas_used),
+                            block_number: Some(info.block_number),
+                            error: None,
+                        });
+                    } else {
+                        crate::rlog!(
+                            "  [{}/{}] tokenId={} REVERTED block={}",
+                            i + 1,
+                            token_ids.len(),
+                            token_id,
+                            info.block_number
+                        );
+                        results.push(MintResult {
+                            address: addr,
+                            tx_hash: Some(tx_hash),
+                            status: WalletStatus::Failed,
+                            gas_used: Some(info.gas_used),
+                            block_number: Some(info.block_number),
+                            error: Some("reverted".to_string()),
+                        });
+                    }
+                }
+                Err(e) => {
+                    crate::rlog!(
+                        "  [{}/{}] tokenId={} receipt timeout: {}",
+                        i + 1,
+                        token_ids.len(),
+                        token_id,
+                        e
+                    );
+                    match rpc.nonce(&addr).await {
+                        Ok(n) => {
+                            crate::rlog!("  nonce re-fetched: {} (was {})", n, nonce);
+                            nonce = n;
+                        }
+                        Err(ne) => {
+                            crate::rlog!(
+                                "  WARN: nonce re-fetch failed: {}, using {}+1",
+                                ne,
+                                nonce
+                            );
+                            nonce += 1;
+                        }
+                    }
+                    results.push(MintResult {
+                        address: addr,
+                        tx_hash: Some(tx_hash),
+                        status: WalletStatus::Sent,
+                        gas_used: None,
+                        block_number: None,
+                        error: Some(format!("receipt: {}", e)),
+                    });
+                }
+            }
+        }
+    }
+
+    results
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum NftKind {
+    Erc721,
+    Erc1155,
+}
+
+impl NftKind {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_uppercase().replace('-', "").as_str() {
+            "ERC721" => Some(Self::Erc721),
+            "ERC1155" => Some(Self::Erc1155),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Erc721 => "ERC-721",
+            Self::Erc1155 => "ERC-1155",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NftAsset {
+    contract: Address,
+    token_id: U256,
+    kind: NftKind,
+    amount: U256,
+}
+
+/// NFT-aware result used by the desktop table. A result identifies one exact
+/// asset instead of collapsing every transfer from a wallet into one row.
+#[derive(Debug, Clone)]
+pub struct NftSweepResult {
+    pub result: MintResult,
+    pub contract: Option<Address>,
+    pub token_id: Option<U256>,
+    pub token_type: Option<String>,
+    pub amount: Option<U256>,
+}
+
+pub struct AutoNftSweepConfig {
+    /// Optional contract filter. None discovers all supported NFTs.
+    pub contract: Option<Address>,
+    pub destination: Address,
+    pub gas: GasParams,
+    pub dry_run: bool,
+    pub alchemy_api_key: Option<String>,
+}
+
+fn nft_sweep_result(
+    address: Address,
+    asset: Option<&NftAsset>,
+    status: WalletStatus,
+    tx_hash: Option<alloy_primitives::B256>,
+    gas_used: Option<u64>,
+    block_number: Option<u64>,
+    error: Option<String>,
+) -> NftSweepResult {
+    NftSweepResult {
+        result: MintResult {
+            address,
+            tx_hash,
+            status,
+            gas_used,
+            block_number,
+            error,
+        },
+        contract: asset.map(|n| n.contract),
+        token_id: asset.map(|n| n.token_id),
+        token_type: asset.map(|n| n.kind.label().to_string()),
+        amount: asset.map(|n| n.amount),
+    }
+}
+
+fn parse_asset_amount(value: Option<&serde_json::Value>) -> U256 {
+    value
+        .and_then(|v| {
+            v.as_str()
+                .and_then(parse_token_id_str)
+                .or_else(|| v.as_u64().map(U256::from))
+        })
+        .unwrap_or(U256::from(1u64))
+}
+
+fn blockscout_nft_base(chain_id: u64) -> Option<&'static str> {
+    match chain_id {
+        4663 => Some("https://robinhoodchain.blockscout.com"),
+        _ => None,
+    }
+}
+
+async fn fetch_assets_alchemy_v3(
+    api_key: &str,
+    domain: &str,
+    owner: Address,
+    contract_filter: Option<Address>,
+) -> Result<Vec<NftAsset>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let endpoint = format!("https://{domain}/nft/v3/{api_key}/getNFTsForOwner");
+    let mut page_key: Option<String> = None;
+    let mut assets = Vec::new();
+    let mut seen = HashSet::new();
+    let mut seen_page_keys = HashSet::new();
+
+    loop {
+        let mut request = client.get(&endpoint).query(&[
+            ("owner", format!("{owner:?}")),
+            ("withMetadata", "true".to_string()),
+            ("pageSize", "100".to_string()),
+        ]);
+        if let Some(contract) = contract_filter {
+            request = request.query(&[("contractAddresses[]", format!("{contract:?}"))]);
+        }
+        if let Some(ref key) = page_key {
+            request = request.query(&[("pageKey", key.as_str())]);
+        }
+        let response = request.send().await.map_err(|error| {
+            anyhow::anyhow!("Alchemy NFT API request failed: {}", error.without_url())
+        })?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!(
+                "Alchemy NFT API {}: {}",
+                status,
+                crate::safe_truncate(&body, 300)
+            );
+        }
+        let data: serde_json::Value =
+            serde_json::from_str(&body).context("invalid Alchemy NFT API response")?;
+        for nft in data
+            .get("ownedNfts")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let token_id = nft
+                .get("tokenId")
+                .and_then(|v| v.as_str())
+                .and_then(parse_token_id_str)
+                .or_else(|| {
+                    nft.get("id")
+                        .and_then(|v| v.get("tokenId"))
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_token_id_str)
+                });
+            let contract = nft
+                .get("contract")
+                .and_then(|v| v.get("address"))
+                .and_then(|v| v.as_str())
+                .and_then(|v| v.parse::<Address>().ok());
+            let kind = nft
+                .get("tokenType")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    nft.get("contract")
+                        .and_then(|v| v.get("tokenType"))
+                        .and_then(|v| v.as_str())
+                })
+                .and_then(NftKind::parse);
+            let Some(((token_id, contract), kind)) = token_id.zip(contract).zip(kind) else {
+                continue;
+            };
+            if contract_filter.is_some_and(|filter| filter != contract)
+                || !seen.insert((contract, token_id, kind))
+            {
+                continue;
+            }
+            let amount = if kind == NftKind::Erc721 {
+                U256::from(1u64)
+            } else {
+                parse_asset_amount(nft.get("balance"))
+            };
+            if !amount.is_zero() {
+                assets.push(NftAsset {
+                    contract,
+                    token_id,
+                    kind,
+                    amount,
+                });
+            }
+        }
+        if assets.len() >= MAX_ALCHEMY_TOKENS {
+            assets.truncate(MAX_ALCHEMY_TOKENS);
+            break;
+        }
+        page_key = data
+            .get("pageKey")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if page_key
+            .as_ref()
+            .is_none_or(|key| !seen_page_keys.insert(key.clone()))
+        {
+            break;
+        }
+    }
+    Ok(assets)
+}
+
+async fn fetch_assets_blockscout(
+    base_url: &str,
+    owner: Address,
+    contract_filter: Option<Address>,
+) -> Result<Vec<NftAsset>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let endpoint = format!("{base_url}/api/v2/addresses/{owner:?}/nft");
+    let mut next_params: Vec<(String, String)> = Vec::new();
+    let mut assets = Vec::new();
+    let mut seen = HashSet::new();
+    let mut seen_pages = HashSet::new();
+
+    loop {
+        let response = client
+            .get(&endpoint)
+            .query(&next_params)
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("Blockscout NFT request failed: {}", error.without_url())
+            })?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!(
+                "Blockscout NFT API {}: {}",
+                status,
+                crate::safe_truncate(&body, 300)
+            );
+        }
+        let data: serde_json::Value =
+            serde_json::from_str(&body).context("invalid Blockscout NFT response")?;
+        for nft in data
+            .get("items")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let token_id = nft
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(parse_token_id_str);
+            let contract = nft
+                .get("token")
+                .and_then(|v| v.get("address_hash"))
+                .and_then(|v| v.as_str())
+                .and_then(|v| v.parse::<Address>().ok());
+            let kind = nft
+                .get("token_type")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    nft.get("token")
+                        .and_then(|v| v.get("type"))
+                        .and_then(|v| v.as_str())
+                })
+                .and_then(NftKind::parse);
+            let Some(((token_id, contract), kind)) = token_id.zip(contract).zip(kind) else {
+                continue;
+            };
+            if contract_filter.is_some_and(|filter| filter != contract)
+                || !seen.insert((contract, token_id, kind))
+            {
+                continue;
+            }
+            let amount = if kind == NftKind::Erc721 {
+                U256::from(1u64)
+            } else {
+                parse_asset_amount(nft.get("value"))
+            };
+            if !amount.is_zero() {
+                assets.push(NftAsset {
+                    contract,
+                    token_id,
+                    kind,
+                    amount,
+                });
+            }
+        }
+        if assets.len() >= MAX_ALCHEMY_TOKENS {
+            assets.truncate(MAX_ALCHEMY_TOKENS);
+            break;
+        }
+        let Some(next) = data.get("next_page_params").and_then(|v| v.as_object()) else {
+            break;
+        };
+        next_params = next
+            .iter()
+            .filter_map(|(key, value)| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| value.as_u64().map(|n| n.to_string()))
+                    .map(|value| (key.clone(), value))
+            })
+            .collect();
+        if next_params.is_empty() {
+            break;
+        }
+        let page_fingerprint = format!("{next_params:?}");
+        if !seen_pages.insert(page_fingerprint) {
+            break;
+        }
+    }
+    Ok(assets)
+}
+
+async fn discover_enumerable_contract(
+    rpc: &RpcClient,
+    owner: Address,
+    contract: Address,
+) -> Result<Vec<NftAsset>> {
+    if !supports_interface(rpc, &contract, ERC721_INTERFACE_ID)
+        .await
+        .unwrap_or(false)
+    {
+        if supports_interface(rpc, &contract, ERC1155_INTERFACE_ID)
+            .await
+            .unwrap_or(false)
+        {
+            bail!("ERC-1155 cannot enumerate token IDs on-chain; use NFT discovery API");
+        }
+        bail!("contract does not report ERC-721/ERC-1155 support");
+    }
+    if !supports_interface(rpc, &contract, ERC721_ENUMERABLE_INTERFACE_ID)
+        .await
+        .unwrap_or(false)
+    {
+        bail!("ERC-721 is not Enumerable; use Alchemy/Blockscout discovery");
+    }
+    let count = u64::try_from(balance_of(rpc, &contract, &owner).await?)
+        .unwrap_or(u64::MAX)
+        .min(MAX_ALCHEMY_TOKENS as u64);
+    let mut assets = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        assets.push(NftAsset {
+            contract,
+            token_id: token_of_owner_by_index(rpc, &contract, &owner, U256::from(index)).await?,
+            kind: NftKind::Erc721,
+            amount: U256::from(1u64),
+        });
+    }
+    Ok(assets)
+}
+
+async fn discover_wallet_assets(
+    rpc: &RpcClient,
+    chain_id: u64,
+    owner: Address,
+    contract_filter: Option<Address>,
+    alchemy_api_key: Option<&str>,
+) -> Result<Vec<NftAsset>> {
+    let mut errors = Vec::new();
+    let mut source_succeeded = false;
+    if let (Some(api_key), Some(domain)) = (alchemy_api_key, alchemy_nft_domain(chain_id)) {
+        match fetch_assets_alchemy_v3(api_key, domain, owner, contract_filter).await {
+            Ok(assets) if !assets.is_empty() => return Ok(assets),
+            Ok(_) => source_succeeded = true,
+            Err(error) => errors.push(format!("Alchemy: {error}")),
+        }
+    }
+    if let Some(base_url) = blockscout_nft_base(chain_id) {
+        match fetch_assets_blockscout(base_url, owner, contract_filter).await {
+            Ok(assets) => return Ok(assets),
+            Err(error) => errors.push(format!("Blockscout: {error}")),
+        }
+    }
+    if let Some(contract) = contract_filter {
+        match discover_enumerable_contract(rpc, owner, contract).await {
+            Ok(assets) => return Ok(assets),
+            Err(error) => errors.push(format!("on-chain: {error}")),
+        }
+    }
+    if source_succeeded {
+        return Ok(Vec::new());
+    }
+    if errors.is_empty() {
+        bail!(
+            "automatic NFT discovery unavailable for this network; configure Alchemy or enter an Enumerable ERC-721 contract"
+        );
+    }
+    bail!("NFT discovery failed: {}", errors.join(" | "))
+}
+
+async fn nft_owner_of(rpc: &RpcClient, contract: Address, token_id: U256) -> Result<Address> {
+    let mut data = function_selector("ownerOf(uint256)").to_vec();
+    data.extend(encode_u256(token_id));
+    let result = rpc
+        .eth_call(&Address::ZERO, &contract, &Bytes::from(data))
+        .await
+        .context("ownerOf eth_call failed")?;
+    if result.len() < 32 {
+        bail!("ownerOf returned {} bytes", result.len());
+    }
+    Ok(Address::from_slice(&result[12..32]))
+}
+
+async fn nft_erc1155_balance(
+    rpc: &RpcClient,
+    contract: Address,
+    owner: Address,
+    token_id: U256,
+) -> Result<U256> {
+    let mut data = function_selector("balanceOf(address,uint256)").to_vec();
+    data.extend(encode_address(&owner));
+    data.extend(encode_u256(token_id));
+    let result = rpc
+        .eth_call(&Address::ZERO, &contract, &Bytes::from(data))
+        .await
+        .context("ERC-1155 balanceOf eth_call failed")?;
+    decode_u256(&result)
+}
+
+fn build_erc1155_transfer_calldata(
+    from: Address,
+    to: Address,
+    token_id: U256,
+    amount: U256,
+) -> Bytes {
+    let mut data =
+        function_selector("safeTransferFrom(address,address,uint256,uint256,bytes)").to_vec();
+    data.extend(encode_address(&from));
+    data.extend(encode_address(&to));
+    data.extend(encode_u256(token_id));
+    data.extend(encode_u256(amount));
+    data.extend(encode_u256(U256::from(160u64)));
+    data.extend(encode_u256(U256::ZERO));
+    Bytes::from(data)
+}
+
+/// Discover and sweep ERC-721/ERC-1155 assets from exactly the supplied Vault
+/// signers. Every asset is re-checked through RPC immediately before signing.
+pub async fn run_auto_nft_sweep(
+    signers: &[Signer],
+    rpc: &RpcClient,
+    config: &AutoNftSweepConfig,
+) -> Vec<NftSweepResult> {
+    let chain_id = match rpc.chain_id().await {
+        Ok(id) if id != 0 => id,
+        Ok(_) => {
+            crate::rlog!("RPC returned invalid chain id 0 - refusing to sign");
+            return vec![];
+        }
+        Err(error) => {
+            crate::rlog!("Failed to get chain ID: {error}");
+            return vec![];
+        }
+    };
+    let (base_fee, network_priority) = rpc
+        .fee_history()
+        .await
+        .unwrap_or((U256::from(1_000_000_000u64), U256::from(1_000_000_000u64)));
+    let (max_fee, max_priority_fee) =
+        match gas::calculate_fees(&config.gas, base_fee, network_priority) {
+            Ok(fees) => fees,
+            Err(error) => {
+                crate::rlog!("Gas calculation failed: {error}");
+                return vec![];
+            }
+        };
+
+    crate::rlog!("\nNFT Sweep Summary:");
+    crate::rlog!(
+        "  Contract:    {}",
+        config
+            .contract
+            .map(|c| format!("{c:?}"))
+            .unwrap_or_else(|| "AUTO (all owned NFTs)".to_string())
+    );
+    crate::rlog!("  Destination: {:?}", config.destination);
+    crate::rlog!("  Chain ID:    {chain_id}");
+    crate::rlog!("  Wallets:     {}", signers.len());
+    if config.dry_run {
+        crate::rlog!("  Mode:        DRY RUN");
+    }
+
+    let mut results = Vec::new();
+    let mut kind_cache: HashMap<Address, NftKind> = HashMap::new();
+    for signer in signers {
+        let address = signer.address();
+        if address == config.destination {
+            crate::rlog!("[{}] skip: destination wallet", shorten_address(&address));
+            continue;
+        }
+        crate::rlog!("\n=== Wallet {} ===", shorten_address(&address));
+        let mut assets = match discover_wallet_assets(
+            rpc,
+            chain_id,
+            address,
+            config.contract,
+            config.alchemy_api_key.as_deref(),
+        )
+        .await
+        {
+            Ok(assets) => assets,
+            Err(error) => {
+                crate::rlog!("  Discovery failed: {error}");
+                results.push(nft_sweep_result(
+                    address,
+                    None,
+                    WalletStatus::Failed,
+                    None,
+                    None,
+                    None,
+                    Some(error.to_string()),
+                ));
+                continue;
+            }
+        };
+        if assets.is_empty() {
+            crate::rlog!("  No supported NFTs found");
+            continue;
+        }
+        assets.sort_by(|a, b| {
+            a.contract
+                .as_slice()
+                .cmp(b.contract.as_slice())
+                .then_with(|| a.token_id.cmp(&b.token_id))
+        });
+        crate::rlog!("  Discovered {} NFT asset(s)", assets.len());
+        let mut nonce = if config.dry_run {
+            0
+        } else {
+            match rpc.nonce(&address).await {
+                Ok(nonce) => nonce,
+                Err(error) => {
+                    results.push(nft_sweep_result(
+                        address,
+                        None,
+                        WalletStatus::Failed,
+                        None,
+                        None,
+                        None,
+                        Some(format!("nonce: {error}")),
+                    ));
+                    continue;
+                }
+            }
+        };
+
+        let asset_count = assets.len();
+        for (index, asset) in assets.iter_mut().enumerate() {
+            let kind = if let Some(kind) = kind_cache.get(&asset.contract).copied() {
+                kind
+            } else if supports_interface(rpc, &asset.contract, ERC721_INTERFACE_ID)
+                .await
+                .unwrap_or(false)
+            {
+                kind_cache.insert(asset.contract, NftKind::Erc721);
+                NftKind::Erc721
+            } else if supports_interface(rpc, &asset.contract, ERC1155_INTERFACE_ID)
+                .await
+                .unwrap_or(false)
+            {
+                kind_cache.insert(asset.contract, NftKind::Erc1155);
+                NftKind::Erc1155
+            } else {
+                asset.kind
+            };
+            asset.kind = kind;
+            let calldata = match kind {
+                NftKind::Erc721 => match nft_owner_of(rpc, asset.contract, asset.token_id).await {
+                    Ok(owner) if owner == address => {
+                        build_safe_transfer_calldata(&address, &config.destination, asset.token_id)
+                    }
+                    Ok(owner) => {
+                        results.push(nft_sweep_result(
+                            address,
+                            Some(asset),
+                            WalletStatus::Failed,
+                            None,
+                            None,
+                            None,
+                            Some(format!("owner changed before sweep: now {owner:?}")),
+                        ));
+                        continue;
+                    }
+                    Err(error) => {
+                        results.push(nft_sweep_result(
+                            address,
+                            Some(asset),
+                            WalletStatus::Failed,
+                            None,
+                            None,
+                            None,
+                            Some(format!("ownerOf: {error}")),
+                        ));
+                        continue;
+                    }
+                },
+                NftKind::Erc1155 => {
+                    match nft_erc1155_balance(rpc, asset.contract, address, asset.token_id).await {
+                        Ok(amount) if !amount.is_zero() => {
+                            asset.amount = amount;
+                            build_erc1155_transfer_calldata(
+                                address,
+                                config.destination,
+                                asset.token_id,
+                                amount,
+                            )
+                        }
+                        Ok(_) => {
+                            results.push(nft_sweep_result(
+                                address,
+                                Some(asset),
+                                WalletStatus::Failed,
+                                None,
+                                None,
+                                None,
+                                Some("ERC-1155 balance is now zero".to_string()),
+                            ));
+                            continue;
+                        }
+                        Err(error) => {
+                            results.push(nft_sweep_result(
+                                address,
+                                Some(asset),
+                                WalletStatus::Failed,
+                                None,
+                                None,
+                                None,
+                                Some(format!("ERC-1155 balanceOf: {error}")),
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            };
+            let gas_limit = match rpc
+                .estimate_gas(&address, &asset.contract, U256::ZERO, &calldata)
+                .await
+            {
+                Ok(estimated) => {
+                    gas::apply_gas_limit(estimated, config.gas.gas_multiplier, chain_id, 21_000)
+                }
+                Err(error) => {
+                    results.push(nft_sweep_result(
+                        address,
+                        Some(asset),
+                        WalletStatus::Failed,
+                        None,
+                        None,
+                        None,
+                        Some(format!("estimateGas: {error}")),
+                    ));
+                    continue;
+                }
+            };
+            crate::rlog!(
+                "  [{}/{}] {:?} #{} {} amount={} gas={}",
+                index + 1,
+                asset_count,
+                asset.contract,
+                asset.token_id,
+                asset.kind.label(),
+                asset.amount,
+                gas_limit
+            );
+            if config.dry_run {
+                results.push(nft_sweep_result(
+                    address,
+                    Some(asset),
+                    WalletStatus::DryRunOk,
+                    None,
+                    Some(gas_limit),
+                    None,
+                    None,
+                ));
+                continue;
+            }
+            let tx = BuiltTx {
+                chain_id,
+                nonce,
+                to: asset.contract,
+                value: U256::ZERO,
+                data: calldata,
+                gas_limit,
+                max_fee,
+                max_priority_fee,
+            };
+            let (raw, signed_hash) = match sign_transaction(signer, &tx) {
+                Ok(signed) => signed,
+                Err(error) => {
+                    results.push(nft_sweep_result(
+                        address,
+                        Some(asset),
+                        WalletStatus::Failed,
+                        None,
+                        None,
+                        None,
+                        Some(format!("sign: {error}")),
+                    ));
+                    continue;
+                }
+            };
+            let tx_hash = match rpc.race_send(&raw).await {
+                Ok(hash) => hash,
+                Err(error) if crate::errors::is_already_known(&error.to_string()) => signed_hash,
+                Err(error) => {
+                    results.push(nft_sweep_result(
+                        address,
+                        Some(asset),
+                        WalletStatus::Failed,
+                        None,
+                        None,
+                        None,
+                        Some(format!("send: {error}")),
+                    ));
+                    continue;
+                }
+            };
+            match rpc.wait_for_receipt(&tx_hash, 120).await {
+                Ok(receipt) => {
+                    // A mined transaction consumes the nonce even when it reverts.
+                    nonce += 1;
+                    let info = crate::rpc::parse_receipt(&receipt);
+                    results.push(nft_sweep_result(
+                        address,
+                        Some(asset),
+                        if info.success {
+                            WalletStatus::Confirmed
+                        } else {
+                            WalletStatus::Failed
+                        },
+                        Some(tx_hash),
+                        Some(info.gas_used),
+                        Some(info.block_number),
+                        (!info.success).then(|| "reverted".to_string()),
+                    ));
+                }
+                Err(error) => {
+                    nonce = rpc.nonce(&address).await.unwrap_or(nonce.saturating_add(1));
+                    results.push(nft_sweep_result(
+                        address,
+                        Some(asset),
+                        WalletStatus::Sent,
+                        Some(tx_hash),
+                        None,
+                        None,
+                        Some(format!("receipt: {error}")),
+                    ));
+                }
+            }
+        }
+    }
+    results
+}
+
+pub struct SweepEthConfig {
+    pub destination: Address,
+    pub gas: GasParams,
+    pub dry_run: bool,
+}
+
+/// Format wei as ETH (`"1.500000"`), not the broken `"1.0.123456"` style.
+pub fn fmt_eth(wei: U256) -> String {
+    let scale = U256::from(1_000_000_000_000_000_000u64); // 1e18
+    let whole = wei / scale;
+    let frac = (wei % scale).to::<u128>();
+    // First 6 decimal places of ETH: frac_wei / 10^12
+    let micros = frac / 1_000_000_000_000u128;
+    format!("{}.{:06}", whole, micros)
+}
+
+pub async fn run_sweep_eth(
+    signers: &[Signer],
+    rpc: &RpcClient,
+    config: &SweepEthConfig,
+) -> Vec<MintResult> {
+    if signers.is_empty() {
+        crate::rlog!("Sweep ETH: no wallets selected");
+        return vec![];
+    }
+    let chain_id = match rpc.chain_id().await {
+        // Chain id 0 is never valid; signing with it produces a tx no network
+        // will accept (and, on a broken node, an unreplayable signature).
+        Ok(0) => {
+            crate::rlog!("RPC returned invalid chain id 0 — refusing to sign");
+            return vec![];
+        }
+        Ok(id) => id,
+        Err(e) => {
+            crate::rlog!("Failed to get chain ID: {}", e);
+            return vec![];
+        }
+    };
+
+    let (base_fee, network_priority) = rpc
+        .fee_history()
+        .await
+        .unwrap_or((U256::from(1_000_000_000u64), U256::from(1_000_000_000u64)));
+    let (max_fee, max_priority_fee) =
+        match gas::calculate_fees(&config.gas, base_fee, network_priority) {
+            Ok(f) => f,
+            Err(e) => {
+                crate::rlog!("Gas calculation failed: {}", e);
+                return vec![];
+            }
+        };
+
+    // Unified L2-safe transfer gas (estimate + floor). Sample first non-dest wallet.
+    let sample_from = signers
+        .iter()
+        .map(|s| s.address())
+        .find(|a| *a != config.destination)
+        .unwrap_or(signers[0].address());
+    let gas_limit = crate::gas::resolve_native_transfer_gas(
+        rpc,
+        &sample_from,
+        &config.destination,
+        U256::ZERO, // estimate transfer shape; amount varies per wallet
+        chain_id,
+        config.gas.gas_multiplier,
+    )
+    .await;
+    // OP-stack chains bill an L1 data fee on top of L2 gas, and the node's
+    // balance check includes it. Reserving only `gas_limit * max_fee` and
+    // sending the exact remainder makes every sweep on Base/Optimism/etc. fail
+    // with "insufficient funds" — by precisely the L1 fee.
+    let l1_data_fee = crate::gas::estimate_l1_data_fee(rpc, chain_id).await;
+    let gas_cost = max_fee * U256::from(gas_limit) + l1_data_fee;
+
+    crate::rlog!("\nETH Sweep Summary:");
+    if !l1_data_fee.is_zero() {
+        crate::rlog!("  L1 data fee reserve: {} ETH", fmt_eth(l1_data_fee));
+    }
+    crate::rlog!("  Destination: {:?}", config.destination);
+    crate::rlog!("  Chain ID:    {}", chain_id);
+    crate::rlog!("  Wallets:     {}", signers.len());
+    crate::rlog!(
+        "  Gas:         max={}gwei priority={}gwei ({} gas for simple transfer)",
+        max_fee / U256::from(1_000_000_000u64),
+        max_priority_fee / U256::from(1_000_000_000u64),
+        gas_limit
+    );
+    if config.dry_run {
+        crate::rlog!("  Mode:        DRY RUN");
+    }
+
+    let mut results: Vec<MintResult> = Vec::new();
+
+    for signer in signers {
+        let addr = signer.address();
+
+        if addr == config.destination {
+            crate::rlog!("\n[{}] skip (is destination)", shorten_address(&addr));
+            continue;
+        }
+
+        crate::rlog!("\n=== Wallet {} ===", shorten_address(&addr));
+
+        let balance = match rpc.balance(&addr).await {
+            Ok(b) => b,
+            Err(e) => {
+                crate::rlog!("  balance failed: {}", e);
+                results.push(MintResult {
+                    address: addr,
+                    tx_hash: None,
+                    status: WalletStatus::Failed,
+                    gas_used: None,
+                    block_number: None,
+                    error: Some(format!("balance: {}", e)),
+                });
+                continue;
+            }
+        };
+
+        crate::rlog!("  Balance: {} ETH", fmt_eth(balance));
+
+        if balance <= gas_cost {
+            crate::rlog!(
+                "  Skipping: balance {} <= gas cost {} ETH",
+                fmt_eth(balance),
+                fmt_eth(gas_cost)
+            );
+            continue;
+        }
+
+        let transfer_amount = balance - gas_cost;
+        crate::rlog!(
+            "  Transfer: {} ETH (minus gas {} ETH)",
+            fmt_eth(transfer_amount),
+            fmt_eth(gas_cost)
+        );
+
+        if config.dry_run {
+            crate::rlog!("  DRY RUN OK");
+            results.push(MintResult {
+                address: addr,
+                tx_hash: None,
+                status: WalletStatus::DryRunOk,
+                gas_used: Some(gas_limit),
+                block_number: None,
+                error: None,
+            });
+            continue;
+        }
+
+        let nonce = match rpc.nonce(&addr).await {
+            Ok(n) => n,
+            Err(e) => {
+                crate::rlog!("  nonce failed: {}", e);
+                results.push(MintResult {
+                    address: addr,
+                    tx_hash: None,
+                    status: WalletStatus::Failed,
+                    gas_used: None,
+                    block_number: None,
+                    error: Some(format!("nonce: {}", e)),
+                });
+                continue;
+            }
+        };
+
+        let tx = BuiltTx {
+            chain_id,
+            nonce,
+            to: config.destination,
+            value: transfer_amount,
+            data: Bytes::new(),
+            gas_limit,
+            max_fee,
+            max_priority_fee,
+        };
+
+        let (raw, _signed_hash) = match sign_transaction(signer, &tx) {
+            Ok((r, h)) => {
+                crate::rlog!("  sign OK ({} bytes)", r.len());
+                (r, h)
+            }
+            Err(e) => {
+                crate::rlog!("  sign FAILED: {}", e);
+                results.push(MintResult {
+                    address: addr,
+                    tx_hash: None,
+                    status: WalletStatus::Failed,
+                    gas_used: None,
+                    block_number: None,
+                    error: Some(format!("sign: {}", e)),
+                });
+                continue;
+            }
+        };
+
+        let tx_hash = match rpc.race_send(&raw).await {
+            Ok(h) => {
+                crate::rlog!("  sent tx={}", shorten_hash(&h));
+                h
+            }
+            Err(e) => {
+                crate::rlog!("  send FAILED: {}", e);
+                results.push(MintResult {
+                    address: addr,
+                    tx_hash: None,
+                    status: WalletStatus::Failed,
+                    gas_used: None,
+                    block_number: None,
+                    error: Some(format!("send: {}", e)),
+                });
+                continue;
+            }
+        };
+
+        match rpc.wait_for_receipt(&tx_hash, 120).await {
+            Ok(receipt) => {
+                let info = crate::rpc::parse_receipt(&receipt);
+                if info.success {
+                    crate::rlog!(
+                        "  CONFIRMED block={} gas={} (sent {} ETH)",
+                        info.block_number,
+                        info.gas_used,
+                        fmt_eth(transfer_amount)
+                    );
+                    results.push(MintResult {
+                        address: addr,
+                        tx_hash: Some(tx_hash),
+                        status: WalletStatus::Confirmed,
+                        gas_used: Some(info.gas_used),
+                        block_number: Some(info.block_number),
+                        error: None,
+                    });
+                } else {
+                    crate::rlog!("  REVERTED block={}", info.block_number);
+                    results.push(MintResult {
+                        address: addr,
+                        tx_hash: Some(tx_hash),
+                        status: WalletStatus::Failed,
+                        gas_used: Some(info.gas_used),
+                        block_number: Some(info.block_number),
+                        error: Some("reverted".to_string()),
+                    });
+                }
+            }
+            Err(e) => {
+                crate::rlog!("  receipt timeout: {}", e);
+                results.push(MintResult {
+                    address: addr,
+                    tx_hash: Some(tx_hash),
+                    status: WalletStatus::Sent,
+                    gas_used: None,
+                    block_number: None,
+                    error: Some(format!("receipt: {}", e)),
+                });
+            }
+        }
+    }
+
+    results
+}
+
+#[cfg(test)]
+mod fmt_eth_tests {
+    use super::*;
+
+    #[test]
+    fn fmt_eth_whole_and_fraction() {
+        let one = U256::from(1_000_000_000_000_000_000u64);
+        assert_eq!(fmt_eth(one), "1.000000");
+        assert_eq!(fmt_eth(one + one / U256::from(2u64)), "1.500000");
+        // 0.08 ETH
+        assert_eq!(fmt_eth(U256::from(80_000_000_000_000_000u64)), "0.080000");
+        assert_eq!(fmt_eth(U256::ZERO), "0.000000");
+    }
+
+    #[test]
+    fn fmt_eth_no_nested_dot() {
+        let s = fmt_eth(U256::from(1_500_000_000_000_000_000u64));
+        assert_eq!(s.matches('.').count(), 1);
+        assert!(!s.contains("1.0."));
+    }
+
+    #[test]
+    fn nft_type_parser_accepts_provider_spellings() {
+        assert_eq!(NftKind::parse("ERC721"), Some(NftKind::Erc721));
+        assert_eq!(NftKind::parse("ERC-721"), Some(NftKind::Erc721));
+        assert_eq!(NftKind::parse("erc-1155"), Some(NftKind::Erc1155));
+        assert_eq!(NftKind::parse("ERC20"), None);
+    }
+
+    #[test]
+    fn erc1155_transfer_encodes_empty_bytes_tail() {
+        let from: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let to: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let data = build_erc1155_transfer_calldata(from, to, U256::from(7u64), U256::from(3u64));
+        assert_eq!(data.len(), 4 + 6 * 32);
+        assert_eq!(
+            &data[..4],
+            &function_selector("safeTransferFrom(address,address,uint256,uint256,bytes)")
+        );
+        assert_eq!(&data[data.len() - 32..], &[0u8; 32]);
+    }
+}

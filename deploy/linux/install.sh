@@ -2,7 +2,7 @@
 #
 # MINTER — one-command install on a headless Linux VPS.
 #
-#   curl -fsSL https://raw.githubusercontent.com/MaxBetov-pdd/Minter-rs-v2/main/deploy/ubuntu/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/MaxBetov-pdd/Minter-rs-v2/main/deploy/linux/install.sh | sudo bash
 #
 # Downloads the prebuilt binary from GitHub Releases (no Rust toolchain, no
 # 10-minute compile), installs it as a systemd service behind a private noVNC

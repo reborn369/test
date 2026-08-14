@@ -1,4 +1,4 @@
-# Ubuntu VPS deployment
+# Linux VPS deployment
 
 Runs the unchanged Tauri application inside an isolated Xvfb desktop and serves
 that desktop over noVNC on loopback port `3021`. The mint engine and Tauri IPC
@@ -13,7 +13,7 @@ One command on a fresh server. It pulls the prebuilt binary from GitHub
 Releases — no Rust toolchain, no compile:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MaxBetov-pdd/Minter-rs-v2/main/deploy/ubuntu/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/MaxBetov-pdd/Minter-rs-v2/main/deploy/linux/install.sh | sudo bash
 ```
 
 It installs runtime packages, verifies the download against the published
@@ -45,7 +45,7 @@ sudo apt-get install build-essential pkg-config curl ca-certificates git file wg
   pcmanfm fonts-dejavu-core
 
 cargo build -p minter-desktop --release
-sudo ./deploy/ubuntu/install-built.sh 'eight-or-more-characters'
+sudo ./deploy/linux/install-built.sh 'eight-or-more-characters'
 ```
 
 The VPS needs **no desktop environment** — Xvfb provides a virtual display, so a

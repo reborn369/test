@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Prebuilt releases for both audiences: a Windows zip to run locally and a
   Linux tarball consumed by the VPS installer. Neither needs a Rust toolchain.
-- `deploy/ubuntu/install.sh` — one-command install on a headless server.
+- `deploy/linux/install.sh` — one-command install on a headless server.
   Detects apt/dnf/pacman (and derivatives via `ID_LIKE`), enforces the glibc
   and webkit2gtk 4.1 floors before touching anything, verifies the download
   against its published SHA256, and asks the loader which libraries are

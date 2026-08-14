@@ -5,7 +5,7 @@
 #
 # Two artifacts, two audiences:
 #   * windows .zip    — run MINTER locally on your own machine
-#   * linux .tar.gz   — what deploy/ubuntu/install.sh pulls onto a headless VPS
+#   * linux .tar.gz   — what deploy/linux/install.sh pulls onto a headless VPS
 name: Release
 
 on:
@@ -124,8 +124,8 @@ jobs:
           chmod 755 "$stage/minter-desktop"
           # Ship the server-side runner and unit next to the binary so the
           # installer never has to reach back into the source tree.
-          cp deploy/ubuntu/start-minter-vnc.sh "$stage/"
-          cp deploy/ubuntu/minter-vps.service "$stage/"
+          cp deploy/linux/start-minter-vnc.sh "$stage/"
+          cp deploy/linux/minter-vps.service "$stage/"
           for f in README.md SECURITY.md LICENSE-MIT LICENSE-APACHE NOTICE USER_GUIDE.md; do
             [ -f "$f" ] && cp "$f" "$stage/"
           done
@@ -183,10 +183,10 @@ jobs:
             No server needed. Your machine has to be awake at mint time.
 
             ### Linux VPS — run it 24/7 near the chain
-            On a fresh Ubuntu server (no desktop required):
+            On a fresh Linux server — Ubuntu, Debian, Fedora, RHEL or Arch, no desktop required:
 
             ```bash
-            curl -fsSL https://raw.githubusercontent.com/MaxBetov-pdd/Minter-rs-v2/main/deploy/ubuntu/install.sh | sudo bash
+            curl -fsSL https://raw.githubusercontent.com/MaxBetov-pdd/Minter-rs-v2/main/deploy/linux/install.sh | sudo bash
             ```
 
             The installer pulls `minter-desktop-*-linux-x64.tar.gz` from this

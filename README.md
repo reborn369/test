@@ -42,13 +42,29 @@
 
 ## ⚡ Quick start
 
+> **Новичкам:** пошаговое руководство на русском — **[QUICKSTART.md](QUICKSTART.md)**.
+> Оба варианта установки, от скачивания до первого минта, простым языком.
+
 ### Release binary (Windows)
 
-1. Download the latest **`minter-desktop-*-windows.zip`** from [Releases](https://github.com/MaxBetov-pdd/Minter-rs-v2/releases)
+1. Download the latest **`minter-desktop-*-windows-x64.zip`** from [Releases](https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/latest)
 2. Verify the SHA256 checksum when provided
 3. Unzip → run `minter-desktop.exe`
 4. Settings → Alchemy API key → Proxies → **Check Connection**
 5. **Dry Run** habits for raw tools; OpenSea **Tasks → Start** is LIVE (type `LIVE`)
+
+### Headless Linux server
+
+One command on a fresh VPS — Ubuntu 22.04+, Debian 12+, Fedora 36+, RHEL 9+ or
+Arch. No desktop environment, no Rust toolchain:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MaxBetov-pdd/Minter-rs-v2/main/deploy/linux/install.sh | sudo bash
+```
+
+Then reach the GUI from Windows with
+[minter-connect](https://github.com/MaxBetov-pdd/minter-connect) — it sets up
+the SSH tunnel and opens the browser for you.
 
 ### From source
 

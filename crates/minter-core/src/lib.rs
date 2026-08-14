@@ -50,6 +50,7 @@ pub mod settings;
 pub mod sign;
 pub mod sweep;
 pub mod types;
+pub mod update;
 pub mod vault;
 
 pub use api::{

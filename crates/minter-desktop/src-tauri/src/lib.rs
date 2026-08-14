@@ -1633,6 +1633,18 @@ fn mint_running(state: State<'_, Arc<AppState>>) -> bool {
     state.mint_running()
 }
 
+/// Is a newer release published?
+///
+/// The desktop ships as an unsigned binary people download by hand, so nothing
+/// otherwise tells them a fix exists. This only *reports* — it never downloads
+/// or installs anything, and it sends nothing about the operator. Any failure
+/// (offline, rate limited) comes back as "no update known" with a note rather
+/// than an error the operator has to dismiss.
+#[tauri::command]
+async fn check_for_update() -> Result<minter_core::update::UpdateInfo, String> {
+    Ok(minter_core::update::check_for_update(minter_core::update::DEFAULT_REPO).await)
+}
+
 #[tauri::command]
 async fn test_auth(
     state: State<'_, Arc<AppState>>,
@@ -2577,6 +2589,7 @@ pub fn run() {
             read_text_file,
             cancel_mint,
             mint_running,
+            check_for_update,
             load_wl_for_slug,
         ])
         .run(tauri::generate_context!())

@@ -7083,3 +7083,55 @@ document.addEventListener("keydown", (e) => {
     }
   }
 });
+
+// —— Update check ——
+// The desktop ships as an unsigned binary people download by hand, so nothing
+// otherwise tells them a newer build exists. Ask once per launch, well after
+// startup so it can never compete with the UI coming up, and stay silent unless
+// there is genuinely something newer. A dismissed version is not shown again.
+const UPDATE_DISMISS_KEY = "minter.updateDismissed";
+
+async function checkForUpdate() {
+  let info;
+  try {
+    info = await invoke("check_for_update");
+  } catch (e) {
+    console.warn("update check failed", e);
+    return;
+  }
+  if (!info || !info.updateAvailable || !info.latest) return;
+  // Respect a dismissal, but only for that exact version — a later release
+  // must surface again.
+  try {
+    if (localStorage.getItem(UPDATE_DISMISS_KEY) === info.latest) return;
+  } catch (_) {}
+
+  const banner = $("update-banner");
+  const text = $("update-text");
+  const link = $("update-link");
+  if (!banner || !text || !link) return;
+
+  text.textContent = (
+    t("update.available") || "Version {latest} is available — you have {current}"
+  )
+    .replace("{latest}", info.latest)
+    .replace("{current}", info.current);
+  if (info.url) link.href = info.url;
+  banner.classList.remove("hidden");
+
+  $("update-dismiss")?.addEventListener(
+    "click",
+    () => {
+      banner.classList.add("hidden");
+      try {
+        localStorage.setItem(UPDATE_DISMISS_KEY, info.latest);
+      } catch (_) {}
+    },
+    { once: true }
+  );
+}
+
+// Delayed so a slow or unreachable network cannot hold up the first paint.
+setTimeout(() => {
+  checkForUpdate().catch((e) => console.warn("update check", e));
+}, 4000);

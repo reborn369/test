@@ -327,7 +327,11 @@ mod tests {
     fn send_failure_classification() {
         use SendOutcome::*;
         // Accepted: the node already has it.
-        for s in ["already known", "known transaction: 0xabc", "already imported"] {
+        for s in [
+            "already known",
+            "known transaction: 0xabc",
+            "already imported",
+        ] {
             assert_eq!(classify_send_failure(s), Accepted, "{s}");
         }
         // Rejected: provably never entered a pool.
@@ -357,7 +361,10 @@ mod tests {
     fn nonce_and_fee_errors_are_never_treated_as_proof_of_rejection() {
         // "nonce too low" is exactly what a node returns when an earlier
         // attempt already mined, so it must never short-circuit to Rejected.
-        assert_eq!(classify_send_failure("nonce too low"), SendOutcome::Ambiguous);
+        assert_eq!(
+            classify_send_failure("nonce too low"),
+            SendOutcome::Ambiguous
+        );
         assert_eq!(
             classify_send_failure("transaction underpriced"),
             SendOutcome::Ambiguous

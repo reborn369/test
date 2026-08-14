@@ -3957,7 +3957,11 @@ pub async fn run_opensea_mint(
                                 "[{}] resolved: {} {} block={}",
                                 sign::shorten_address(&addr),
                                 sign::shorten_hash(&hash),
-                                if info.success { "CONFIRMED" } else { "REVERTED" },
+                                if info.success {
+                                    "CONFIRMED"
+                                } else {
+                                    "REVERTED"
+                                },
                                 info.block_number
                             ),
                         );

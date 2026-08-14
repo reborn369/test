@@ -832,7 +832,9 @@ impl Session {
             // probe never gets a rank: a fast failure (connection refused,
             // NXDOMAIN, 401) is quicker than any real round-trip and must not
             // outrank a slower *working* endpoint.
-            let mut order: Vec<usize> = (0..chain_rows.len()).filter(|&i| chain_rows[i].ok).collect();
+            let mut order: Vec<usize> = (0..chain_rows.len())
+                .filter(|&i| chain_rows[i].ok)
+                .collect();
             order.sort_by_key(|&i| chain_rows[i].latency_ms.unwrap_or(u64::MAX));
             for (pos, &i) in order.iter().enumerate() {
                 let rank = pos + 1;
@@ -3222,7 +3224,10 @@ mod rpc_collect_tests {
         env.insert("ALCHEMY_API_KEY".into(), "myKey99".into());
         env.insert("ROBINHOOD_RPC_URL".into(), "https://mine.example".into());
         let labeled = collect_rpc_urls_for_chain_labeled(&env, Some("robinhood"), &[]);
-        assert_eq!(labeled[0], ("https://mine.example".to_string(), RpcOrigin::Settings));
+        assert_eq!(
+            labeled[0],
+            ("https://mine.example".to_string(), RpcOrigin::Settings)
+        );
         assert!(labeled.iter().any(|(_, o)| *o == RpcOrigin::Provider));
         assert!(labeled.iter().any(|(_, o)| *o == RpcOrigin::Public));
     }
@@ -3235,7 +3240,10 @@ mod rpc_collect_tests {
             Some("robinhood"),
             &["https://extra.example".to_string()],
         );
-        assert_eq!(labeled[0], ("https://extra.example".to_string(), RpcOrigin::Custom));
+        assert_eq!(
+            labeled[0],
+            ("https://extra.example".to_string(), RpcOrigin::Custom)
+        );
     }
 }
 

@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-15
+
+### Fixed
+
+- Burner generation no longer aborts when one backup folder is refused.
+  The plaintext recovery file — written before the encrypted vault, so a
+  failed vault rewrite is always recoverable — went to `./imports`, resolved
+  against the *working directory*, which on Windows is whatever launched the
+  program rather than where the program lives. Three ordinary ways to hit it:
+  a shortcut whose working directory is `C:\Windows\System32`; running from a
+  still-zipped folder, which Explorer extracts read-only; and Controlled
+  Folder Access, which refuses folder creation to unsigned programs in
+  Downloads, Documents and the Desktop while still permitting the vault to be
+  read — which is why the vault opens and only the backup fails.
+
+  There is now a list of candidate directories and generation moves on when
+  one cannot be created or written. The order keeps the existing location
+  first, so a setup whose working directory already is the vault's directory
+  — the Linux service, and double-clicking the executable in its own folder —
+  writes exactly where it always has; the fallbacks (beside the executable,
+  then the per-user data directory) engage only after a refusal. The path
+  actually used is reported back. When every candidate is refused, the error
+  names each one with its reason instead of reporting a single path with none,
+  and keys are still never committed to the vault without a backup on disk.
+
 ## [0.2.1] - 2026-08-14
 
 ### Fixed
@@ -99,7 +124,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Session / vault Debug redaction
 - Wave A–D hardening (LIVE gate, fee caps, zero-address rejects, OpenSea value checks, etc.)
 
-[Unreleased]: https://github.com/MaxBetov-pdd/Minter-rs-v2/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/MaxBetov-pdd/Minter-rs-v2/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/tag/v0.2.2
 [0.2.1]: https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/tag/v0.2.1
 [0.2.0]: https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/tag/v0.2.0
 [0.1.0]: https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/tag/v0.1.0

@@ -16,7 +16,9 @@ pub struct Vault {
 
 /// Non-secret result of one burner generation batch. The private keys are
 /// written straight to the operator backup and encrypted vault; they are never
-/// returned through the desktop IPC layer.
+/// returned through the desktop IPC layer — so unlike `VaultEntry`, this is
+/// safe to derive `Debug` on.
+#[derive(Debug)]
 pub struct GeneratedBurnerBatch {
     pub count: usize,
     pub backup_path: PathBuf,
@@ -356,7 +358,7 @@ impl Vault {
         &self,
         count: usize,
         password: &str,
-        backup_dir: &Path,
+        backup_dirs: &[PathBuf],
     ) -> Result<GeneratedBurnerBatch> {
         if count == 0 || count > MAX_GENERATED_BURNERS {
             bail!(
@@ -391,20 +393,8 @@ impl Vault {
             });
         }
 
-        std::fs::create_dir_all(backup_dir).with_context(|| {
-            format!(
-                "failed to create burner backup directory {}",
-                backup_dir.display()
-            )
-        })?;
-        let backup_dir = backup_dir.canonicalize().with_context(|| {
-            format!(
-                "failed to resolve burner backup directory {}",
-                backup_dir.display()
-            )
-        })?;
         let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
-        let backup_path = backup_dir.join(format!("burners_{stamp}_{count}.txt"));
+        let filename = format!("burners_{stamp}_{count}.txt");
 
         let mut backup = Zeroizing::new(Vec::<u8>::with_capacity(count * 120 + 256));
         writeln!(backup, "# MINTER burner private-key backup — KEEP PRIVATE")?;
@@ -419,28 +409,61 @@ impl Vault {
             writeln!(backup, "{},{}", entry.address, entry.key)?;
         }
 
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+        let write_backup = |dir: &Path| -> Result<PathBuf> {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("cannot create {}", dir.display()))?;
+            // Canonicalize so the reported path is the real one, not `./imports`.
+            let dir = dir
+                .canonicalize()
+                .with_context(|| format!("cannot resolve {}", dir.display()))?;
+            let path = dir.join(&filename);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let result = (|| -> Result<()> {
+                let mut file = options
+                    .open(&path)
+                    .with_context(|| format!("cannot create {}", path.display()))?;
+                file.write_all(backup.as_slice()).context("write failed")?;
+                file.sync_all().context("fsync failed")?;
+                Ok(())
+            })();
+            if let Err(e) = result {
+                // This path was created by this call with create_new; remove
+                // only that incomplete file, never an existing backup.
+                let _ = std::fs::remove_file(&path);
+                return Err(e);
+            }
+            Ok(path)
+        };
+
+        // Try each candidate. A directory that cannot be created or written is
+        // the normal case on Windows — a shortcut's working directory, a
+        // read-only temp extraction, or Controlled Folder Access — so move on
+        // rather than abandoning keys that are already generated.
+        let mut refused: Vec<String> = Vec::new();
+        let mut backup_path: Option<PathBuf> = None;
+        for dir in backup_dirs {
+            match write_backup(dir) {
+                Ok(path) => {
+                    backup_path = Some(path);
+                    break;
+                }
+                Err(e) => refused.push(format!("{} — {}", dir.display(), e.root_cause())),
+            }
         }
-        let backup_result = (|| -> Result<()> {
-            let mut file = options.open(&backup_path).with_context(|| {
-                format!("failed to create burner backup {}", backup_path.display())
-            })?;
-            file.write_all(backup.as_slice())
-                .context("failed to write burner backup")?;
-            file.sync_all().context("failed to fsync burner backup")?;
-            Ok(())
-        })();
-        if let Err(e) = backup_result {
-            // This path was created by this call with create_new; remove only
-            // that incomplete file, never an operator-owned existing backup.
-            let _ = std::fs::remove_file(&backup_path);
-            return Err(e);
-        }
+        let Some(backup_path) = backup_path else {
+            bail!(
+                "no writable place for the key backup, so nothing was generated. Tried: {}. \
+                 Move MINTER to a folder you own (not Program Files), start it from that \
+                 folder, and if Windows ransomware protection is on, allow it there.",
+                refused.join("; ")
+            );
+        };
 
         entries.extend(generated);
         if let Err(e) = self.write_entries(&entries, password) {
@@ -614,7 +637,7 @@ mod tests {
         let backup_dir = path.parent().unwrap().join("imports");
         let vault = Vault::new(&path);
         let batch = vault
-            .generate_burners(3, "burner_test_password", &backup_dir)
+            .generate_burners(3, "burner_test_password", std::slice::from_ref(&backup_dir))
             .unwrap();
 
         assert_eq!(batch.count, 3);
@@ -659,14 +682,78 @@ mod tests {
         let path = unique_vault_path("generate_bounds");
         let backup_dir = path.parent().unwrap().join("imports");
         let vault = Vault::new(&path);
-        assert!(vault.generate_burners(0, "pw", &backup_dir).is_err());
         assert!(
             vault
-                .generate_burners(MAX_GENERATED_BURNERS + 1, "pw", &backup_dir)
+                .generate_burners(0, "pw", std::slice::from_ref(&backup_dir))
+                .is_err()
+        );
+        assert!(
+            vault
+                .generate_burners(
+                    MAX_GENERATED_BURNERS + 1,
+                    "pw",
+                    std::slice::from_ref(&backup_dir)
+                )
                 .is_err()
         );
         assert!(!path.exists());
         assert!(!backup_dir.exists());
+        cleanup_vault_path(&path);
+    }
+
+    /// A directory whose parent is a *file*: `create_dir_all` refuses it on
+    /// every platform, which stands in for the real Windows cases — a
+    /// shortcut's working directory, a read-only zip extraction, or Controlled
+    /// Folder Access blocking an unsigned program.
+    fn unusable_dir(near: &Path, label: &str) -> PathBuf {
+        let blocker = near.parent().unwrap().join(format!("{label}.blocker"));
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        blocker.join("imports")
+    }
+
+    #[test]
+    fn an_unwritable_first_choice_falls_through_instead_of_losing_the_keys() {
+        let path = unique_vault_path("generate_fallback");
+        let blocked = unusable_dir(&path, "generate_fallback");
+        let usable = path.parent().unwrap().join("generate_fallback_imports");
+        let vault = Vault::new(&path);
+
+        let batch = vault
+            .generate_burners(2, "pw", &[blocked.clone(), usable.clone()])
+            .expect("must fall back rather than abandon generated keys");
+
+        // Landed in the second candidate, and the caller is told where.
+        assert!(
+            batch
+                .backup_path
+                .starts_with(usable.canonicalize().unwrap()),
+            "backup went to {}",
+            batch.backup_path.display()
+        );
+        assert!(!blocked.exists());
+        // The vault really was written, not just the backup.
+        assert_eq!(vault.read_entries("pw").unwrap().len(), 2);
+        cleanup_vault_path(&path);
+    }
+
+    #[test]
+    fn when_nowhere_is_writable_it_says_so_and_writes_no_vault() {
+        let path = unique_vault_path("generate_nowhere");
+        let a = unusable_dir(&path, "generate_nowhere_a");
+        let b = unusable_dir(&path, "generate_nowhere_b");
+        let vault = Vault::new(&path);
+
+        let err = vault
+            .generate_burners(2, "pw", &[a.clone(), b.clone()])
+            .expect_err("no writable location must be an error");
+        let msg = err.to_string();
+
+        // Name every place tried, so the operator can act on it.
+        assert!(msg.contains(&a.display().to_string()), "{msg}");
+        assert!(msg.contains(&b.display().to_string()), "{msg}");
+        // Backup-first ordering: keys that were never backed up are never
+        // committed to the vault either.
+        assert!(!path.exists(), "vault must not exist after a failed backup");
         cleanup_vault_path(&path);
     }
 }

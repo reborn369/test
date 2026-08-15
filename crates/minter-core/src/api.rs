@@ -552,6 +552,62 @@ impl Session {
         Ok(n)
     }
 
+    /// Places to try for the plaintext recovery backup, best first.
+    ///
+    /// The desktop build configures the vault as a bare `keys.vault`, so its
+    /// parent is empty and the backup used to land in `./imports` — relative to
+    /// the *working directory*, which on Windows is whatever launched the
+    /// program. From a Start-menu shortcut that is `C:\Windows\System32`; from
+    /// a still-zipped folder it is a read-only temp directory; and in Downloads
+    /// or on the Desktop, Controlled Folder Access refuses folder creation to
+    /// unsigned programs while still allowing the vault to be *read*. All three
+    /// end the same way: the vault opens, the backup cannot be written, and
+    /// generation aborts with nothing created.
+    ///
+    /// So offer alternatives instead of one guess. The order deliberately keeps
+    /// today's location first: where the working directory *is* the vault's
+    /// directory — the service on the server, and the common Windows case of
+    /// double-clicking the executable in its own folder — the backup must keep
+    /// landing exactly where it always has. The fallbacks only engage once that
+    /// fails, and the chosen path is returned to the caller so nobody has to
+    /// hunt for their keys.
+    fn burner_backup_dirs(vault_path: &Path) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        let mut push = |dir: PathBuf| {
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        };
+
+        // Beside the vault, when the configured path says where that is.
+        if let Some(parent) = vault_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            push(parent.join("imports"));
+        }
+        // Unchanged behaviour: relative to the working directory.
+        push(PathBuf::from(".").join("imports"));
+        if let Some(exe_dir) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        {
+            push(exe_dir.join("imports"));
+        }
+        // Per-user data directory, read from the environment rather than by
+        // taking on a new dependency: %APPDATA% on Windows, XDG elsewhere.
+        let data_home = if cfg!(windows) {
+            std::env::var_os("APPDATA").map(PathBuf::from)
+        } else {
+            std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
+                })
+        };
+        if let Some(home) = data_home {
+            push(home.join("minter").join("imports"));
+        }
+        dirs
+    }
+
     /// Generate burner wallets without exposing private keys through IPC.
     /// The Vault writes a recovery file before its atomic encrypted rewrite;
     /// reloading afterward also verifies that the new vault decrypts cleanly.
@@ -561,12 +617,8 @@ impl Session {
             .as_deref()
             .context("vault locked — unlock first")?;
         let vault = Vault::new(&self.vault_path);
-        let vault_parent = self
-            .vault_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let batch = vault.generate_burners(count, pw, &vault_parent.join("imports"))?;
+        let batch =
+            vault.generate_burners(count, pw, &Self::burner_backup_dirs(&self.vault_path))?;
         let keys = vault.decrypt_keys(pw)?;
         self.rebuild_signers_from_keys(&keys);
         Ok(GeneratedBurnersInfo {

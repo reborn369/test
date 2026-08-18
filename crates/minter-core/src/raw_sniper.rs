@@ -197,12 +197,22 @@ async fn sleep_until_unix(target: i64, cancel: &Option<Arc<AtomicBool>>) -> Resu
 async fn sleep_until_fire(
     target_unix: i64,
     cancel: &Option<Arc<AtomicBool>>,
+    reactive: &Option<crate::reactive::ReactiveEngine>,
 ) -> Result<(), String> {
     let target_ms = target_unix.saturating_mul(1000);
     loop {
         if cancelled(cancel) {
             return Err("cancelled by user".into());
         }
+
+        // Reactive check: if blockchain timestamp >= target, fire early!
+        if let Some(engine) = reactive {
+            let block_ts = engine.latest_block_timestamp();
+            if block_ts > 0 && (block_ts as i64) >= target_unix {
+                return Ok(());
+            }
+        }
+
         let now = now_unix_ms();
         let rem = target_ms - now;
         if rem <= 0 {

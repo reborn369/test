@@ -62,7 +62,7 @@ impl Drop for TimerResolutionGuard {
 mod windows_timer {
     // Link against winmm.lib for multimedia timer functions.
     #[link(name = "winmm")]
-    extern "system" {
+    unsafe extern "system" {
         pub fn timeBeginPeriod(uPeriod: u32) -> u32;
         pub fn timeEndPeriod(uPeriod: u32) -> u32;
     }

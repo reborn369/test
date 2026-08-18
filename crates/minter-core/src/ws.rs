@@ -122,7 +122,7 @@ impl WsClient {
                                             "method": method,
                                             "params": params,
                                         });
-                                        let msg = Message::Text(payload.to_string());
+                                        let msg = Message::Text(payload.to_string().into());
                                         if let Err(e) = write.send(msg).await {
                                             let _ = reply.send(Err(anyhow::anyhow!("WS write error: {e}")));
                                             break; // drop connection, reconnect
@@ -130,7 +130,7 @@ impl WsClient {
                                         pending.insert(id, reply);
                                     }
                                     WsRequest::SendRaw(payload) => {
-                                        if let Err(_) = write.send(Message::Text(payload)).await {
+                                        if let Err(_) = write.send(Message::Text(payload.into())).await {
                                             break;
                                         }
                                     }
@@ -139,7 +139,7 @@ impl WsClient {
                             
                             // 2. Keep-alive Pings
                             _ = ping_interval.tick() => {
-                                if let Err(_) = write.send(Message::Ping(vec![])).await {
+                                if let Err(_) = write.send(Message::Ping(vec![].into())).await {
                                     break;
                                 }
                             }

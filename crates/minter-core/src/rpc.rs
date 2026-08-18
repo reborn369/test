@@ -110,7 +110,7 @@ impl RpcClient {
         &self.ws_clients
     }
 
-    fn short_url(url: &str) -> String {
+    pub fn short_url(url: &str) -> String {
         // Keep scheme + host only; drop path/query, which may embed the provider
         // API key (e.g. Alchemy `/v2/<key>`). Never log the key — not even a tail
         // fragment of it (audit L1). ':' '/' '?' are ASCII, so byte finds/slices

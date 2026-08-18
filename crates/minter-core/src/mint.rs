@@ -2326,12 +2326,10 @@ pub async fn run_opensea_mint(
 
         let ws_clients = rpc.ws_clients();
         if !ws_clients.is_empty() {
-            report(
-                &reporter,
-                MintEvent::phase(
-                    "wait",
-                    format!("🚀 ReactiveEngine: WebSockets Active ({} nodes)", ws_clients.len()),
-                ),
+            report_phase(
+                &*reporter,
+                "wait",
+                format!("🚀 ReactiveEngine: WebSockets Active ({} nodes)", ws_clients.len()),
             );
         }
         let reactive_engine = crate::reactive::ReactiveEngine::new(ws_clients);

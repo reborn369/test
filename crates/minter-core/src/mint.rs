@@ -2324,7 +2324,17 @@ pub async fn run_opensea_mint(
         )> = tokio::task::JoinSet::new();
 
 
-        let reactive_engine = crate::reactive::ReactiveEngine::new(rpc.ws_clients());
+        let ws_clients = rpc.ws_clients();
+        if !ws_clients.is_empty() {
+            report(
+                &reporter,
+                MintEvent::phase(
+                    "wait",
+                    format!("🚀 ReactiveEngine: WebSockets Active ({} nodes)", ws_clients.len()),
+                ),
+            );
+        }
+        let reactive_engine = crate::reactive::ReactiveEngine::new(ws_clients);
 
         // ── Activate high-resolution timers for the fire-critical window ──
         // On Windows this calls timeBeginPeriod(1), ensuring sleep(1ms) ≈ 1ms

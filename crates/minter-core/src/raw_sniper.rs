@@ -834,10 +834,18 @@ pub async fn run_raw_sniper(
     }
 
     // ── Clock fire ──
-    let reactive_engine = if rpc.ws_clients().is_empty() {
+    let ws_clients = rpc.ws_clients();
+    let reactive_engine = if ws_clients.is_empty() {
         None
     } else {
-        Some(crate::reactive::ReactiveEngine::new(rpc.ws_clients()))
+        report(
+            &reporter,
+            MintEvent::phase(
+                "wait",
+                format!("🚀 ReactiveEngine: WebSockets Active ({} nodes)", ws_clients.len()),
+            ),
+        );
+        Some(crate::reactive::ReactiveEngine::new(ws_clients))
     };
 
     if let Some(at) = fire_at {

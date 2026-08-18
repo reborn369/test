@@ -824,6 +824,12 @@ pub async fn run_raw_sniper(
     }
 
     // ── Clock fire ──
+    let reactive_engine = if rpc.ws_clients().is_empty() {
+        None
+    } else {
+        Some(crate::reactive::ReactiveEngine::new(rpc.ws_clients()))
+    };
+
     if let Some(at) = fire_at {
         let now = now_unix();
         if now < at {
@@ -834,7 +840,7 @@ pub async fn run_raw_sniper(
                     format!("Armed — firing in {}s (clock {at})", at - now),
                 ),
             );
-            if let Err(e) = sleep_until_fire(at, &cancel).await {
+            if let Err(e) = sleep_until_fire(at, &cancel, &reactive_engine).await {
                 return fail_all(signers, e);
             }
         } else {

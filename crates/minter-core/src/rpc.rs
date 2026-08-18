@@ -59,6 +59,7 @@ pub struct RpcClient {
     urls: Vec<String>,
     next_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
     tuning: RpcTuning,
+    ws_clients: Vec<crate::ws::WsClient>,
 }
 
 impl Clone for RpcClient {
@@ -68,26 +69,16 @@ impl Clone for RpcClient {
             urls: self.urls.clone(),
             next_id: self.next_id.clone(),
             tuning: self.tuning,
+            ws_clients: self.ws_clients.clone(),
         }
     }
 }
 
 impl RpcClient {
-    /// Build a direct (non-proxied) RPC client.
-    ///
-    /// PRODUCT DECISION (audit M1, 2026-07-24): JSON-RPC traffic
-    /// (`eth_sendRawTransaction`, nonce, balance, receipts) is intentionally sent
-    /// **direct**. Proxies are applied only to OpenSea SIWE auth (per-wallet,
-    /// where IP-based 429 rate-limits matter). RPC here is a single shared
-    /// multi-URL race client per run, so per-wallet sticky proxying isn't possible
-    /// without a refactor, and routing the race through one proxy would add
-    /// hot-path latency. `new_with_proxy` is used only by the opt-in
-    /// "Probe networks via proxy" diagnostic. See docs/ARCHITECTURE.md + SECURITY.md.
     pub fn new(urls: Vec<String>) -> Self {
         Self::new_with_proxy(urls, None).expect("failed to create HTTP client")
     }
 
-    /// Build RPC client; optional HTTP/SOCKS proxy for all JSON-RPC calls.
     pub fn new_with_proxy(urls: Vec<String>, proxy_url: Option<&str>) -> Result<Self> {
         let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -99,12 +90,24 @@ impl RpcClient {
             builder = builder.proxy(proxy);
         }
         let client = builder.build().context("build RPC HTTP client")?;
+        
+        let ws_clients: Vec<_> = urls
+            .iter()
+            .filter(|u| u.starts_with("ws://") || u.starts_with("wss://"))
+            .map(|u| crate::ws::WsClient::spawn(u.clone()))
+            .collect();
+
         Ok(Self {
             client,
-            urls,
+            urls: urls.into_iter().filter(|u| u.starts_with("http")).collect(),
             next_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             tuning: RpcTuning::from_lookup(|k| std::env::var(k).ok()),
+            ws_clients,
         })
+    }
+
+    pub fn ws_clients(&self) -> &[crate::ws::WsClient] {
+        &self.ws_clients
     }
 
     fn short_url(url: &str) -> String {
@@ -778,14 +781,42 @@ impl RpcClient {
             .cloned()
             .collect();
         let max_attempts = urls.len();
-        if max_attempts == 0 {
-            bail!("No RPC URLs configured");
+        
+        // Ensure we have either HTTP or WS urls
+        if max_attempts == 0 && self.ws_clients.is_empty() {
+            bail!("No RPC URLs configured (HTTP or WS)");
         }
 
         // Pre-build the JSON-RPC request body once (outside the fan-out loop).
         // This moves hex encoding, string formatting, JSON AST construction, and
         // serde serialization off the hot path — they used to run per-endpoint.
         let raw_hex = format!("0x{}", hex::encode(raw));
+        
+        // 1. FAST PATH: Blast raw JSON over all open WebSockets instantly.
+        if !self.ws_clients.is_empty() {
+            let ws_payload = json!({
+                "jsonrpc": "2.0",
+                "id": 999999, // Fire-and-forget ID
+                "method": "eth_sendRawTransaction",
+                "params": [&raw_hex],
+            }).to_string();
+            
+            for ws in &self.ws_clients {
+                ws.send_raw_json(ws_payload.clone());
+            }
+            crate::rlog!("RPC blasted via {} WebSocket(s)", self.ws_clients.len());
+        }
+
+        if max_attempts == 0 {
+            // Only WS configured, return a synthetic report
+            return Ok(SendReport {
+                hash: B256::default(), // caller usually ignores hash
+                winner: "websocket".to_string(),
+                nodes_tried: self.ws_clients.len(),
+                losers: vec![],
+            });
+        }
+
         let prebuilt_body: Vec<u8> = {
             let base_id = self
                 .next_id

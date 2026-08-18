@@ -2324,6 +2324,8 @@ pub async fn run_opensea_mint(
         )> = tokio::task::JoinSet::new();
 
 
+        let reactive_engine = crate::reactive::ReactiveEngine::new(rpc.ws_clients());
+
         // ── Activate high-resolution timers for the fire-critical window ──
         // On Windows this calls timeBeginPeriod(1), ensuring sleep(1ms) ≈ 1ms
         // instead of ≈15.6ms. The guard restores default resolution on drop.
@@ -2333,6 +2335,15 @@ pub async fn run_opensea_mint(
             if cancelled(&cancel) {
                 bail!("Mint cancelled while waiting for phase open");
             }
+            
+            // 1. Reactive Trigger (blockchain timestamp)
+            let latest_block_ts = reactive_engine.latest_block_timestamp();
+            if latest_block_ts > 0 && latest_block_ts as i64 >= start_ts {
+                crate::rlog!("REACTIVE TRIGGER: Block timestamp {} >= target {}. FIRE!", latest_block_ts, start_ts);
+                break;
+            }
+
+            // 2. Wall Clock Trigger (fallback)
             let wall_ms = chrono::Utc::now().timestamp_millis();
             let remaining_ms = target_ms.saturating_sub(wall_ms);
             if remaining_ms <= 0 {

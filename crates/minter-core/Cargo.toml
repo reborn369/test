@@ -29,3 +29,5 @@ k256 = "0.13"
 chrono = "0.4"
 anyhow = "1"
 dotenvy = "0.15"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"

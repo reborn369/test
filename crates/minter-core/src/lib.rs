@@ -53,6 +53,8 @@ pub mod types;
 pub mod update;
 pub mod vault;
 pub mod timer_resolution;
+pub mod ws;
+pub mod reactive;
 
 pub use api::{
     AuthTestRow, DiscoveredFunction, DropPhasesResult, EligibilityResult, GeneratedBurnersInfo,

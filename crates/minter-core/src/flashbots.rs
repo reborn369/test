@@ -20,6 +20,9 @@ pub const MAINNET_CHAIN_ID: u64 = 1;
 #[derive(Debug, Clone)]
 pub struct FlashbotsConfig {
     pub relay_url: String,
+    /// Additional relay URLs for parallel multi-builder dispatch.
+    /// Bundles are sent to `relay_url` AND all `extra_relay_urls` simultaneously.
+    pub extra_relay_urls: Vec<String>,
     /// How many next blocks to target (current+1 .. current+max_blocks).
     pub max_blocks: u64,
     /// Delay between resubmits to successive target blocks.
@@ -30,6 +33,7 @@ impl Default for FlashbotsConfig {
     fn default() -> Self {
         Self {
             relay_url: DEFAULT_RELAY_URL.to_string(),
+            extra_relay_urls: vec![],
             max_blocks: 3,
             resubmit_ms: 1200,
         }
@@ -37,6 +41,22 @@ impl Default for FlashbotsConfig {
 }
 
 impl FlashbotsConfig {
+    /// All relay URLs (primary + extras) deduplicated.
+    pub fn all_relay_urls(&self) -> Vec<String> {
+        let mut urls = vec![self.relay_url.clone()];
+        for u in &self.extra_relay_urls {
+            let trimmed = u.trim().trim_end_matches('/').to_string();
+            if !trimmed.is_empty()
+                && !urls
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(&trimmed))
+            {
+                urls.push(trimmed);
+            }
+        }
+        urls
+    }
+
     pub fn from_env(env: &std::collections::HashMap<String, String>) -> Self {
         let mut c = Self::default();
         if let Some(u) = env
@@ -47,6 +67,15 @@ impl FlashbotsConfig {
             if !t.is_empty() {
                 c.relay_url = t.to_string();
             }
+        }
+        // FLASHBOTS_EXTRA_RELAYS: comma-separated list of additional builder endpoints.
+        // Example: "https://rpc.beaverbuild.org,https://rsync-builder.xyz,https://rpc.titanbuilder.xyz"
+        if let Some(extras) = env.get("FLASHBOTS_EXTRA_RELAYS") {
+            c.extra_relay_urls = extras
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         }
         if let Some(n) = env
             .get("FLASHBOTS_MAX_BLOCKS")
@@ -119,6 +148,7 @@ impl FlashbotsClient {
         }
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
+            .tcp_nodelay(true)
             .build()
             .context("flashbots http client")?;
         Ok(Self { http, config })
@@ -145,6 +175,10 @@ impl FlashbotsClient {
     }
 
     async fn rpc(&self, auth: &Signer, method: &str, params: Value) -> Result<Value> {
+        self.rpc_to_url(auth, method, params, &self.config.relay_url).await
+    }
+
+    async fn rpc_to_url(&self, auth: &Signer, method: &str, params: Value, relay_url: &str) -> Result<Value> {
         let body_obj = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -153,7 +187,7 @@ impl FlashbotsClient {
         });
         let body = serde_json::to_string(&body_obj).context("flashbots serialize")?;
         let header = Self::sign_auth_header(auth, &body)?;
-        let url = self.config.relay_url.trim_end_matches('/');
+        let url = relay_url.trim_end_matches('/');
 
         let resp = self
             .http
@@ -180,6 +214,95 @@ impl FlashbotsClient {
         data.get("result")
             .cloned()
             .context("flashbots: no result field")
+    }
+
+    /// Fan out an RPC call to ALL configured relays in parallel.
+    /// Returns the first successful result; logs failures from other relays.
+    async fn fan_out_rpc(&self, auth: &Signer, method: &str, params: Value) -> Result<Value> {
+        let all_urls = self.config.all_relay_urls();
+        if all_urls.len() <= 1 {
+            // Single relay — no fan-out needed
+            return self.rpc(auth, method, params).await;
+        }
+
+        crate::rlog!(
+            "Flashbots multi-relay fan-out: {} relays for {}",
+            all_urls.len(),
+            method
+        );
+
+        // Pre-serialize the body once (all relays get the same payload)
+        let body_obj = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        });
+        let body = serde_json::to_string(&body_obj).context("flashbots serialize")?;
+        let header = Self::sign_auth_header(auth, &body)?;
+
+        let mut set = tokio::task::JoinSet::new();
+        for url in all_urls {
+            let http = self.http.clone();
+            let body = body.clone();
+            let header = header.clone();
+            set.spawn(async move {
+                let trimmed = url.trim_end_matches('/').to_string();
+                let result = async {
+                    let resp = http
+                        .post(&trimmed)
+                        .header("content-type", "application/json")
+                        .header("X-Flashbots-Signature", &header)
+                        .body(body)
+                        .send()
+                        .await
+                        .with_context(|| format!("flashbots POST {trimmed}"))?;
+                    let status = resp.status();
+                    let text = resp.text().await.context("flashbots read body")?;
+                    if !status.is_success() {
+                        bail!("Flashbots HTTP {status} via {trimmed}: {}", crate::safe_truncate(&text, 200));
+                    }
+                    let data: Value = serde_json::from_str(&text).context("flashbots json")?;
+                    if let Some(err) = data.get("error") {
+                        bail!("Flashbots RPC error via {trimmed}: {err}");
+                    }
+                    data.get("result").cloned().context("flashbots: no result field")
+                }.await;
+                (trimmed, result)
+            });
+        }
+
+        let mut errors: Vec<String> = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((url, Ok(val))) => {
+                    crate::rlog!("Flashbots fan-out OK via {}", url);
+                    // Drain remaining in background (bundles are idempotent)
+                    if !set.is_empty() {
+                        tokio::spawn(async move {
+                            while let Some(bg) = set.join_next().await {
+                                match bg {
+                                    Ok((u, Ok(_))) => crate::rlog!("Flashbots fan-out completed: {u}"),
+                                    Ok((u, Err(e))) => crate::rlog!("Flashbots fan-out failed: {u}: {e}"),
+                                    Err(e) => crate::rlog!("Flashbots fan-out join: {e}"),
+                                }
+                            }
+                        });
+                    }
+                    return Ok(val);
+                }
+                Ok((url, Err(e))) => {
+                    crate::rlog!("Flashbots fan-out FAIL {}: {}", url, e);
+                    errors.push(format!("{url}: {e}"));
+                }
+                Err(e) => errors.push(format!("join: {e}")),
+            }
+        }
+        bail!(
+            "All {} Flashbots relay(s) failed: {}",
+            errors.len(),
+            errors.join(" | ")
+        )
     }
 
     /// Simulate bundle at `block_number` (hex or decimal u64).
@@ -222,7 +345,7 @@ impl FlashbotsClient {
             "txs": raws,
             "blockNumber": format!("0x{:x}", block_number),
         }]);
-        self.rpc(auth, "eth_sendBundle", params).await
+        self.fan_out_rpc(auth, "eth_sendBundle", params).await
     }
 
     /// Submit to next `max_blocks` blocks (resubmit). Stops if `cancel` is set.

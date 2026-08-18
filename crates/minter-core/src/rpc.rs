@@ -89,7 +89,11 @@ impl RpcClient {
 
     /// Build RPC client; optional HTTP/SOCKS proxy for all JSON-RPC calls.
     pub fn new_with_proxy(urls: Vec<String>, proxy_url: Option<&str>) -> Result<Self> {
-        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
+        let mut builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .tcp_nodelay(true)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(4);
         if let Some(p) = proxy_url.map(str::trim).filter(|s| !s.is_empty()) {
             let proxy = reqwest::Proxy::all(p).with_context(|| format!("invalid RPC proxy {p}"))?;
             builder = builder.proxy(proxy);
@@ -778,6 +782,25 @@ impl RpcClient {
             bail!("No RPC URLs configured");
         }
 
+        // Pre-build the JSON-RPC request body once (outside the fan-out loop).
+        // This moves hex encoding, string formatting, JSON AST construction, and
+        // serde serialization off the hot path — they used to run per-endpoint.
+        let raw_hex = format!("0x{}", hex::encode(raw));
+        let prebuilt_body: Vec<u8> = {
+            let base_id = self
+                .next_id
+                .fetch_add(max_attempts as u64, std::sync::atomic::Ordering::Relaxed);
+            // Build with base_id; each endpoint gets its own id patched below.
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": base_id,
+                "method": "eth_sendRawTransaction",
+                "params": [&raw_hex],
+            });
+            serde_json::to_vec(&body).expect("JSON serialization cannot fail")
+        };
+        let prebuilt_body = std::sync::Arc::new(prebuilt_body);
+
         // Broadcast to all endpoints in parallel; the first to COMPLETE
         // successfully wins. Each send is wrapped in a per-attempt timeout so a
         // hung node can't stall the winner up to the 30s client timeout. After
@@ -796,21 +819,41 @@ impl RpcClient {
                 Self::short_url(&url)
             );
             let client = self.client.clone();
-            let raw_hex = format!("0x{}", hex::encode(raw));
-            let id = self
-                .next_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let body_bytes = prebuilt_body.clone();
             set.spawn(async move {
-                let res = match tokio::time::timeout(
-                    timeout,
-                    Self::rpc_call_with_client(
-                        client,
-                        url.clone(),
-                        id,
-                        "eth_sendRawTransaction",
-                        json!([raw_hex]),
-                    ),
-                )
+                let res = match tokio::time::timeout(timeout, async {
+                    let short = Self::short_url(&url);
+                    let resp = client
+                        .post(&url)
+                        .header("content-type", "application/json")
+                        .body(body_bytes.as_ref().clone())
+                        .send()
+                        .await
+                        .with_context(|| format!("RPC eth_sendRawTransaction request failed via {short}"))?;
+                    let status = resp.status();
+                    let text = resp
+                        .text()
+                        .await
+                        .with_context(|| format!("RPC eth_sendRawTransaction: failed to read response from {short}"))?;
+                    if !status.is_success() {
+                        bail!(
+                            "RPC eth_sendRawTransaction HTTP {status} via {short}: {}",
+                            crate::safe_truncate(&text, 240)
+                        );
+                    }
+                    let data: serde_json::Value = serde_json::from_str(&text).with_context(|| {
+                        format!(
+                            "RPC eth_sendRawTransaction: bad JSON from {short}: {}",
+                            crate::safe_truncate(&text, 240)
+                        )
+                    })?;
+                    if let Some(error) = data.get("error") {
+                        bail!("RPC eth_sendRawTransaction via {short} error: {error}");
+                    }
+                    data.get("result")
+                        .cloned()
+                        .with_context(|| format!("RPC eth_sendRawTransaction via {short}: no result"))
+                })
                 .await
                 {
                     Ok(Ok(v)) => Ok(v),

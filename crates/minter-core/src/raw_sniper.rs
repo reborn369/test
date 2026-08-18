@@ -190,6 +190,10 @@ async fn sleep_until_unix(target: i64, cancel: &Option<Arc<AtomicBool>>) -> Resu
 }
 
 /// Fine-grained wait for fire: target is unix **seconds**; spins last ~20ms.
+///
+/// With `TimerResolutionGuard` active (1 ms resolution on Windows), the 5 ms
+/// sleep tier is accurate. The busy-yield window is widened to 20 ms to
+/// guarantee sub-millisecond precision in the final approach.
 async fn sleep_until_fire(
     target_unix: i64,
     cancel: &Option<Arc<AtomicBool>>,
@@ -206,12 +210,12 @@ async fn sleep_until_fire(
         }
         if rem > 2_000 {
             tokio::time::sleep(Duration::from_millis(100)).await;
-        } else if rem > 50 {
+        } else if rem > 100 {
             tokio::time::sleep(Duration::from_millis(5)).await;
-        } else if rem > 5 {
+        } else if rem > 20 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         } else {
-            // busy-ish spin for last few ms
+            // Sub-millisecond busy-spin for the final 20 ms.
             tokio::task::yield_now().await;
         }
     }
@@ -599,6 +603,12 @@ pub async fn run_raw_sniper(
             config.dry_run
         )),
     );
+
+
+    // ── Activate high-resolution timers for the fire-critical window ──
+    // On Windows this calls timeBeginPeriod(1), ensuring sleep(1ms) ≈ 1ms
+    // instead of ≈15.6ms. The guard restores default resolution on drop.
+    let _timer_guard = crate::timer_resolution::TimerResolutionGuard::activate();
 
     // ── Wait until prep window (at_time − PREP_LEAD) ──
     if let Some(at) = fire_at {

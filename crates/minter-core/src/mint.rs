@@ -2323,6 +2323,12 @@ pub async fn run_opensea_mint(
             Option<PrefetchedMintTx>,
         )> = tokio::task::JoinSet::new();
 
+
+        // ── Activate high-resolution timers for the fire-critical window ──
+        // On Windows this calls timeBeginPeriod(1), ensuring sleep(1ms) ≈ 1ms
+        // instead of ≈15.6ms. The guard restores default resolution on drop.
+        let _timer_guard = crate::timer_resolution::TimerResolutionGuard::activate();
+
         loop {
             if cancelled(&cancel) {
                 bail!("Mint cancelled while waiting for phase open");
@@ -2645,9 +2651,9 @@ pub async fn run_opensea_mint(
                 200
             } else if remaining_ms > 2_000 {
                 50
-            } else if remaining_ms > 50 {
+            } else if remaining_ms > 100 {
                 5
-            } else if remaining_ms > 5 {
+            } else if remaining_ms > 20 {
                 1
             } else {
                 tokio::task::yield_now().await;

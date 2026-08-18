@@ -52,6 +52,7 @@ pub mod sweep;
 pub mod types;
 pub mod update;
 pub mod vault;
+pub mod timer_resolution;
 
 pub use api::{
     AuthTestRow, DiscoveredFunction, DropPhasesResult, EligibilityResult, GeneratedBurnersInfo,

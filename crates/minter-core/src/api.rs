@@ -3815,6 +3815,10 @@ fn provider_rpc_urls_for_chain(env: &HashMap<String, String>, chain: Option<&str
     if let (Some(key), Some(slug)) = (alchemy_api_key_from_env(env), alchemy_slug) {
         add_unique_url(
             &mut urls,
+            format!("wss://{}.g.alchemy.com/v2/{}", slug, key),
+        );
+        add_unique_url(
+            &mut urls,
             format!("https://{}.g.alchemy.com/v2/{}", slug, key),
         );
     }

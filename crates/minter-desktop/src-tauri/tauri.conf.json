@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Minter",
+  "productName": "Minter Reactive",
   "version": "0.2.2",
-  "identifier": "com.minter.desktop",
+  "identifier": "com.minter.desktop.reactive",
   "build": {
     "frontendDist": "../ui"
   },
@@ -10,7 +10,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "MINTER",
+        "title": "MINTER REACTIVE",
         "width": 1280,
         "height": 820,
         "minWidth": 960,

@@ -77,80 +77,9 @@ jobs:
             dist/*.zip
             dist/*.sha256
 
-  linux:
-    name: Linux server
-    # Pinned to 22.04 on purpose: a binary linked against 24.04's glibc (2.39)
-    # refuses to start on a 22.04 server, while a 22.04 build runs on both.
-    # Most VPS images are still 22.04, so build against the older floor.
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ". -> target"
-
-      - name: Build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config libssl-dev \
-            libwebkit2gtk-4.1-dev libxdo-dev \
-            libayatana-appindicator3-dev librsvg2-dev patchelf
-
-      - name: Build
-        run: cargo build -p minter-desktop --release
-
-      - name: Package
-        run: |
-          set -euo pipefail
-          tag="${{ github.ref_name }}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
-            tag="${{ inputs.tag }}"
-          fi
-          [ -n "$tag" ] || tag="dev-${{ github.run_id }}"
-          ver="${tag#v}"
-
-          bin=""
-          for c in target/release/minter-desktop \
-                   crates/minter-desktop/src-tauri/target/release/minter-desktop; do
-            [ -x "$c" ] && bin="$c" && break
-          done
-          [ -n "$bin" ] || { echo "minter-desktop not found after build" >&2; exit 1; }
-
-          stage="dist/minter-desktop-$ver-linux-x64"
-          mkdir -p "$stage"
-          cp "$bin" "$stage/minter-desktop"
-          chmod 755 "$stage/minter-desktop"
-          # Ship the server-side runner and unit next to the binary so the
-          # installer never has to reach back into the source tree.
-          cp deploy/linux/start-minter-vnc.sh "$stage/"
-          cp deploy/linux/minter-vps.service "$stage/"
-          for f in README.md SECURITY.md LICENSE-MIT LICENSE-APACHE NOTICE USER_GUIDE.md; do
-            [ -f "$f" ] && cp "$f" "$stage/"
-          done
-          [ -f docs/OPERATOR_GUIDE.md ] && cp docs/OPERATOR_GUIDE.md "$stage/"
-
-          name="minter-desktop-$ver-linux-x64.tar.gz"
-          tar -czf "dist/$name" -C dist "minter-desktop-$ver-linux-x64"
-          # Hash recorded with the bare filename so `sha256sum -c` works from
-          # whatever directory the operator downloaded into.
-          ( cd dist && sha256sum "$name" > "$name.sha256" )
-          # Surfaced in the build log so a glibc regression is caught here and
-          # not by an operator whose server refuses to start the binary.
-          echo "highest glibc symbol required:"
-          objdump -T "$stage/minter-desktop" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -3
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-linux
-          path: |
-            dist/*.tar.gz
-            dist/*.sha256
-
   release:
     name: Publish release
-    needs: [windows, linux]
+    needs: [windows]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:

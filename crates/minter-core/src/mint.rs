@@ -2323,39 +2323,46 @@ pub async fn run_opensea_mint(
             Option<PrefetchedMintTx>,
         )> = tokio::task::JoinSet::new();
 
-
         let ws_clients = rpc.ws_clients();
         if !ws_clients.is_empty() {
             report_phase(
                 &*reporter,
                 "wait",
-                format!("🚀 ReactiveEngine: WebSockets Active ({} nodes)", ws_clients.len()),
+                format!(
+                    "Reactive transport: {} WebSocket node(s) configured; connecting",
+                    ws_clients.len()
+                ),
             );
         }
         let reactive_engine = crate::reactive::ReactiveEngine::new(ws_clients);
-
-        // ── Activate high-resolution timers for the fire-critical window ──
-        // On Windows this calls timeBeginPeriod(1), ensuring sleep(1ms) ≈ 1ms
-        // instead of ≈15.6ms. The guard restores default resolution on drop.
-        let _timer_guard = crate::timer_resolution::TimerResolutionGuard::activate();
+        let mut last_active_ws = None;
+        let mut timer_guard = None;
 
         loop {
             if cancelled(&cancel) {
                 bail!("Mint cancelled while waiting for phase open");
             }
-            
-            // 1. Reactive Trigger (blockchain timestamp)
-            let latest_block_ts = reactive_engine.latest_block_timestamp();
-            if latest_block_ts > 0 && latest_block_ts as i64 >= start_ts {
-                crate::rlog!("REACTIVE TRIGGER: Block timestamp {} >= target {}. FIRE!", latest_block_ts, start_ts);
-                break;
-            }
-
-            // 2. Wall Clock Trigger (fallback)
             let wall_ms = chrono::Utc::now().timestamp_millis();
             let remaining_ms = target_ms.saturating_sub(wall_ms);
             if remaining_ms <= 0 {
                 break;
+            }
+            if timer_guard.is_none() && remaining_ms <= 5_000 {
+                timer_guard = Some(crate::timer_resolution::TimerResolutionGuard::activate());
+            }
+
+            let active_ws = reactive_engine.active_subscriptions();
+            if last_active_ws != Some(active_ws) {
+                let message = if active_ws == 0 {
+                    "Reactive transport: WS unavailable; verified HTTP fallback armed".to_string()
+                } else {
+                    format!(
+                        "Reactive transport ready: {active_ws}/{} WS subscription(s) healthy; HTTP fallback armed",
+                        ws_clients.len()
+                    )
+                };
+                report_phase(reporter.as_ref(), "wait", message);
+                last_active_ws = Some(active_ws);
             }
             let left = remaining_ms.saturating_add(999) / 1000;
 
@@ -2680,6 +2687,7 @@ pub async fn run_opensea_mint(
             };
             tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
         }
+        drop(timer_guard);
 
         if !prep_frozen {
             // We reached T0 before the 50ms freeze branch could run. Never do

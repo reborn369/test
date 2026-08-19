@@ -90,16 +90,48 @@ impl RpcClient {
             builder = builder.proxy(proxy);
         }
         let client = builder.build().context("build RPC HTTP client")?;
-        
-        let ws_clients: Vec<_> = urls
+
+        let ws_urls: Vec<String> = urls
             .iter()
             .filter(|u| u.starts_with("ws://") || u.starts_with("wss://"))
-            .map(|u| crate::ws::WsClient::spawn(u.clone()))
+            .cloned()
             .collect();
+        let ws_clients = ws_urls
+            .iter()
+            .cloned()
+            .map(crate::ws::WsClient::spawn)
+            .collect();
+
+        // Receipt polling and the verified fallback always need HTTP. Most EVM
+        // providers expose HTTP and WS JSON-RPC on the same URL, so derive the
+        // counterpart when an operator configured WSS only. Explicit HTTP URLs
+        // retain their original order and remain the preferred fallback.
+        let mut http_urls: Vec<String> = urls
+            .iter()
+            .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
+            .cloned()
+            .collect();
+        for ws_url in &ws_urls {
+            let http_url = ws_url
+                .strip_prefix("wss://")
+                .map(|rest| format!("https://{rest}"))
+                .or_else(|| {
+                    ws_url
+                        .strip_prefix("ws://")
+                        .map(|rest| format!("http://{rest}"))
+                });
+            if let Some(http_url) = http_url
+                && !http_urls
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(&http_url))
+            {
+                http_urls.push(http_url);
+            }
+        }
 
         Ok(Self {
             client,
-            urls: urls.into_iter().filter(|u| u.starts_with("http")).collect(),
+            urls: http_urls,
             next_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             tuning: RpcTuning::from_lookup(|k| std::env::var(k).ok()),
             ws_clients,
@@ -108,6 +140,13 @@ impl RpcClient {
 
     pub fn ws_clients(&self) -> &[crate::ws::WsClient] {
         &self.ws_clients
+    }
+
+    pub fn connected_ws_count(&self) -> usize {
+        self.ws_clients
+            .iter()
+            .filter(|client| client.is_connected())
+            .count()
     }
 
     pub fn short_url(url: &str) -> String {
@@ -780,47 +819,28 @@ impl RpcClient {
             .take(self.tuning.max_nodes)
             .cloned()
             .collect();
-        let max_attempts = urls.len();
-        
-        // Ensure we have either HTTP or WS urls
-        if max_attempts == 0 && self.ws_clients.is_empty() {
-            bail!("No RPC URLs configured (HTTP or WS)");
+        let http_attempts = urls.len();
+        if http_attempts == 0 {
+            bail!("No HTTP RPC URLs configured for verified broadcast and receipt fallback");
         }
 
         // Pre-build the JSON-RPC request body once (outside the fan-out loop).
         // This moves hex encoding, string formatting, JSON AST construction, and
         // serde serialization off the hot path — they used to run per-endpoint.
         let raw_hex = format!("0x{}", hex::encode(raw));
-        
-        // 1. FAST PATH: Blast raw JSON over all open WebSockets instantly.
-        if !self.ws_clients.is_empty() {
-            let ws_payload = json!({
-                "jsonrpc": "2.0",
-                "id": 999999, // Fire-and-forget ID
-                "method": "eth_sendRawTransaction",
-                "params": [&raw_hex],
-            }).to_string();
-            
-            for ws in &self.ws_clients {
-                ws.send_raw_json(ws_payload.clone());
-            }
-            crate::rlog!("RPC blasted via {} WebSocket(s)", self.ws_clients.len());
-        }
-
-        if max_attempts == 0 {
-            // Only WS configured, return a synthetic report
-            return Ok(SendReport {
-                hash: B256::default(), // caller usually ignores hash
-                winner: "websocket".to_string(),
-                nodes_tried: self.ws_clients.len(),
-                losers: vec![],
-            });
-        }
+        let expected_hash = alloy_primitives::keccak256(raw.as_ref());
+        let connected_ws: Vec<_> = self
+            .ws_clients
+            .iter()
+            .filter(|client| client.is_connected())
+            .cloned()
+            .collect();
+        let max_attempts = http_attempts + connected_ws.len();
 
         let prebuilt_body: Vec<u8> = {
             let base_id = self
                 .next_id
-                .fetch_add(max_attempts as u64, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(http_attempts as u64, std::sync::atomic::Ordering::Relaxed);
             // Build with base_id; each endpoint gets its own id patched below.
             let body = json!({
                 "jsonrpc": "2.0",
@@ -842,11 +862,30 @@ impl RpcClient {
             String,
             std::result::Result<serde_json::Value, String>,
         )> = tokio::task::JoinSet::new();
+
+        // Persistent WS sends start first, but are bounded and acknowledged.
+        // The verified HTTP path below always starts as well and stays alive
+        // after the first ACK, so WebSocket remains an accelerator, not a SPOF.
+        for (index, ws) in connected_ws.into_iter().enumerate() {
+            let raw_hex = raw_hex.clone();
+            set.spawn(async move {
+                let result = ws
+                    .call_timeout(
+                        "eth_sendRawTransaction",
+                        json!([raw_hex]),
+                        Duration::from_millis(1_500),
+                    )
+                    .await
+                    .map_err(|error| error.to_string());
+                (format!("websocket#{}", index + 1), result)
+            });
+        }
+
         for (attempt, url) in urls.into_iter().enumerate() {
             crate::rlog!(
                 "RPC send attempt {}/{} via {}",
                 attempt + 1,
-                max_attempts,
+                http_attempts,
                 Self::short_url(&url)
             );
             let client = self.client.clone();
@@ -860,30 +899,32 @@ impl RpcClient {
                         .body(body_bytes.as_ref().clone())
                         .send()
                         .await
-                        .with_context(|| format!("RPC eth_sendRawTransaction request failed via {short}"))?;
+                        .with_context(|| {
+                            format!("RPC eth_sendRawTransaction request failed via {short}")
+                        })?;
                     let status = resp.status();
-                    let text = resp
-                        .text()
-                        .await
-                        .with_context(|| format!("RPC eth_sendRawTransaction: failed to read response from {short}"))?;
+                    let text = resp.text().await.with_context(|| {
+                        format!("RPC eth_sendRawTransaction: failed to read response from {short}")
+                    })?;
                     if !status.is_success() {
                         bail!(
                             "RPC eth_sendRawTransaction HTTP {status} via {short}: {}",
                             crate::safe_truncate(&text, 240)
                         );
                     }
-                    let data: serde_json::Value = serde_json::from_str(&text).with_context(|| {
-                        format!(
-                            "RPC eth_sendRawTransaction: bad JSON from {short}: {}",
-                            crate::safe_truncate(&text, 240)
-                        )
-                    })?;
+                    let data: serde_json::Value =
+                        serde_json::from_str(&text).with_context(|| {
+                            format!(
+                                "RPC eth_sendRawTransaction: bad JSON from {short}: {}",
+                                crate::safe_truncate(&text, 240)
+                            )
+                        })?;
                     if let Some(error) = data.get("error") {
                         bail!("RPC eth_sendRawTransaction via {short} error: {error}");
                     }
-                    data.get("result")
-                        .cloned()
-                        .with_context(|| format!("RPC eth_sendRawTransaction via {short}: no result"))
+                    data.get("result").cloned().with_context(|| {
+                        format!("RPC eth_sendRawTransaction via {short}: no result")
+                    })
                 })
                 .await
                 {
@@ -919,6 +960,16 @@ impl RpcClient {
                             continue;
                         }
                     };
+                    if hash != expected_hash {
+                        let msg = format!(
+                            "{}: node returned unexpected tx hash {}",
+                            Self::short_url(&url),
+                            hash
+                        );
+                        crate::rlog!("RPC send failed: {}", msg);
+                        losers.push(msg);
+                        continue;
+                    }
                     let winner = Self::short_url(&url);
                     if losers.is_empty() {
                         crate::rlog!("RPC send OK via {}", winner);
@@ -1499,7 +1550,11 @@ mod tests {
     async fn send_report_records_winner_and_losers() {
         // Lead node errors; second node accepts the tx. The report should name
         // the winner and carry the loser's error.
-        let hash_hex = format!("0x{}", "11".repeat(32));
+        let raw = Bytes::from(vec![1u8, 2, 3]);
+        let hash_hex = format!(
+            "0x{}",
+            hex::encode(alloy_primitives::keccak256(raw.as_ref()).as_slice())
+        );
         let bad = spawn_mock(
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"nope\"}}"
                 .to_string(),
@@ -1508,13 +1563,31 @@ mod tests {
         let good = spawn_mock(ok_body(&hash_hex), Duration::ZERO);
         let good_short = RpcClient::short_url(&good);
         let rpc = RpcClient::new(vec![bad, good]);
-        let raw = Bytes::from(vec![1u8, 2, 3]);
         let report = rpc.send_raw_transaction_report(&raw).await.unwrap();
         assert_eq!(report.hash, hash_hex.parse::<B256>().unwrap());
         assert_eq!(report.winner, good_short);
         assert_eq!(report.nodes_tried, 2);
         assert_eq!(report.losers.len(), 1, "the failed lead node is recorded");
         assert!(report.losers[0].contains("nope"));
+    }
+
+    #[tokio::test]
+    async fn send_report_rejects_unexpected_transaction_hash() {
+        let endpoint = spawn_mock(ok_body(&format!("0x{}", "11".repeat(32))), Duration::ZERO);
+        let rpc = RpcClient::new(vec![endpoint]);
+        let error = rpc
+            .send_raw_transaction_report(&Bytes::from(vec![1u8, 2, 3]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unexpected tx hash"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn wss_only_configuration_derives_http_fallback() {
+        let rpc = RpcClient::new(vec!["ws://127.0.0.1:9/provider".to_string()]);
+        assert_eq!(rpc.urls, vec!["http://127.0.0.1:9/provider"]);
+        assert_eq!(rpc.ws_clients.len(), 1);
     }
 
     #[tokio::test]

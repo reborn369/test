@@ -197,26 +197,21 @@ async fn sleep_until_unix(target: i64, cancel: &Option<Arc<AtomicBool>>) -> Resu
 async fn sleep_until_fire(
     target_unix: i64,
     cancel: &Option<Arc<AtomicBool>>,
-    reactive: &Option<crate::reactive::ReactiveEngine>,
 ) -> Result<(), String> {
     let target_ms = target_unix.saturating_mul(1000);
+    let mut timer_guard = None;
     loop {
         if cancelled(cancel) {
             return Err("cancelled by user".into());
-        }
-
-        // Reactive check: if blockchain timestamp >= target, fire early!
-        if let Some(engine) = reactive {
-            let block_ts = engine.latest_block_timestamp();
-            if block_ts > 0 && (block_ts as i64) >= target_unix {
-                return Ok(());
-            }
         }
 
         let now = now_unix_ms();
         let rem = target_ms - now;
         if rem <= 0 {
             return Ok(());
+        }
+        if timer_guard.is_none() && rem <= 5_000 {
+            timer_guard = Some(crate::timer_resolution::TimerResolutionGuard::activate());
         }
         if rem > 2_000 {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -614,12 +609,6 @@ pub async fn run_raw_sniper(
         )),
     );
 
-
-    // ── Activate high-resolution timers for the fire-critical window ──
-    // On Windows this calls timeBeginPeriod(1), ensuring sleep(1ms) ≈ 1ms
-    // instead of ≈15.6ms. The guard restores default resolution on drop.
-    let _timer_guard = crate::timer_resolution::TimerResolutionGuard::activate();
-
     // ── Wait until prep window (at_time − PREP_LEAD) ──
     if let Some(at) = fire_at {
         let prep_at = at.saturating_sub(PREP_LEAD_SECS);
@@ -835,18 +824,19 @@ pub async fn run_raw_sniper(
 
     // ── Clock fire ──
     let ws_clients = rpc.ws_clients();
-    let reactive_engine = if ws_clients.is_empty() {
-        None
-    } else {
+    if !ws_clients.is_empty() {
         report(
             &reporter,
             MintEvent::phase(
                 "wait",
-                format!("🚀 ReactiveEngine: WebSockets Active ({} nodes)", ws_clients.len()),
+                format!(
+                    "Reactive transport: {}/{} WebSocket node(s) connected; verified HTTP fallback armed",
+                    rpc.connected_ws_count(),
+                    ws_clients.len()
+                ),
             ),
         );
-        Some(crate::reactive::ReactiveEngine::new(ws_clients))
-    };
+    }
 
     if let Some(at) = fire_at {
         let now = now_unix();
@@ -858,7 +848,7 @@ pub async fn run_raw_sniper(
                     format!("Armed — firing in {}s (clock {at})", at - now),
                 ),
             );
-            if let Err(e) = sleep_until_fire(at, &cancel, &reactive_engine).await {
+            if let Err(e) = sleep_until_fire(at, &cancel).await {
                 return fail_all(signers, e);
             }
         } else {

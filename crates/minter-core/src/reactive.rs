@@ -1,88 +1,171 @@
-
-use std::sync::atomic::{AtomicU64, Ordering};
+use serde_json::Value;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
+use tokio::sync::broadcast;
 
-/// Engine that listens to blockchain events (newHeads) to trigger mints
-/// reactively based on actual block time.
+const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
+const SUBSCRIBE_RETRY: Duration = Duration::from_secs(1);
+
+/// Tracks healthy `newHeads` subscriptions on all configured WebSocket nodes.
+///
+/// A subscription is recreated after every reconnect. Block timestamps are kept
+/// for diagnostics only: a remote producer timestamp is not a safe indication
+/// that a sale is open, so it never advances the wall-clock fire decision.
 pub struct ReactiveEngine {
     latest_block_timestamp: Arc<AtomicU64>,
+    active_subscriptions: Arc<AtomicUsize>,
 }
 
 impl ReactiveEngine {
     pub fn new(ws_clients: &[crate::ws::WsClient]) -> Self {
         let latest_block_timestamp = Arc::new(AtomicU64::new(0));
+        let active_subscriptions = Arc::new(AtomicUsize::new(0));
 
-        for (i, ws) in ws_clients.iter().enumerate() {
-            let ws_clone = ws.clone();
-            let ts_ref = latest_block_timestamp.clone();
-            
+        for (index, ws) in ws_clients.iter().cloned().enumerate() {
+            let timestamp = Arc::clone(&latest_block_timestamp);
+            let active = Arc::clone(&active_subscriptions);
             tokio::spawn(async move {
-                // Subscribe to newHeads
-                if let Ok(_sub_id) = ws_clone.eth_subscribe("newHeads", None).await {
-                    crate::rlog!("ReactiveEngine [Node {}]: Subscribed to newHeads for precise timing.", i + 1);
-                    let mut rx = ws_clone.subscribe();
-                    while let Ok(val) = rx.recv().await {
-                        if let Some(result) = val.get("result") {
-                            if let Some(timestamp_hex) = result.get("timestamp").and_then(|t| t.as_str()) {
-                                let ts_clean = timestamp_hex.trim_start_matches("0x");
-                                if let Ok(block_ts) = u64::from_str_radix(ts_clean, 16) {
-                                    // Update if higher (race condition safe)
-                                    let current = ts_ref.load(Ordering::Relaxed);
-                                    if block_ts > current {
-                                        ts_ref.store(block_ts, Ordering::SeqCst);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    crate::rlog!("ReactiveEngine [Node {}]: Failed to subscribe to newHeads", i + 1);
-                }
+                monitor_new_heads(index + 1, ws, timestamp, active).await;
             });
         }
 
         Self {
             latest_block_timestamp,
+            active_subscriptions,
         }
     }
 
-    /// Returns the latest block timestamp observed from the WebSocket subscription.
-    /// Returns 0 if no WebSocket is available or no block has been observed yet.
     pub fn latest_block_timestamp(&self) -> u64 {
-        self.latest_block_timestamp.load(Ordering::SeqCst)
+        self.latest_block_timestamp.load(Ordering::Acquire)
     }
 
-    /// Spawns a background task to listen for pending transactions to the target contract.
-    /// Useful for mempool sniping (back-running a state-changing transaction like unpause).
-    pub fn listen_mempool(
-        &self,
-        ws_clients: &[crate::ws::WsClient],
-        target_contract: alloy_primitives::Address,
-        trigger_flag: Arc<std::sync::atomic::AtomicBool>,
-    ) {
-        for (i, ws) in ws_clients.iter().enumerate() {
-            let ws_clone = ws.clone();
-            let trigger = trigger_flag.clone();
-            tokio::spawn(async move {
-                // Subscribe to full pending transactions
-                if let Ok(_sub_id) = ws_clone.eth_subscribe("newPendingTransactions", None).await {
-                    crate::rlog!("ReactiveEngine [Node {}]: Subscribed to mempool for contract {:?}", i + 1, target_contract);
-                    let mut rx = ws_clone.subscribe();
-                    let target_hex = format!("{:?}", target_contract).to_lowercase();
-                    
-                    while let Ok(val) = rx.recv().await {
-                        if let Some(result) = val.get("result") {
-                            if let Some(to_addr) = result.get("to").and_then(|t| t.as_str()) {
-                                if to_addr.to_lowercase() == target_hex {
-                                    crate::rlog!("REACTIVE MEMPOOL TRIGGER [Node {}]: Found tx to target contract!", i + 1);
-                                    trigger.store(true, Ordering::SeqCst);
-                                    break;
-                                }
-                            }
+    pub fn active_subscriptions(&self) -> usize {
+        self.active_subscriptions.load(Ordering::Acquire)
+    }
+}
+
+async fn monitor_new_heads(
+    node: usize,
+    ws: crate::ws::WsClient,
+    latest_timestamp: Arc<AtomicU64>,
+    active_subscriptions: Arc<AtomicUsize>,
+) {
+    let mut status = ws.subscribe_status();
+    loop {
+        while !status.borrow().connected {
+            if status.changed().await.is_err() {
+                return;
+            }
+        }
+
+        let generation = status.borrow().generation;
+        let mut events = ws.subscribe();
+        let subscription_id = match ws
+            .eth_subscribe_timeout("newHeads", None, SUBSCRIBE_TIMEOUT)
+            .await
+        {
+            Ok(id) => id,
+            Err(error) => {
+                crate::rlog!("ReactiveEngine [Node {node}]: subscribe failed: {error}");
+                tokio::select! {
+                    _ = tokio::time::sleep(SUBSCRIBE_RETRY) => {},
+                    changed = status.changed() => {
+                        if changed.is_err() {
+                            return;
                         }
                     }
                 }
-            });
+                continue;
+            }
+        };
+
+        active_subscriptions.fetch_add(1, Ordering::AcqRel);
+        crate::rlog!("ReactiveEngine [Node {node}]: newHeads active");
+
+        loop {
+            tokio::select! {
+                changed = status.changed() => {
+                    if changed.is_err() {
+                        active_subscriptions.fetch_sub(1, Ordering::AcqRel);
+                        return;
+                    }
+                    let current = *status.borrow();
+                    if !current.connected || current.generation != generation {
+                        break;
+                    }
+                }
+                event = events.recv() => {
+                    match event {
+                        Ok(params) => update_timestamp(
+                            &params,
+                            &subscription_id,
+                            latest_timestamp.as_ref(),
+                        ),
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            active_subscriptions.fetch_sub(1, Ordering::AcqRel);
+                            return;
+                        }
+                    }
+                }
+            }
         }
+
+        active_subscriptions.fetch_sub(1, Ordering::AcqRel);
+        crate::rlog!("ReactiveEngine [Node {node}]: reconnecting subscription");
+    }
+}
+
+fn update_timestamp(params: &Value, subscription_id: &str, latest: &AtomicU64) {
+    if params.get("subscription").and_then(Value::as_str) != Some(subscription_id) {
+        return;
+    }
+    let Some(timestamp_hex) = params
+        .get("result")
+        .and_then(|result| result.get("timestamp"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    let Ok(block_timestamp) = u64::from_str_radix(timestamp_hex.trim_start_matches("0x"), 16)
+    else {
+        return;
+    };
+    latest.fetch_max(block_timestamp, Ordering::AcqRel);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::update_timestamp;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn only_matching_subscription_updates_timestamp() {
+        let latest = AtomicU64::new(0);
+        update_timestamp(
+            &json!({"subscription":"other","result":{"timestamp":"0x64"}}),
+            "wanted",
+            &latest,
+        );
+        assert_eq!(latest.load(Ordering::Relaxed), 0);
+        update_timestamp(
+            &json!({"subscription":"wanted","result":{"timestamp":"0x64"}}),
+            "wanted",
+            &latest,
+        );
+        assert_eq!(latest.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn timestamp_never_moves_backwards() {
+        let latest = AtomicU64::new(100);
+        update_timestamp(
+            &json!({"subscription":"wanted","result":{"timestamp":"0x50"}}),
+            "wanted",
+            &latest,
+        );
+        assert_eq!(latest.load(Ordering::Relaxed), 100);
     }
 }

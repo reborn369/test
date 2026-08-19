@@ -4613,3 +4613,516 @@ textarea#add-key {
 .update-dismiss:hover {
   opacity: 1;
 }
+
+/* ============================================================
+   Reactive UI 2026
+   One quiet, performance-minded presentation layer. The DOM contract and
+   all element ids stay intact; this section intentionally changes only UI.
+   ============================================================ */
+:root {
+  --bg: #0b0e14;
+  --bg-gradient: #0b0e14;
+  --bg-elevated: #111620;
+  --bg-sidebar: #0d1118;
+  --card: #121821;
+  --card-hover: #171e29;
+  --card-2: #0f141d;
+  --border: #242c39;
+  --border-soft: #1b2330;
+  --text: #f3f6fb;
+  --muted: #939dad;
+  --muted-2: #687386;
+  --accent: #7c6cff;
+  --accent-2: #8c7fff;
+  --accent-hover: #8b7dff;
+  --accent-border: rgba(139, 125, 255, 0.55);
+  --accent-soft: rgba(124, 108, 255, 0.12);
+  --accent-ink: #c9c2ff;
+  --green: #4fd19a;
+  --yellow: #f1c75b;
+  --red: #ff737d;
+  --control-h: 38px;
+  --sidebar-w: 216px;
+  --radius: 12px;
+  --radius-sm: 9px;
+  --shadow-sm: none;
+  --shadow-md: none;
+  --shadow-lg: 0 18px 48px rgba(0, 0, 0, 0.42);
+  --t-fast: 110ms;
+  --t: 150ms;
+  --t-slow: 180ms;
+}
+
+html,
+body {
+  background: var(--bg);
+}
+
+body {
+  letter-spacing: -0.005em;
+}
+
+/* The content viewport is the only app-level scrolling surface. */
+.sidebar {
+  width: var(--sidebar-w);
+  padding: 10px 9px;
+  overflow: hidden;
+  background: var(--bg-sidebar);
+}
+
+.sidebar-brand {
+  min-height: 50px;
+  gap: 10px;
+  padding: 3px 7px 9px;
+}
+
+.brand-mark {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: #151b25;
+}
+
+.brand-mark img {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+}
+
+.brand-name {
+  font-size: 0.88rem;
+  letter-spacing: 0.065em;
+}
+
+.brand-edition {
+  display: inline-block;
+  margin-left: 3px;
+  padding: 1px 4px;
+  border: 1px solid rgba(124, 108, 255, 0.52);
+  border-radius: 4px;
+  color: var(--accent-ink);
+  font-size: 0.58em;
+  line-height: 1.25;
+  letter-spacing: 0.05em;
+  vertical-align: middle;
+}
+
+.brand-tag {
+  color: var(--muted-2);
+  font-size: 0.62rem;
+  letter-spacing: 0.08em;
+}
+
+.sidebar-nav {
+  gap: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+}
+
+.sidebar-nav::-webkit-scrollbar {
+  display: none;
+}
+
+.nav-group {
+  gap: 1px;
+  margin-bottom: 3px;
+}
+
+.nav-group-label {
+  padding: 5px 9px 3px;
+  font-size: 0.59rem;
+  letter-spacing: 0.11em;
+}
+
+.nav-item {
+  min-height: 32px;
+  gap: 9px;
+  padding: 6px 9px;
+  border: 0;
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  transition: background-color var(--t-fast) ease, color var(--t-fast) ease;
+}
+
+.nav-item:hover:not(.active) {
+  transform: none;
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.nav-item.active {
+  animation: none;
+  background: var(--accent-soft);
+  color: var(--text);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.nav-ico {
+  width: 18px;
+  height: 18px;
+  color: var(--muted-2);
+}
+
+.sidebar-foot {
+  margin-top: 4px;
+  padding-top: 6px;
+}
+
+.creator-block {
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 2px 8px;
+  margin: 5px 8px 0;
+  padding: 5px 0 0;
+}
+
+.creator-block .muted {
+  display: none;
+}
+
+.creator-link {
+  font-size: 0.66rem;
+}
+
+.app-version {
+  margin: 3px 8px 0;
+  font-size: 0.63rem;
+}
+
+.main-col,
+.topbar {
+  background: var(--bg);
+}
+
+.topbar {
+  min-height: 66px;
+  align-items: center;
+  padding: 11px 22px;
+  backdrop-filter: none;
+}
+
+.topbar h1 {
+  margin-bottom: 2px;
+  font-size: 1.25rem;
+  font-weight: 680;
+}
+
+.status-bar {
+  gap: 14px;
+  margin-top: 1px;
+  line-height: 1.35;
+}
+
+.content {
+  padding: 20px 24px 72px;
+  scrollbar-gutter: stable;
+  scrollbar-color: #343e4d transparent;
+  scrollbar-width: thin;
+}
+
+.content::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.content::-webkit-scrollbar-thumb {
+  border-radius: 8px;
+  background: #343e4d;
+}
+
+.page {
+  width: 100%;
+  max-width: 1180px;
+  margin-inline: auto;
+  animation: none;
+}
+
+.page-subhead {
+  margin-bottom: 10px;
+}
+
+.page-subhead-title {
+  font-size: 1.08rem;
+}
+
+/* Flat surfaces give controls and live state priority over decoration. */
+.card,
+.panel,
+.group-card,
+.raw-card,
+.cost-card,
+.home-launch-card,
+.last-run-panel,
+.raw-probe-card,
+.unlock-card,
+.mc-panel,
+.cmd-card,
+.modal-card {
+  background: var(--card);
+  border-color: var(--border);
+  border-radius: var(--radius);
+  box-shadow: none;
+}
+
+.card::before,
+.panel::before,
+.group-card::before,
+.home-launch-card::before {
+  content: none;
+}
+
+.panel,
+.hint-card,
+.card,
+.settings-section,
+.raw-card {
+  padding: 14px;
+  margin-bottom: 12px;
+}
+
+.panel.nest {
+  border-radius: 0;
+  background: transparent;
+}
+
+.group-card-head {
+  padding: 12px 14px;
+  background: var(--card-2);
+}
+
+.stat-grid {
+  gap: 8px;
+}
+
+.stat-card {
+  padding: 11px 12px;
+  background: var(--card);
+}
+
+.home-launch-grid {
+  gap: 12px;
+}
+
+.home-launch-card,
+.run-card {
+  transition: border-color var(--t-fast) ease, background-color var(--t-fast) ease;
+}
+
+.home-launch-card:hover,
+.run-card:hover {
+  transform: none;
+  border-color: var(--accent-border);
+  background: var(--card-hover);
+  box-shadow: none;
+}
+
+button,
+.primary,
+.ghost-btn,
+.danger-btn,
+.spend-btn,
+.chip,
+.seg-btn,
+.raw-mode-chip,
+.filter-chip,
+.btn-group {
+  transition: background-color var(--t-fast) ease, border-color var(--t-fast) ease,
+    color var(--t-fast) ease, opacity var(--t-fast) ease;
+}
+
+button:active:not(:disabled),
+.primary:active:not(:disabled),
+.spend-btn:active:not(:disabled),
+.ghost-btn:active:not(:disabled),
+.danger-btn:active:not(:disabled),
+.chip:active,
+.nav-item:active {
+  transform: none;
+}
+
+button.primary,
+.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  box-shadow: none;
+}
+
+button.primary:hover:not(:disabled),
+.primary:hover:not(:disabled) {
+  transform: none;
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  box-shadow: none;
+}
+
+button.spend-btn,
+.spend-btn {
+  background: var(--green);
+  border-color: var(--green);
+  box-shadow: none;
+}
+
+input[type="password"],
+input[type="text"],
+input[type="number"],
+input[type="datetime-local"],
+select,
+textarea,
+.code {
+  background: #0c1118;
+  border-color: var(--border);
+}
+
+input:focus,
+select:focus,
+textarea:focus,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  border-color: var(--accent-border);
+  box-shadow: 0 0 0 2px rgba(124, 108, 255, 0.13);
+}
+
+.data-table th {
+  background: var(--card-2);
+  color: var(--muted);
+}
+
+.data-table tbody tr:hover {
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.modal-overlay,
+.mc-overlay,
+.cmd-overlay {
+  backdrop-filter: none;
+}
+
+.modal-overlay:not(.hidden),
+.modal-overlay:not(.hidden) .modal-card,
+.mc-overlay:not(.hidden) .mc-panel,
+.cmd-overlay:not(.hidden) .cmd-card,
+.toast,
+details.collapsible[open] > *:not(summary),
+details.settings-acc[open] > .settings-acc-body,
+details.raw-card[open] > *:not(summary),
+details.raw-wallets-acc[open] > *:not(summary),
+details.raw-advanced[open] > *:not(summary),
+details.raw-log-acc[open] > *:not(summary),
+details.panel[open] > *:not(summary),
+.nav-live-dot,
+.tool-dot,
+.group-dot {
+  animation: none;
+}
+
+.mint-phase-banner.mint-phase-done,
+.mint-phase-banner.mint-phase-fire {
+  box-shadow: none;
+}
+
+.update-banner {
+  border-radius: 10px;
+  background: #171d2a;
+  box-shadow: var(--shadow-lg);
+}
+
+.unlock-view {
+  background: var(--bg);
+}
+
+.unlock-card {
+  padding: 30px 28px 26px;
+  border-radius: 16px;
+  box-shadow: var(--shadow-lg);
+}
+
+.unlock-card .brand-mark.large {
+  width: 72px;
+  height: 72px;
+  margin: 0 auto 14px;
+  border: 0;
+  background: transparent;
+}
+
+.unlock-card .brand-mark.large img {
+  width: 72px;
+  height: 72px;
+}
+
+@media (max-height: 720px) {
+  .sidebar {
+    padding-block: 7px;
+  }
+
+  .sidebar-brand {
+    min-height: 42px;
+    padding-bottom: 5px;
+  }
+
+  .brand-mark {
+    width: 32px;
+    height: 32px;
+  }
+
+  .brand-mark img {
+    width: 29px;
+    height: 29px;
+  }
+
+  .nav-group-label {
+    padding-top: 3px;
+  }
+
+  .nav-item {
+    min-height: 29px;
+    padding-block: 4px;
+  }
+
+  .creator-block {
+    display: none;
+  }
+}
+
+@media (max-width: 900px) {
+  :root {
+    --sidebar-w: 64px;
+  }
+
+  .sidebar {
+    width: var(--sidebar-w);
+    padding-inline: 7px;
+  }
+
+  .sidebar-brand {
+    justify-content: center;
+    padding-inline: 0;
+  }
+
+  .nav-group-label,
+  .brand-text,
+  .creator-block,
+  .app-version,
+  .nav-item span:not(.nav-ico):not(.nav-live-dot) {
+    display: none;
+  }
+
+  .nav-group {
+    margin-bottom: 2px;
+  }
+
+  .nav-item {
+    justify-content: center;
+    padding-inline: 7px;
+  }
+
+  .nav-item.active {
+    box-shadow: inset 0 0 0 1px var(--accent-border);
+  }
+
+  .content {
+    padding-inline: 18px;
+  }
+}

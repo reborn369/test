@@ -1,10 +1,11 @@
 /* MINTER — dark operator dashboard (Linear / Raycast / GitHub Dark) */
 
 :root {
-  --bg: #0b0d13;
+  --bg: #090a0f;
+  --bg-gradient: radial-gradient(circle at 50% 0%, #151928 0%, #090a0f 60%);
   --bg-elevated: #10131a;
   --bg-sidebar: #0c0e14;
-  --card: #1a1e28;
+  --card: rgba(26, 30, 40, 0.7);
   --card-hover: #1f2430;
   --card-2: #181c26;
   --border: #252a36;
@@ -61,7 +62,7 @@
 
 body {
   margin: 0;
-  background: var(--bg);
+  background: var(--bg-gradient);
   color: var(--text);
   min-height: 100vh;
   overflow: hidden;

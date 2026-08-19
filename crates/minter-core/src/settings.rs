@@ -25,6 +25,9 @@ pub struct Settings {
     pub rpc_url_ethereum: String,
     pub rpc_url_base: String,
     pub rpc_url_polygon: String,
+    pub rpc_url_robinhood: String,
+    pub rpc_url_arbitrum: String,
+    pub rpc_url_optimism: String,
     /// Proxies: one per line (host:port:user:pass, socks5://…, http://…).
     /// Field name kept as `proxy_url` for backward-compatible config.json.
     pub proxy_url: String,
@@ -80,6 +83,9 @@ impl Default for Settings {
             rpc_url_ethereum: String::new(),
             rpc_url_base: String::new(),
             rpc_url_polygon: String::new(),
+            rpc_url_robinhood: String::new(),
+            rpc_url_arbitrum: String::new(),
+            rpc_url_optimism: String::new(),
             proxy_url: String::new(),
             flashbots_relay_url: String::new(),
             flashbots_max_blocks: 3,
@@ -118,6 +124,9 @@ pub const MANAGED_CONNECTION_ENV_KEYS: &[&str] = &[
     "RPC_URLS_BASE",
     "RPC_URL_POLYGON",
     "POLYGON_RPC_URL",
+    "RPC_URL_ROBINHOOD",
+    "RPC_URL_ARBITRUM",
+    "RPC_URL_OPTIMISM",
 ];
 
 impl Settings {
@@ -165,6 +174,9 @@ impl Settings {
         self.rpc_url_ethereum.clear();
         self.rpc_url_base.clear();
         self.rpc_url_polygon.clear();
+        self.rpc_url_robinhood.clear();
+        self.rpc_url_arbitrum.clear();
+        self.rpc_url_optimism.clear();
     }
 
     /// Drop managed connection keys from an env map, then apply [`to_env_map`].
@@ -228,12 +240,10 @@ impl Settings {
         ) {
             self.rpc_url_base = v;
         }
-        if let Some(v) = take(
-            &self.rpc_url_polygon,
-            &["RPC_URL_POLYGON", "POLYGON_RPC_URL"],
-        ) {
-            self.rpc_url_polygon = v;
-        }
+        if let Some(v) = take(&self.rpc_url_polygon, &["RPC_URL_POLYGON", "POLYGON_RPC_URL"]) { self.rpc_url_polygon = v; }
+        if let Some(v) = take(&self.rpc_url_robinhood, &["RPC_URL_ROBINHOOD"]) { self.rpc_url_robinhood = v; }
+        if let Some(v) = take(&self.rpc_url_arbitrum, &["RPC_URL_ARBITRUM"]) { self.rpc_url_arbitrum = v; }
+        if let Some(v) = take(&self.rpc_url_optimism, &["RPC_URL_OPTIMISM"]) { self.rpc_url_optimism = v; }
         if let Some(v) = take(&self.proxy_url, &["PROXY_URL", "HTTP_PROXY", "HTTPS_PROXY"]) {
             // Single-line env; append if multi-line already empty
             if self.proxy_lines().is_empty() {
@@ -601,14 +611,16 @@ impl Settings {
             );
         }
         if !self.rpc_url_polygon.trim().is_empty() {
-            m.insert(
-                "RPC_URL_POLYGON".to_string(),
-                self.rpc_url_polygon.trim().to_string(),
-            );
-            m.insert(
-                "POLYGON_RPC_URL".to_string(),
-                self.rpc_url_polygon.trim().to_string(),
-            );
+            m.insert("RPC_URL_POLYGON".to_string(), self.rpc_url_polygon.trim().to_string());
+        }
+        if !self.rpc_url_robinhood.trim().is_empty() {
+            m.insert("RPC_URL_ROBINHOOD".to_string(), self.rpc_url_robinhood.trim().to_string());
+        }
+        if !self.rpc_url_arbitrum.trim().is_empty() {
+            m.insert("RPC_URL_ARBITRUM".to_string(), self.rpc_url_arbitrum.trim().to_string());
+        }
+        if !self.rpc_url_optimism.trim().is_empty() {
+            m.insert("RPC_URL_OPTIMISM".to_string(), self.rpc_url_optimism.trim().to_string());
         }
         // First proxy as PROXY_URL for single-proxy helpers; full list lives in proxies.txt
         if let Some(first) = self.proxy_lines().into_iter().next() {
@@ -697,7 +709,7 @@ impl Settings {
             || !self.rpc_urls.trim().is_empty()
             || !self.rpc_url_ethereum.trim().is_empty()
             || !self.rpc_url_base.trim().is_empty()
-            || !self.rpc_url_polygon.trim().is_empty()
+            || !self.rpc_url_polygon.trim().is_empty() || !self.rpc_url_robinhood.trim().is_empty() || !self.rpc_url_arbitrum.trim().is_empty() || !self.rpc_url_optimism.trim().is_empty()
     }
 
     /// Mask secrets for UI display (last 4 chars).

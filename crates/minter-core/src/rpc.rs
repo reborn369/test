@@ -861,6 +861,7 @@ impl RpcClient {
         let mut set: tokio::task::JoinSet<(
             String,
             std::result::Result<serde_json::Value, String>,
+            u64,
         )> = tokio::task::JoinSet::new();
 
         // Persistent WS sends start first, but are bounded and acknowledged.
@@ -869,6 +870,7 @@ impl RpcClient {
         for (index, ws) in connected_ws.into_iter().enumerate() {
             let raw_hex = raw_hex.clone();
             set.spawn(async move {
+                let started = std::time::Instant::now();
                 let result = ws
                     .call_timeout(
                         "eth_sendRawTransaction",
@@ -877,7 +879,11 @@ impl RpcClient {
                     )
                     .await
                     .map_err(|error| error.to_string());
-                (format!("websocket#{}", index + 1), result)
+                (
+                    format!("websocket#{}", index + 1),
+                    result,
+                    started.elapsed().as_millis() as u64,
+                )
             });
         }
 
@@ -891,6 +897,7 @@ impl RpcClient {
             let client = self.client.clone();
             let body_bytes = prebuilt_body.clone();
             set.spawn(async move {
+                let started = std::time::Instant::now();
                 let res = match tokio::time::timeout(timeout, async {
                     let short = Self::short_url(&url);
                     let resp = client
@@ -932,14 +939,14 @@ impl RpcClient {
                     Ok(Err(e)) => Err(e.to_string()),
                     Err(_) => Err(format!("timeout {}s", timeout.as_secs().max(1))),
                 };
-                (url, res)
+                (url, res, started.elapsed().as_millis() as u64)
             });
         }
 
         let mut losers: Vec<String> = Vec::new();
         while let Some(joined) = set.join_next().await {
             match joined {
-                Ok((url, Ok(result))) => {
+                Ok((url, Ok(result), winner_latency_ms)) => {
                     // A node that answers 200 with a non-hash `result` (null, an
                     // object, junk from a flaky load balancer) is a *loser*, not a
                     // fatal error. Propagating with `?` here dropped the JoinSet,
@@ -990,13 +997,15 @@ impl RpcClient {
                         tokio::spawn(async move {
                             while let Some(background) = set.join_next().await {
                                 match background {
-                                    Ok((url, Ok(_))) => crate::rlog!(
-                                        "RPC send fan-out completed via {}",
-                                        Self::short_url(&url)
-                                    ),
-                                    Ok((url, Err(e))) => crate::rlog!(
-                                        "RPC send fan-out failed via {}: {}",
+                                    Ok((url, Ok(_), latency_ms)) => crate::rlog!(
+                                        "RPC send fan-out completed via {} in {}ms",
                                         Self::short_url(&url),
+                                        latency_ms
+                                    ),
+                                    Ok((url, Err(e), latency_ms)) => crate::rlog!(
+                                        "RPC send fan-out failed via {} in {}ms: {}",
+                                        Self::short_url(&url),
+                                        latency_ms,
                                         e
                                     ),
                                     Err(e) => crate::rlog!("RPC send fan-out task join: {e}"),
@@ -1008,11 +1017,14 @@ impl RpcClient {
                         hash,
                         winner,
                         nodes_tried: max_attempts,
+                        winner_latency_ms,
+                        ws_attempts: max_attempts.saturating_sub(http_attempts),
+                        http_attempts,
                         losers,
                     });
                 }
-                Ok((url, Err(e))) => {
-                    let msg = format!("{}: {}", Self::short_url(&url), e);
+                Ok((url, Err(e), latency_ms)) => {
+                    let msg = format!("{} ({}ms): {}", Self::short_url(&url), latency_ms, e);
                     crate::rlog!("RPC send failed: {}", msg);
                     losers.push(msg);
                 }
@@ -1198,6 +1210,12 @@ pub struct SendReport {
     pub winner: String,
     /// Number of endpoints the broadcast fanned out to.
     pub nodes_tried: usize,
+    /// Time from the winning attempt starting until its verified ACK.
+    pub winner_latency_ms: u64,
+    /// Connected persistent WebSocket endpoints included in the fan-out.
+    pub ws_attempts: usize,
+    /// HTTP endpoints included in the fan-out.
+    pub http_attempts: usize,
     /// `"shorturl: error"` for endpoints that errored before the winner.
     pub losers: Vec<String>,
 }
@@ -1567,6 +1585,8 @@ mod tests {
         assert_eq!(report.hash, hash_hex.parse::<B256>().unwrap());
         assert_eq!(report.winner, good_short);
         assert_eq!(report.nodes_tried, 2);
+        assert_eq!(report.ws_attempts, 0);
+        assert_eq!(report.http_attempts, 2);
         assert_eq!(report.losers.len(), 1, "the failed lead node is recorded");
         assert!(report.losers[0].contains("nope"));
     }

@@ -1663,6 +1663,41 @@ pub async fn run_opensea_mint(
         );
         default_pick
     };
+    if opts.phase_index.is_none() {
+        let now = chrono::Utc::now().timestamp();
+        let selected_has_started = stages[pick]
+            .start_time
+            .map(|timestamp| timestamp as i64 <= now)
+            .unwrap_or(true);
+        if selected_has_started
+            && let Some((future_index, future_stage)) = stages
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| opensea::stage_effective_eligible(candidate))
+                .filter(|(_, candidate)| {
+                    opensea::available_mint_quantity(&info, candidate).unwrap_or(0) > 0
+                })
+                .filter(|(_, candidate)| {
+                    candidate
+                        .start_time
+                        .map(|timestamp| timestamp as i64 > now)
+                        .unwrap_or(false)
+                })
+                .min_by_key(|(_, candidate)| candidate.start_time.map(|value| value as i64))
+        {
+            log_always(
+                reporter.as_ref(),
+                format!(
+                    "WARN: Auto selected already-open phase #{} {}; future eligible phase #{} {} opens at unix {:.0}. Select the phase explicitly for a scheduled snipe.",
+                    pick + 1,
+                    opensea::stage_label(&stages[pick]),
+                    future_index + 1,
+                    opensea::stage_label(future_stage),
+                    future_stage.start_time.unwrap_or_default()
+                ),
+            );
+        }
+    }
     let _ = (auto_mode, &phase_labels);
     let stage = &stages[pick];
     log_always(
@@ -2267,6 +2302,17 @@ pub async fn run_opensea_mint(
         // OpenSea stage.start_time is wall-clock (unix). Waiting on eth block.timestamp
         // lags ~1 block (~12s on L1) — that is why logs showed "opens in ~1s" then
         // "Phase is open!" only ~12s later. Fire on wall clock.
+        let target_ms = start_ts.saturating_mul(1000);
+        let before_wait_ms = chrono::Utc::now().timestamp_millis();
+        if before_wait_ms >= target_ms {
+            log_always(
+                reporter.as_ref(),
+                format!(
+                    "WARN: LATE START by {}ms; pre-open preparation and readiness reporting are unavailable, firing immediately",
+                    before_wait_ms.saturating_sub(target_ms)
+                ),
+            );
+        }
         let open_at = chrono::DateTime::from_timestamp(start_ts, 0)
             .map(|d| d.format("%H:%M:%S UTC").to_string())
             .unwrap_or_else(|| start_ts.to_string());
@@ -2279,7 +2325,6 @@ pub async fn run_opensea_mint(
             reporter.as_ref(),
             format!("\nWaiting for phase open (wall clock) at {open_at} (unix={start_ts})"),
         );
-        let target_ms = start_ts.saturating_mul(1000);
         let mut nonce_refreshed = false;
         let mut prefetched = false;
         let mut prep_frozen = false;
@@ -2313,8 +2358,9 @@ pub async fn run_opensea_mint(
             );
         }
         let local_public_prefetch = stage_type_owned == "PUBLIC_SALE" && !use_gql;
-        // Every scheduled phase can now be prepared before T0: whitelist
-        // phases use GQL, while PUBLIC_SALE is built entirely locally.
+        // PUBLIC_SALE can be built locally before T0. Signed phases deliberately
+        // reserve their limited OpenSea mint-action requests for T0 because the
+        // service does not issue transactionSubmissionData before the stage opens.
         let should_prefetch = true;
         let pre_sign_enabled = should_prefetch && !dry_run && !use_flashbots;
 
@@ -3621,12 +3667,14 @@ pub async fn run_opensea_mint(
                         } else {
                             format!(" after {} failed", send_report.losers.len())
                         };
-                        log_always(reporter.as_ref(), format!("[{}] SEND OK {}ms via {}{} ({} node(s) tried) tx={}",
+                        log_always(reporter.as_ref(), format!("[{}] SEND OK {}ms via {}{} (fanout ws={} http={}, winner_ack={}ms) tx={}",
                             sign::shorten_address(&addr),
                             send_start.elapsed().as_millis(),
                             send_report.winner,
                             failed_note,
-                            send_report.nodes_tried,
+                            send_report.ws_attempts,
+                            send_report.http_attempts,
+                            send_report.winner_latency_ms,
                             sign::shorten_hash(&h)));
                         // Always wait for on-chain receipt — SENT alone is not success.
                         report_wallet(reporter.as_ref(),

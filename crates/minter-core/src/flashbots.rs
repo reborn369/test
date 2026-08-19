@@ -175,10 +175,17 @@ impl FlashbotsClient {
     }
 
     async fn rpc(&self, auth: &Signer, method: &str, params: Value) -> Result<Value> {
-        self.rpc_to_url(auth, method, params, &self.config.relay_url).await
+        self.rpc_to_url(auth, method, params, &self.config.relay_url)
+            .await
     }
 
-    async fn rpc_to_url(&self, auth: &Signer, method: &str, params: Value, relay_url: &str) -> Result<Value> {
+    async fn rpc_to_url(
+        &self,
+        auth: &Signer,
+        method: &str,
+        params: Value,
+        relay_url: &str,
+    ) -> Result<Value> {
         let body_obj = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -260,14 +267,20 @@ impl FlashbotsClient {
                     let status = resp.status();
                     let text = resp.text().await.context("flashbots read body")?;
                     if !status.is_success() {
-                        bail!("Flashbots HTTP {status} via {trimmed}: {}", crate::safe_truncate(&text, 200));
+                        bail!(
+                            "Flashbots HTTP {status} via {trimmed}: {}",
+                            crate::safe_truncate(&text, 200)
+                        );
                     }
                     let data: Value = serde_json::from_str(&text).context("flashbots json")?;
                     if let Some(err) = data.get("error") {
                         bail!("Flashbots RPC error via {trimmed}: {err}");
                     }
-                    data.get("result").cloned().context("flashbots: no result field")
-                }.await;
+                    data.get("result")
+                        .cloned()
+                        .context("flashbots: no result field")
+                }
+                .await;
                 (trimmed, result)
             });
         }
@@ -282,8 +295,12 @@ impl FlashbotsClient {
                         tokio::spawn(async move {
                             while let Some(bg) = set.join_next().await {
                                 match bg {
-                                    Ok((u, Ok(_))) => crate::rlog!("Flashbots fan-out completed: {u}"),
-                                    Ok((u, Err(e))) => crate::rlog!("Flashbots fan-out failed: {u}: {e}"),
+                                    Ok((u, Ok(_))) => {
+                                        crate::rlog!("Flashbots fan-out completed: {u}")
+                                    }
+                                    Ok((u, Err(e))) => {
+                                        crate::rlog!("Flashbots fan-out failed: {u}: {e}")
+                                    }
                                     Err(e) => crate::rlog!("Flashbots fan-out join: {e}"),
                                 }
                             }

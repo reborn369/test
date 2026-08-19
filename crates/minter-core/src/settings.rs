@@ -240,10 +240,21 @@ impl Settings {
         ) {
             self.rpc_url_base = v;
         }
-        if let Some(v) = take(&self.rpc_url_polygon, &["RPC_URL_POLYGON", "POLYGON_RPC_URL"]) { self.rpc_url_polygon = v; }
-        if let Some(v) = take(&self.rpc_url_robinhood, &["RPC_URL_ROBINHOOD"]) { self.rpc_url_robinhood = v; }
-        if let Some(v) = take(&self.rpc_url_arbitrum, &["RPC_URL_ARBITRUM"]) { self.rpc_url_arbitrum = v; }
-        if let Some(v) = take(&self.rpc_url_optimism, &["RPC_URL_OPTIMISM"]) { self.rpc_url_optimism = v; }
+        if let Some(v) = take(
+            &self.rpc_url_polygon,
+            &["RPC_URL_POLYGON", "POLYGON_RPC_URL"],
+        ) {
+            self.rpc_url_polygon = v;
+        }
+        if let Some(v) = take(&self.rpc_url_robinhood, &["RPC_URL_ROBINHOOD"]) {
+            self.rpc_url_robinhood = v;
+        }
+        if let Some(v) = take(&self.rpc_url_arbitrum, &["RPC_URL_ARBITRUM"]) {
+            self.rpc_url_arbitrum = v;
+        }
+        if let Some(v) = take(&self.rpc_url_optimism, &["RPC_URL_OPTIMISM"]) {
+            self.rpc_url_optimism = v;
+        }
         if let Some(v) = take(&self.proxy_url, &["PROXY_URL", "HTTP_PROXY", "HTTPS_PROXY"]) {
             // Single-line env; append if multi-line already empty
             if self.proxy_lines().is_empty() {
@@ -611,16 +622,28 @@ impl Settings {
             );
         }
         if !self.rpc_url_polygon.trim().is_empty() {
-            m.insert("RPC_URL_POLYGON".to_string(), self.rpc_url_polygon.trim().to_string());
+            m.insert(
+                "RPC_URL_POLYGON".to_string(),
+                self.rpc_url_polygon.trim().to_string(),
+            );
         }
         if !self.rpc_url_robinhood.trim().is_empty() {
-            m.insert("RPC_URL_ROBINHOOD".to_string(), self.rpc_url_robinhood.trim().to_string());
+            m.insert(
+                "RPC_URL_ROBINHOOD".to_string(),
+                self.rpc_url_robinhood.trim().to_string(),
+            );
         }
         if !self.rpc_url_arbitrum.trim().is_empty() {
-            m.insert("RPC_URL_ARBITRUM".to_string(), self.rpc_url_arbitrum.trim().to_string());
+            m.insert(
+                "RPC_URL_ARBITRUM".to_string(),
+                self.rpc_url_arbitrum.trim().to_string(),
+            );
         }
         if !self.rpc_url_optimism.trim().is_empty() {
-            m.insert("RPC_URL_OPTIMISM".to_string(), self.rpc_url_optimism.trim().to_string());
+            m.insert(
+                "RPC_URL_OPTIMISM".to_string(),
+                self.rpc_url_optimism.trim().to_string(),
+            );
         }
         // First proxy as PROXY_URL for single-proxy helpers; full list lives in proxies.txt
         if let Some(first) = self.proxy_lines().into_iter().next() {
@@ -709,7 +732,10 @@ impl Settings {
             || !self.rpc_urls.trim().is_empty()
             || !self.rpc_url_ethereum.trim().is_empty()
             || !self.rpc_url_base.trim().is_empty()
-            || !self.rpc_url_polygon.trim().is_empty() || !self.rpc_url_robinhood.trim().is_empty() || !self.rpc_url_arbitrum.trim().is_empty() || !self.rpc_url_optimism.trim().is_empty()
+            || !self.rpc_url_polygon.trim().is_empty()
+            || !self.rpc_url_robinhood.trim().is_empty()
+            || !self.rpc_url_arbitrum.trim().is_empty()
+            || !self.rpc_url_optimism.trim().is_empty()
     }
 
     /// Mask secrets for UI display (last 4 chars).

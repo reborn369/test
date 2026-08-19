@@ -44,17 +44,17 @@ pub mod progress;
 pub mod proxy;
 pub mod raw_mint;
 pub mod raw_sniper;
+pub mod reactive;
 pub mod rpc;
 pub mod safety_policy;
 pub mod settings;
 pub mod sign;
 pub mod sweep;
+pub mod timer_resolution;
 pub mod types;
 pub mod update;
 pub mod vault;
-pub mod timer_resolution;
 pub mod ws;
-pub mod reactive;
 
 pub use api::{
     AuthTestRow, DiscoveredFunction, DropPhasesResult, EligibilityResult, GeneratedBurnersInfo,

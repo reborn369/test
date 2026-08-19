@@ -859,7 +859,9 @@ impl Session {
                     primary: false,
                     used_in_broadcast: false,
                 };
-                let probe_url = url.replace("wss://", "https://").replace("ws://", "http://");
+                let probe_url = url
+                    .replace("wss://", "https://")
+                    .replace("ws://", "http://");
                 match RpcClient::new_with_proxy(vec![probe_url], proxy_url.as_deref()) {
                     Ok(client) => {
                         let start = Instant::now();
@@ -1015,7 +1017,9 @@ impl Session {
         let mut out = Vec::new();
         for url in urls.iter().take(5) {
             let short = short_url(url);
-            let probe_url = url.replace("wss://", "https://").replace("ws://", "http://");
+            let probe_url = url
+                .replace("wss://", "https://")
+                .replace("ws://", "http://");
             let client = RpcClient::new(vec![probe_url]);
             let start = Instant::now();
             match client.chain_id().await {

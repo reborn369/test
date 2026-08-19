@@ -3243,17 +3243,20 @@ mod rpc_collect_tests {
 
     #[test]
     fn public_fallback_is_appended_even_with_a_paid_provider_key() {
-        // Configuring one paid endpoint still yields a two-endpoint run: the
-        // public fallback is appended unconditionally. Operators read this as
-        // "I have one node", so the origin label has to make it explicit.
+        // A paid Alchemy provider contributes its persistent WSS fast path and
+        // verified HTTPS counterpart; the public HTTP fallback is still
+        // appended unconditionally.
         let mut env = HashMap::new();
         env.insert("ALCHEMY_API_KEY".into(), "myKey99".into());
         let labeled = collect_rpc_urls_for_chain_labeled(&env, Some("robinhood"), &[]);
-        assert_eq!(labeled.len(), 2, "{labeled:?}");
+        assert_eq!(labeled.len(), 3, "{labeled:?}");
         assert_eq!(labeled[0].1, RpcOrigin::Provider);
+        assert!(labeled[0].0.starts_with("wss://"));
         assert!(labeled[0].0.contains("robinhood-mainnet.g.alchemy.com"));
-        assert_eq!(labeled[1].1, RpcOrigin::Public);
-        assert!(labeled[1].0.contains("rpc.mainnet.chain.robinhood.com"));
+        assert_eq!(labeled[1].1, RpcOrigin::Provider);
+        assert!(labeled[1].0.starts_with("https://"));
+        assert_eq!(labeled[2].1, RpcOrigin::Public);
+        assert!(labeled[2].0.contains("rpc.mainnet.chain.robinhood.com"));
     }
 
     #[test]

@@ -2335,7 +2335,7 @@ pub async fn run_opensea_mint(
             );
         }
         let reactive_engine = crate::reactive::ReactiveEngine::new(ws_clients);
-        let mut last_active_ws = None;
+        let mut last_ws_message = None;
         let mut timer_guard = None;
 
         loop {
@@ -2352,17 +2352,23 @@ pub async fn run_opensea_mint(
             }
 
             let active_ws = reactive_engine.active_subscriptions();
-            if last_active_ws != Some(active_ws) {
-                let message = if active_ws == 0 {
-                    "Reactive transport: WS unavailable; verified HTTP fallback armed".to_string()
-                } else {
+            let message = if active_ws == 0 {
+                if let Some(error) = reactive_engine.last_error() {
                     format!(
-                        "Reactive transport ready: {active_ws}/{} WS subscription(s) healthy; HTTP fallback armed",
-                        ws_clients.len()
+                        "Reactive transport: WS error ({error}); retrying; verified HTTP fallback armed"
                     )
-                };
-                report_phase(reporter.as_ref(), "wait", message);
-                last_active_ws = Some(active_ws);
+                } else {
+                    "Reactive transport: connecting; verified HTTP fallback armed".to_string()
+                }
+            } else {
+                format!(
+                    "Reactive transport ready: {active_ws}/{} WS subscription(s) healthy; HTTP fallback armed",
+                    ws_clients.len()
+                )
+            };
+            if last_ws_message.as_ref() != Some(&message) {
+                report_phase(reporter.as_ref(), "wait", message.clone());
+                last_ws_message = Some(message);
             }
             let left = remaining_ms.saturating_add(999) / 1000;
 

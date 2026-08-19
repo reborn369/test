@@ -825,15 +825,22 @@ pub async fn run_raw_sniper(
     // ── Clock fire ──
     let ws_clients = rpc.ws_clients();
     if !ws_clients.is_empty() {
+        let connected = rpc.connected_ws_count();
+        let detail = if connected > 0 {
+            format!(
+                "{connected}/{} WebSocket node(s) connected",
+                ws_clients.len()
+            )
+        } else if let Some(error) = ws_clients.iter().find_map(|client| client.last_error()) {
+            format!("WS error ({error}); retrying")
+        } else {
+            "WS still connecting; HTTP fallback armed".to_string()
+        };
         report(
             &reporter,
             MintEvent::phase(
                 "wait",
-                format!(
-                    "Reactive transport: {}/{} WebSocket node(s) connected; verified HTTP fallback armed",
-                    rpc.connected_ws_count(),
-                    ws_clients.len()
-                ),
+                format!("Reactive transport: {detail}; verified HTTP fallback armed"),
             ),
         );
     }

@@ -3127,7 +3127,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots 1.0.7",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -3814,7 +3814,7 @@ dependencies = [
 
 [[package]]
 name = "minter-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "aes-gcm",
  "alloy",
@@ -3838,7 +3838,7 @@ dependencies = [
 
 [[package]]
 name = "minter-desktop"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "getrandom 0.2.17",
@@ -5086,7 +5086,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots 1.0.7",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -6638,12 +6638,10 @@ checksum = "7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084"
 dependencies = [
  "futures-util",
  "log",
- "rustls",
- "rustls-pki-types",
+ "native-tls",
  "tokio",
- "tokio-rustls",
+ "tokio-native-tls",
  "tungstenite",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -6894,9 +6892,8 @@ dependencies = [
  "http",
  "httparse",
  "log",
+ "native-tls",
  "rand 0.9.4",
- "rustls",
- "rustls-pki-types",
  "sha1",
  "thiserror 2.0.18",
  "utf-8",
@@ -7434,15 +7431,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31141ce3fc3e300ae89b78c0dd67f9708061d1d2eda54b8209346fd6be9a92c"
 dependencies = [
  "rustls-pki-types",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "0.26.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
-dependencies = [
- "webpki-roots 1.0.7",
 ]
 
 [[package]]

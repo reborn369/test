@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
@@ -26,6 +27,7 @@ pub struct WsClient {
     req_tx: mpsc::Sender<WsRequest>,
     sub_tx: broadcast::Sender<Value>,
     status_rx: watch::Receiver<WsStatus>,
+    last_error: Arc<RwLock<Option<String>>>,
 }
 
 enum WsRequest {
@@ -43,14 +45,16 @@ impl WsClient {
         let (req_tx, req_rx) = mpsc::channel(1024);
         let (sub_tx, _) = broadcast::channel(1024);
         let (status_tx, status_rx) = watch::channel(WsStatus::default());
+        let last_error = Arc::new(RwLock::new(None));
         let client = Self {
             req_tx,
             sub_tx: sub_tx.clone(),
             status_rx,
+            last_error: Arc::clone(&last_error),
         };
 
         tokio::spawn(async move {
-            Self::connection_loop(url, req_rx, sub_tx, status_tx).await;
+            Self::connection_loop(url, req_rx, sub_tx, status_tx, last_error).await;
         });
         client
     }
@@ -65,6 +69,16 @@ impl WsClient {
 
     pub fn subscribe_status(&self) -> watch::Receiver<WsStatus> {
         self.status_rx.clone()
+    }
+
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error.read().ok().and_then(|value| value.clone())
+    }
+
+    fn record_error(&self, message: impl Into<String>) {
+        if let Ok(mut value) = self.last_error.write() {
+            *value = Some(message.into());
+        }
     }
 
     /// Receive Ethereum subscription events. Values are JSON-RPC `params`
@@ -103,10 +117,22 @@ impl WsClient {
             .context("WS request queue timeout")?
             .context("WS client loop dead")?;
 
-        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), rx)
-            .await
-            .context("WS response timeout")?
-            .context("WS request dropped")?
+        let result =
+            match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => {
+                    self.record_error(format!("WS request dropped: {error}"));
+                    bail!("WS request dropped: {error}");
+                }
+                Err(error) => {
+                    self.record_error("WS response timeout");
+                    return Err(error).context("WS response timeout");
+                }
+            };
+        if let Err(error) = &result {
+            self.record_error(error.to_string());
+        }
+        result
     }
 
     pub async fn eth_subscribe_timeout(
@@ -131,6 +157,7 @@ impl WsClient {
         mut req_rx: mpsc::Receiver<WsRequest>,
         sub_tx: broadcast::Sender<Value>,
         status_tx: watch::Sender<WsStatus>,
+        last_error: Arc<RwLock<Option<String>>>,
     ) {
         let mut generation = 0u64;
         loop {
@@ -141,6 +168,9 @@ impl WsClient {
             let connected = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(&url)).await;
             match connected {
                 Ok(Ok((stream, _))) => {
+                    if let Ok(mut error) = last_error.write() {
+                        *error = None;
+                    }
                     generation = generation.wrapping_add(1).max(1);
                     status_tx.send_replace(WsStatus {
                         connected: true,
@@ -174,6 +204,7 @@ impl WsClient {
                                     "params": params,
                                 });
                                 if let Err(error) = write.send(Message::Text(payload.to_string().into())).await {
+                                    store_error(&last_error, sanitize_error(&url, &error.to_string()));
                                     let _ = reply.send(Err(anyhow::anyhow!("WS write error: {error}")));
                                     break;
                                 }
@@ -202,6 +233,7 @@ impl WsClient {
                                             && let Some(reply) = pending.remove(&id)
                                         {
                                             if let Some(error) = value.get("error") {
+                                                store_error(&last_error, format!("RPC error: {error}"));
                                                 let _ = reply.send(Err(anyhow::anyhow!("RPC error: {error}")));
                                             } else if let Some(result) = value.get("result") {
                                                 let _ = reply.send(Ok(result.clone()));
@@ -212,6 +244,7 @@ impl WsClient {
                                     }
                                     Some(Ok(Message::Close(_))) => break,
                                     Some(Err(error)) => {
+                                        store_error(&last_error, sanitize_error(&url, &error.to_string()));
                                         crate::rlog!("WS read error: {error}");
                                         break;
                                     }
@@ -230,8 +263,14 @@ impl WsClient {
                         let _ = reply.send(Err(anyhow::anyhow!("WS connection lost")));
                     }
                 }
-                Ok(Err(error)) => crate::rlog!("WS connect failed: {error}"),
-                Err(_) => crate::rlog!("WS connect timeout"),
+                Ok(Err(error)) => {
+                    store_error(&last_error, sanitize_error(&url, &error.to_string()));
+                    crate::rlog!("WS connect failed: {error}");
+                }
+                Err(_) => {
+                    store_error(&last_error, "connection timeout".to_string());
+                    crate::rlog!("WS connect timeout");
+                }
             }
 
             status_tx.send_replace(WsStatus {
@@ -243,9 +282,32 @@ impl WsClient {
     }
 }
 
+fn store_error(target: &RwLock<Option<String>>, message: String) {
+    if let Ok(mut value) = target.write() {
+        *value = Some(message);
+    }
+}
+
+fn sanitize_error(url: &str, message: &str) -> String {
+    let short = crate::rpc::RpcClient::short_url(url);
+    let mut safe = message.replace(url, &short);
+    if let Some(scheme_end) = url.find("://") {
+        let after_scheme = &url[scheme_end + 3..];
+        if let Some(path_start) = after_scheme.find('/') {
+            let path = &after_scheme[path_start + 1..];
+            for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+                if segment.len() >= 8 {
+                    safe = safe.replace(segment, "…");
+                }
+            }
+        }
+    }
+    crate::safe_truncate(&safe, 240).to_string()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::WsClient;
+    use super::{WsClient, sanitize_error};
     use futures_util::{SinkExt, StreamExt};
     use serde_json::{Value, json};
     use std::time::Duration;
@@ -310,5 +372,13 @@ mod tests {
             .to_string();
         assert!(error.contains("not connected"), "{error}");
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn connection_errors_do_not_expose_rpc_credentials() {
+        let url = "wss://example.invalid/v2/super-secret-api-key";
+        let safe = sanitize_error(url, &format!("TLS failed for {url}: super-secret-api-key"));
+        assert!(!safe.contains("super-secret-api-key"), "{safe}");
+        assert!(safe.contains("example.invalid"), "{safe}");
     }
 }

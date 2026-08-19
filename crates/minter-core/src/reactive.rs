@@ -1,6 +1,6 @@
 use serde_json::Value;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
 
@@ -15,24 +15,28 @@ const SUBSCRIBE_RETRY: Duration = Duration::from_secs(1);
 pub struct ReactiveEngine {
     latest_block_timestamp: Arc<AtomicU64>,
     active_subscriptions: Arc<AtomicUsize>,
+    last_error: Arc<RwLock<Option<String>>>,
 }
 
 impl ReactiveEngine {
     pub fn new(ws_clients: &[crate::ws::WsClient]) -> Self {
         let latest_block_timestamp = Arc::new(AtomicU64::new(0));
         let active_subscriptions = Arc::new(AtomicUsize::new(0));
+        let last_error = Arc::new(RwLock::new(None));
 
         for (index, ws) in ws_clients.iter().cloned().enumerate() {
             let timestamp = Arc::clone(&latest_block_timestamp);
             let active = Arc::clone(&active_subscriptions);
+            let error = Arc::clone(&last_error);
             tokio::spawn(async move {
-                monitor_new_heads(index + 1, ws, timestamp, active).await;
+                monitor_new_heads(index + 1, ws, timestamp, active, error).await;
             });
         }
 
         Self {
             latest_block_timestamp,
             active_subscriptions,
+            last_error,
         }
     }
 
@@ -43,6 +47,10 @@ impl ReactiveEngine {
     pub fn active_subscriptions(&self) -> usize {
         self.active_subscriptions.load(Ordering::Acquire)
     }
+
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error.read().ok().and_then(|value| value.clone())
+    }
 }
 
 async fn monitor_new_heads(
@@ -50,10 +58,16 @@ async fn monitor_new_heads(
     ws: crate::ws::WsClient,
     latest_timestamp: Arc<AtomicU64>,
     active_subscriptions: Arc<AtomicUsize>,
+    last_error: Arc<RwLock<Option<String>>>,
 ) {
     let mut status = ws.subscribe_status();
     loop {
         while !status.borrow().connected {
+            if let Some(error) = ws.last_error()
+                && let Ok(mut target) = last_error.write()
+            {
+                *target = Some(error);
+            }
             if status.changed().await.is_err() {
                 return;
             }
@@ -67,6 +81,9 @@ async fn monitor_new_heads(
         {
             Ok(id) => id,
             Err(error) => {
+                if let Ok(mut target) = last_error.write() {
+                    *target = Some(error.to_string());
+                }
                 crate::rlog!("ReactiveEngine [Node {node}]: subscribe failed: {error}");
                 tokio::select! {
                     _ = tokio::time::sleep(SUBSCRIBE_RETRY) => {},
@@ -81,6 +98,9 @@ async fn monitor_new_heads(
         };
 
         active_subscriptions.fetch_add(1, Ordering::AcqRel);
+        if let Ok(mut error) = last_error.write() {
+            *error = None;
+        }
         crate::rlog!("ReactiveEngine [Node {node}]: newHeads active");
 
         loop {

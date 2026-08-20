@@ -200,6 +200,15 @@ pub fn build_client_with_cookie_jar_and_proxy(
     }
     let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        // A scheduled mint can sit idle for several minutes after auth.  The
+        // reqwest default evicts pooled sockets after 90s, which puts proxy
+        // CONNECT + TLS back on the T0 calldata path.  Keep the per-wallet
+        // tunnel available for the whole normal waiting window instead.
+        .pool_idle_timeout(std::time::Duration::from_secs(10 * 60))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+        .http2_keep_alive_timeout(std::time::Duration::from_secs(5))
+        .http2_keep_alive_while_idle(true)
         .cookie_provider(cookie_jar)
         .default_headers(headers);
 
@@ -298,6 +307,22 @@ fn gql_request(client: &reqwest::Client) -> reqwest::RequestBuilder {
         .header("referer", format!("{}/", OPENSEA_ORIGIN))
         .header("x-app-id", "os2-web")
         .header("x-graphql-operation-type", "query")
+}
+
+/// Establish (or refresh) the exact proxy/TLS connection used by the mint
+/// action without consuming a GraphQL mint-action request.
+///
+/// OpenSea currently answers HEAD on `/graphql` with 405 and keeps the socket
+/// alive.  Any HTTP response is therefore a successful transport warm-up; only
+/// a connect/TLS/timeout error is a failure.  The caller runs this well before
+/// T0 and treats failure as non-fatal.
+pub async fn warm_gql_connection(session: &AuthSession) -> Result<u16> {
+    let mut req = session.client.head(GQL_URL).header("x-app-id", "os2-web");
+    if !session.access_token.is_empty() {
+        req = req.header("authorization", format!("Bearer {}", session.access_token));
+    }
+    let response = req.send().await.context("OpenSea GQL warm-up failed")?;
+    Ok(response.status().as_u16())
 }
 
 fn debug_file_next_to_exe(name: &str) -> std::path::PathBuf {

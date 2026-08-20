@@ -2329,6 +2329,7 @@ pub async fn run_opensea_mint(
         let mut prefetched = false;
         let mut prep_frozen = false;
         let mut conditional_started = false;
+        let mut gql_warm_started = false;
         let mut last_printed = -1i64;
         let mut logged_chain_lag = false;
         let prefetch_lead_ms = if conditional_submit_enabled {
@@ -2437,6 +2438,66 @@ pub async fn run_opensea_mint(
                     );
                 }
                 last_printed = left;
+            }
+
+            // Auth/eligibility often finishes minutes before a scheduled mint.
+            // Warm each wallet's exact proxy -> gql.opensea.io connection outside
+            // the hot path.  Never start this close enough to threaten T0.
+            if !gql_warm_started && !local_public_prefetch && remaining_ms <= 10_000 {
+                gql_warm_started = true;
+                if remaining_ms >= 6_000 {
+                    let mut warm_jobs = tokio::task::JoinSet::new();
+                    for wallet in wallets.iter().filter(|wallet| wallet.auth_ok) {
+                        if let Some(session) = wallet.session.clone() {
+                            let address = wallet.address;
+                            warm_jobs.spawn(async move {
+                                let started = std::time::Instant::now();
+                                let result = tokio::time::timeout(
+                                    std::time::Duration::from_secs(3),
+                                    opensea::warm_gql_connection(&session),
+                                )
+                                .await;
+                                (address, started.elapsed().as_millis() as u64, result)
+                            });
+                        }
+                    }
+                    let total = warm_jobs.len();
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(3_200);
+                    let mut ready = 0usize;
+                    let mut latencies = Vec::new();
+                    while !warm_jobs.is_empty() {
+                        let budget = deadline.saturating_duration_since(std::time::Instant::now());
+                        if budget.is_zero() {
+                            break;
+                        }
+                        match tokio::time::timeout(budget, warm_jobs.join_next()).await {
+                            Ok(Some(Ok((_, elapsed, Ok(Ok(_status)))))) => {
+                                ready += 1;
+                                latencies.push(elapsed);
+                            }
+                            Ok(Some(_)) => {}
+                            Ok(None) | Err(_) => break,
+                        }
+                    }
+                    warm_jobs.abort_all();
+                    latencies.sort_unstable();
+                    let latency = latencies
+                        .get((latencies.len().saturating_sub(1)) / 2)
+                        .map(|ms| format!(" median={ms}ms"))
+                        .unwrap_or_default();
+                    log_always(
+                        reporter.as_ref(),
+                        format!(
+                            "OpenSea GQL transport warm: {ready}/{total} ready{latency}; mint-action budget untouched"
+                        ),
+                    );
+                } else {
+                    log_always(
+                        reporter.as_ref(),
+                        "OpenSea GQL transport warm skipped: less than 6s to T0".to_string(),
+                    );
+                }
             }
 
             // One-shot diagnostic: chain block.timestamp often lags wall by ~block time.

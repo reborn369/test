@@ -99,11 +99,38 @@ pub(crate) const PHASE_OPEN_LAG_WINDOW_SECS: i64 = 25;
 /// Max chain lag (seconds) decoded from NotActive still treated as "about to open".
 pub(crate) const NOT_ACTIVE_CHAIN_WAIT_MAX_SECS: u64 = 20;
 
+/// A reverted transaction may be retried with a fresh nonce only when its
+/// mined block itself proves that SeaDrop had not opened yet.  Keep this
+/// separate from the general retry count: a bad contract call must not turn
+/// `MAX_RETRIES=20` into twenty paid reverts.
+pub(crate) const MAX_PROVEN_EARLY_REVERT_RECOVERIES: u32 = 1;
+
+/// Starting this far after T0 is no longer latency-sensitive enough to justify
+/// skipping a contract preflight.  It is, however, exactly when sold-out state
+/// is likely, so perform a read-only estimate before spending gas.
+pub(crate) const LATE_LIVE_PREFLIGHT_MS: u64 = 2_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NotActiveInfo {
     pub chain_ts: u64,
     pub start_ts: u64,
     pub end_ts: u64,
+}
+
+pub(crate) fn is_proven_pre_open_revert(stage_start_ts: Option<i64>, mined_block_ts: u64) -> bool {
+    let Some(start) = stage_start_ts.filter(|start| *start > 0) else {
+        return false;
+    };
+    let start = start as u64;
+    mined_block_ts < start && start.saturating_sub(mined_block_ts) <= NOT_ACTIVE_CHAIN_WAIT_MAX_SECS
+}
+
+pub(crate) fn late_preflight_proves_rejection(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    classify_mint_error(err) == "fatal"
+        || parse_not_active(err).is_some()
+        || lower.contains("execution reverted")
+        || lower.contains("revert data")
 }
 
 fn format_unix_hms(ts: u64) -> String {
@@ -3054,6 +3081,7 @@ pub async fn run_opensea_mint(
         let use_flashbots_w = use_flashbots;
         let fb_pieces_w = fb_pieces.clone();
         let dry_run_w = dry_run;
+        let scheduled_fire_lag_ms_w = scheduled_fire_lag_ms;
         // Bound at auth time (signer index) — never re-derive from wallets order.
         let proxy_url_w = w.proxy_url.clone();
 
@@ -3092,6 +3120,7 @@ pub async fn run_opensea_mint(
             };
             let mut logged_auto_skip = false;
             let mut logged_reuse = false;
+            let mut proven_early_recoveries = 0u32;
 
             // Only wallets with no calldata and no signed transaction get a
             // slot here, so nothing that is ready to broadcast is delayed.
@@ -3405,6 +3434,79 @@ pub async fn run_opensea_mint(
                             }
                         }
                     };
+
+                // A manual/late launch is not competing at the exact opening
+                // edge anymore.  Read the current contract state before the
+                // first paid send so a sold-out phase or exhausted wallet
+                // allowance cannot consume gas merely because LIVE normally
+                // skips estimation for speed.
+                if !dry_run_w
+                    && attempt == 1
+                    && scheduled_fire_lag_ms_w
+                        .is_some_and(|lag| lag >= LATE_LIVE_PREFLIGHT_MS)
+                {
+                    let guard_started = std::time::Instant::now();
+                    match rpc
+                        .estimate_gas(&addr, &to_addr, tx_value, &calldata)
+                        .await
+                    {
+                        Ok(estimate) => log_always(
+                            reporter.as_ref(),
+                            format!(
+                                "[{}] LATE PREFLIGHT OK {}ms est={} — live send allowed",
+                                sign::shorten_address(&addr),
+                                guard_started.elapsed().as_millis(),
+                                estimate
+                            ),
+                        ),
+                        Err(error) => {
+                            let raw = format!("{error}");
+                            if late_preflight_proves_rejection(&raw) {
+                                let reason = enrich_mint_rpc_error(&raw);
+                                let message = format!(
+                                    "late preflight blocked paid send: {reason}"
+                                );
+                                log_always(
+                                    reporter.as_ref(),
+                                    format!(
+                                        "[{}] LATE PREFLIGHT BLOCKED {}ms: {}",
+                                        sign::shorten_address(&addr),
+                                        guard_started.elapsed().as_millis(),
+                                        reason
+                                    ),
+                                );
+                                report_wallet(
+                                    reporter.as_ref(),
+                                    &addr,
+                                    Some(WalletStatus::Failed),
+                                    Some("not broadcast — contract rejected simulation".into()),
+                                    None,
+                                    Some(message.clone()),
+                                );
+                                break (
+                                    addr,
+                                    MintResult {
+                                        address: addr,
+                                        tx_hash: None,
+                                        status: WalletStatus::Failed,
+                                        gas_used: None,
+                                        block_number: None,
+                                        error: Some(message),
+                                    },
+                                );
+                            }
+                            log_always(
+                                reporter.as_ref(),
+                                format!(
+                                    "[{}] WARN: late preflight RPC unavailable ({}ms); no contract rejection proven — preserving live send: {}",
+                                    sign::shorten_address(&addr),
+                                    guard_started.elapsed().as_millis(),
+                                    raw
+                                ),
+                            );
+                        }
+                    }
+                }
 
                 let gas_limit = if force_fixed_gas {
                     let fixed_raw = fixed_gas_limit_owned.unwrap_or(250_000);
@@ -4245,12 +4347,145 @@ pub async fn run_opensea_mint(
                                 info.gas_used,
                                 info.block_number,
                                 sign::shorten_hash(&mined_hash)));
+
+                            // A receipt status alone has no revert reason.  The
+                            // mined block timestamp does give us one safe fact:
+                            // when it is before this stage's start, SeaDrop
+                            // could not possibly have accepted the mint yet.
+                            // Only that proven case is eligible for one recovery
+                            // transaction, and only after a fresh read-only
+                            // estimate says the exact calldata now succeeds.
+                            let mined_block_ts = rpc
+                                .block_timestamp_at(info.block_number)
+                                .await
+                                .ok();
+                            let proven_early = mined_block_ts.is_some_and(|timestamp| {
+                                is_proven_pre_open_revert(stage_start_ts_w, timestamp)
+                            });
+                            let mut recovery_failure: Option<String> = None;
+                            if proven_early
+                                && proven_early_recoveries
+                                    < MAX_PROVEN_EARLY_REVERT_RECOVERIES
+                            {
+                                let timestamp = mined_block_ts.unwrap_or_default();
+                                log_always(
+                                    reporter.as_ref(),
+                                    format!(
+                                        "[{}] EARLY-BLOCK RECOVERY: block timestamp={} is before phase start={}; validating current contract state before one fresh-nonce retry",
+                                        sign::shorten_address(&addr),
+                                        timestamp,
+                                        stage_start_ts_w.unwrap_or_default()
+                                    ),
+                                );
+
+                                let validation_deadline = std::time::Instant::now()
+                                    + std::time::Duration::from_secs(3);
+                                let validation: Result<u64, String> = loop {
+                                    if cancelled(&cancel_w) {
+                                        break Err(
+                                            "cancelled during early-block recovery".into(),
+                                        );
+                                    }
+                                    match rpc
+                                        .estimate_gas(&addr, &tx.to, tx.value, &tx.data)
+                                        .await
+                                    {
+                                        Ok(estimate) => {
+                                            log_always(
+                                                reporter.as_ref(),
+                                                format!(
+                                                    "[{}] RECOVERY PREFLIGHT OK est={} — contract is active now",
+                                                    sign::shorten_address(&addr),
+                                                    estimate
+                                                ),
+                                            );
+                                            break Ok(estimate);
+                                        }
+                                        Err(error) => {
+                                            let validation_error =
+                                                enrich_mint_rpc_error(&format!("{error}"));
+                                            // Sold out, invalid proof, wallet
+                                            // cap, payment and funds errors do
+                                            // not improve by polling.
+                                            if classify_mint_error(&validation_error) == "fatal"
+                                            {
+                                                break Err(validation_error);
+                                            }
+                                            if std::time::Instant::now() >= validation_deadline {
+                                                break Err(validation_error);
+                                            }
+                                            tokio::time::sleep(
+                                                std::time::Duration::from_millis(100),
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                };
+
+                                if validation.is_ok() {
+                                    match rpc.nonce(&addr).await {
+                                        Ok(fresh_nonce) if fresh_nonce > nonce => {
+                                            proven_early_recoveries += 1;
+                                            nonce = fresh_nonce;
+                                            cached_tx =
+                                                Some((tx.to, tx.value, tx.data.clone()));
+                                            pre_signed_tx = None;
+                                            // Every old candidate used the
+                                            // consumed nonce and is already
+                                            // known reverted.  Keeping it in
+                                            // ambiguity checks would make the
+                                            // next send look landed and abort
+                                            // the valid recovery.
+                                            sent_hashes.clear();
+                                            log_always(
+                                                reporter.as_ref(),
+                                                format!(
+                                                    "[{}] RECOVERY ARMED with fresh nonce={} (paid recovery {}/{})",
+                                                    sign::shorten_address(&addr),
+                                                    nonce,
+                                                    proven_early_recoveries,
+                                                    MAX_PROVEN_EARLY_REVERT_RECOVERIES
+                                                ),
+                                            );
+                                            continue;
+                                        }
+                                        Ok(fresh_nonce) => {
+                                            recovery_failure = Some(format!(
+                                                "early-block recovery stopped: pending nonce did not advance (old={nonce}, current={fresh_nonce})"
+                                            ));
+                                        }
+                                        Err(error) => {
+                                            recovery_failure = Some(format!(
+                                                "early-block recovery stopped: nonce refresh failed: {error}"
+                                            ));
+                                        }
+                                    }
+                                } else if let Err(validation_error) = validation {
+                                    recovery_failure = Some(format!(
+                                        "early-block recovery blocked by current-state preflight: {validation_error}"
+                                    ));
+                                }
+                            }
+
+                            let final_error = recovery_failure.unwrap_or_else(|| {
+                                if proven_early {
+                                    "reverted in a pre-open block; bounded paid recovery exhausted"
+                                        .to_string()
+                                } else if let Some(timestamp) = mined_block_ts {
+                                    format!(
+                                        "reverted (mined block timestamp={timestamp}, not a proven pre-open revert)"
+                                    )
+                                } else {
+                                    "reverted; block timestamp unavailable, automatic resend disabled"
+                                        .to_string()
+                                }
+                            });
                             report_wallet(reporter.as_ref(),
                                 &addr,
                                 Some(WalletStatus::Failed),
                                 Some(format!("reverted blk={}", info.block_number)),
                                 Some(mined_hash),
-                                Some("reverted".into()),
+                                Some(final_error.clone()),
                             );
                             break (
                                 addr,
@@ -4260,7 +4495,7 @@ pub async fn run_opensea_mint(
                                     status: WalletStatus::Failed,
                                     gas_used: Some(info.gas_used),
                                     block_number: Some(info.block_number),
-                                    error: Some("reverted".to_string()),
+                                    error: Some(final_error),
                                 },
                             );
                         }
@@ -4725,8 +4960,9 @@ mod tests {
         RATE_LIMIT_WAIT_BUDGET_MS, WalletAuth, assigned_proxy_routes, build_local_public_mint,
         classify_mint_error, enrich_mint_rpc_error, estimate_fail_policy, fire_lag_ms_from_clock,
         format_not_active, format_rpc_plan, gql_stagger_step_ms, in_phase_open_lag_window,
-        parse_not_active, parse_tx_calldata_hex, pre_sign_ready_wallets, rate_limit_backoff,
-        resolve_mint_gas_limit, validate_seadrop_calldata,
+        is_proven_pre_open_revert, late_preflight_proves_rejection, parse_not_active,
+        parse_tx_calldata_hex, pre_sign_ready_wallets, rate_limit_backoff, resolve_mint_gas_limit,
+        validate_seadrop_calldata,
     };
     use crate::proxy::ProxyManager;
     use crate::types::Signer;
@@ -5110,6 +5346,29 @@ mod tests {
         assert_eq!(info.end_ts, 1_784_736_000); // 16:00:00
         let wait = info.start_ts.saturating_sub(info.chain_ts);
         assert_eq!(wait, 1);
+    }
+
+    #[test]
+    fn phoenix_pre_open_block_is_the_only_paid_recovery_case() {
+        let start = 1_787_252_400i64;
+        assert!(is_proven_pre_open_revert(Some(start), 1_787_252_399));
+        assert!(!is_proven_pre_open_revert(Some(start), 1_787_252_400));
+        assert!(!is_proven_pre_open_revert(Some(start), 1_787_252_401));
+        assert!(!is_proven_pre_open_revert(None, 1_787_252_399));
+        assert!(!is_proven_pre_open_revert(Some(start), 1_787_252_300));
+    }
+
+    #[test]
+    fn late_preflight_blocks_contract_reverts_but_not_transport_noise() {
+        assert!(late_preflight_proves_rejection(
+            "execution reverted: MintQuantityExceedsMaxSupply"
+        ));
+        assert!(late_preflight_proves_rejection(WONKIES_NOT_ACTIVE));
+        assert!(late_preflight_proves_rejection(
+            "RPC error: execution reverted"
+        ));
+        assert!(!late_preflight_proves_rejection("RPC request timed out"));
+        assert!(!late_preflight_proves_rejection("connection reset"));
     }
 
     #[test]

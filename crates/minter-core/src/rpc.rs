@@ -655,6 +655,23 @@ impl RpcClient {
             .context("invalid timestamp")
     }
 
+    /// Timestamp of a specific mined block.  Receipt recovery uses this to
+    /// distinguish a transaction that was provably included before a drop's
+    /// start from an ordinary contract revert.  Those two cases must never
+    /// share the same automatic-retry policy.
+    pub async fn block_timestamp_at(&self, block_number: u64) -> Result<u64> {
+        let block = format!("0x{block_number:x}");
+        let result = self
+            .call_hedged("eth_getBlockByNumber", json!([block, false]))
+            .await?;
+        let hex_str = result
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .context("no timestamp")?;
+        u64::from_str_radix(hex_str.strip_prefix("0x").unwrap_or(hex_str), 16)
+            .context("invalid timestamp")
+    }
+
     pub async fn balance(&self, address: &Address) -> Result<U256> {
         let result = self
             .call(

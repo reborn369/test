@@ -41,7 +41,6 @@ jobs:
       - name: Build
         run: |
           cargo build -p minter-desktop --release
-          cargo build -p minter-core --example wss_probe --release
 
       - name: Package
         shell: pwsh
@@ -63,9 +62,6 @@ jobs:
           $stage = "dist\minter-desktop-$ver-windows-x64"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item -Force $exe (Join-Path $stage "minter-desktop.exe")
-          $probe = "target\release\examples\wss_probe.exe"
-          if (-not (Test-Path $probe)) { throw "wss_probe.exe not found after build" }
-          Copy-Item -Force $probe (Join-Path $stage "wss-probe.exe")
           foreach ($f in @("USER_GUIDE.md","README.md","SECURITY.md","LICENSE-MIT","LICENSE-APACHE","NOTICE")) {
             if (Test-Path $f) { Copy-Item -Force $f $stage }
           }

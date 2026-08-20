@@ -1,7 +1,7 @@
 //! OpenSea mint orchestration (auth, phase, calldata, send, RBF).
 //! Shared by CLI and desktop via `MintReporter` + `MintOptions`.
 
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -412,6 +412,117 @@ pub(crate) fn parse_tx_calldata_hex(data_hex: &str) -> anyhow::Result<Bytes> {
     Ok(Bytes::from(bytes))
 }
 
+fn calldata_word(data: &[u8], index: usize) -> Result<&[u8]> {
+    let start = 4usize
+        .checked_add(index.checked_mul(32).context("calldata word overflow")?)
+        .context("calldata offset overflow")?;
+    let end = start.checked_add(32).context("calldata offset overflow")?;
+    data.get(start..end)
+        .with_context(|| format!("calldata is missing ABI word {index}"))
+}
+
+fn calldata_address(data: &[u8], index: usize) -> Result<Address> {
+    let word = calldata_word(data, index)?;
+    if word[..12].iter().any(|byte| *byte != 0) {
+        bail!("ABI address word {index} has non-zero padding");
+    }
+    Ok(Address::from_slice(&word[12..]))
+}
+
+fn calldata_u64(data: &[u8], index: usize) -> Result<u64> {
+    let word = calldata_word(data, index)?;
+    if word[..24].iter().any(|byte| *byte != 0) {
+        bail!("ABI integer word {index} does not fit u64");
+    }
+    Ok(u64::from_be_bytes(
+        word[24..].try_into().expect("8-byte slice"),
+    ))
+}
+
+/// Validate the wallet-specific SeaDrop call returned by OpenSea before it is
+/// signed. Chain id and target/value are checked separately by the caller; this
+/// verifies the critical ABI fields that a compromised response could swap.
+fn validate_seadrop_calldata(
+    data: &[u8],
+    nft_contract: Address,
+    minter: Address,
+    quantity: u32,
+    expected_stage_index: Option<i64>,
+) -> Result<()> {
+    if data.len() < 4 {
+        bail!("SeaDrop calldata has no selector");
+    }
+    let public_selector = &keccak256("mintPublic(address,address,address,uint256)".as_bytes())[..4];
+    let signed_selector = &keccak256("mintSigned(address,address,address,uint256,(uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool),uint256,bytes)".as_bytes())[..4];
+
+    let kind = if &data[..4] == public_selector {
+        "mintPublic"
+    } else if &data[..4] == signed_selector {
+        "mintSigned"
+    } else {
+        bail!(
+            "OpenSea returned an unsupported SeaDrop function selector 0x{}",
+            hex::encode(&data[..4])
+        );
+    };
+
+    let actual_nft = calldata_address(data, 0)?;
+    let actual_minter = calldata_address(data, 2)?;
+    let actual_quantity = calldata_u64(data, 3)?;
+    if actual_nft != nft_contract {
+        bail!("{kind} NFT contract mismatch: got {actual_nft:?}, expected {nft_contract:?}");
+    }
+    // SeaDrop permits zero here to mean msg.sender; since this transaction is
+    // signed by `minter`, both encodings mint to the same wallet.
+    if actual_minter != minter && actual_minter != Address::ZERO {
+        bail!("{kind} minter mismatch: got {actual_minter:?}, expected {minter:?}");
+    }
+    if actual_quantity != u64::from(quantity) {
+        bail!("{kind} quantity mismatch: got {actual_quantity}, expected {quantity}");
+    }
+
+    if kind == "mintSigned" {
+        // MintParams: price, wallet max, start, end, stage index, stage supply,
+        // fee bps, restrictFeeRecipients.
+        let stage_index = calldata_u64(data, 8)?;
+        if let Some(expected) = expected_stage_index.filter(|value| *value >= 0)
+            && stage_index != expected as u64
+        {
+            bail!("mintSigned stage mismatch: got {stage_index}, expected {expected}");
+        }
+        if calldata_u64(data, 11)? != 1 {
+            bail!("mintSigned does not restrict fee recipients");
+        }
+        // `bytes signature` is word 13; ensure its offset and declared length
+        // both point inside this call rather than trusting malformed ABI.
+        let signature_offset = usize::try_from(calldata_u64(data, 13)?)
+            .context("mintSigned signature offset does not fit usize")?;
+        let length_word_start = 4usize
+            .checked_add(signature_offset)
+            .context("mintSigned signature offset overflow")?;
+        let length_word_end = length_word_start
+            .checked_add(32)
+            .context("mintSigned signature length offset overflow")?;
+        let length_word = data
+            .get(length_word_start..length_word_end)
+            .context("mintSigned signature offset is outside calldata")?;
+        if length_word[..24].iter().any(|byte| *byte != 0) {
+            bail!("mintSigned signature length does not fit u64");
+        }
+        let signature_len = usize::try_from(u64::from_be_bytes(
+            length_word[24..].try_into().expect("8-byte slice"),
+        ))
+        .context("mintSigned signature length does not fit usize")?;
+        let signature_end = length_word_end
+            .checked_add(signature_len)
+            .context("mintSigned signature length overflow")?;
+        if signature_len == 0 || signature_end > data.len() {
+            bail!("mintSigned signature bytes are missing or truncated");
+        }
+    }
+    Ok(())
+}
+
 /// Build wallet-specific PUBLIC_SALE calldata without an OpenSea GraphQL call.
 /// This is pure local work, so it can be completed and signed before T0.
 fn build_local_public_mint(
@@ -577,6 +688,7 @@ async fn fetch_and_parse_gql(
     chain: &str,
     stage_token_id: &str,
     quantity: u32,
+    expected_stage_index: Option<i64>,
     payment_asset: &serde_json::Value,
     calldata_value: &U256,
     mint_started_at: &std::time::Instant,
@@ -707,6 +819,22 @@ async fn fetch_and_parse_gql(
     let data_hex = tx_data.get("data").and_then(|v| v.as_str()).unwrap_or("");
     let cd = parse_tx_calldata_hex(data_hex)
         .with_context(|| format!("[{}] OpenSea GQL tx data", sign::shorten_address(addr)))?;
+    let expected_nft = nft_contract
+        .parse::<Address>()
+        .context("invalid expected NFT contract")?;
+    validate_seadrop_calldata(
+        cd.as_ref(),
+        expected_nft,
+        *addr,
+        quantity,
+        expected_stage_index,
+    )
+    .with_context(|| {
+        format!(
+            "[{}] unsafe OpenSea calldata rejected",
+            sign::shorten_address(addr)
+        )
+    })?;
 
     mint_log(
         reporter,
@@ -737,6 +865,7 @@ async fn fetch_calldata_reauth(
     chain: &str,
     stage_token_id: &str,
     quantity: u32,
+    expected_stage_index: Option<i64>,
     payment_asset: &serde_json::Value,
     calldata_value: &U256,
     mint_started_at: &std::time::Instant,
@@ -755,6 +884,7 @@ async fn fetch_calldata_reauth(
         chain,
         stage_token_id,
         quantity,
+        expected_stage_index,
         payment_asset,
         calldata_value,
         mint_started_at,
@@ -803,6 +933,7 @@ async fn fetch_calldata_reauth(
                 chain,
                 stage_token_id,
                 quantity,
+                expected_stage_index,
                 payment_asset,
                 calldata_value,
                 mint_started_at,
@@ -1151,6 +1282,16 @@ pub async fn run_opensea_mint(
         .chain_id()
         .await
         .context("Failed to get chain ID from RPC")?;
+    if actual_chain_id == 4663 {
+        // Robinhood's official direct sequencer accepts raw transactions but
+        // deliberately does not expose normal read RPC. Add it only after a
+        // read-capable node has verified chainId=4663.
+        rpc.add_send_only_url("https://sequencer.mainnet.chain.robinhood.com");
+        log_always(
+            reporter.as_ref(),
+            "Robinhood broadcast: direct sequencer armed as send-only parallel ingress".to_string(),
+        );
+    }
 
     let use_flashbots = opts.use_flashbots.unwrap_or(false);
     let conditional_requested = opts.conditional_submit_enabled.unwrap_or(false);
@@ -2370,19 +2511,6 @@ pub async fn run_opensea_mint(
             Option<PrefetchedMintTx>,
         )> = tokio::task::JoinSet::new();
 
-        let ws_clients = rpc.ws_clients();
-        if !ws_clients.is_empty() {
-            report_phase(
-                &*reporter,
-                "wait",
-                format!(
-                    "Reactive transport: {} WebSocket node(s) configured; connecting",
-                    ws_clients.len()
-                ),
-            );
-        }
-        let reactive_engine = crate::reactive::ReactiveEngine::new(ws_clients);
-        let mut last_ws_message = None;
         let mut timer_guard = None;
 
         loop {
@@ -2398,25 +2526,6 @@ pub async fn run_opensea_mint(
                 timer_guard = Some(crate::timer_resolution::TimerResolutionGuard::activate());
             }
 
-            let active_ws = reactive_engine.active_subscriptions();
-            let message = if active_ws == 0 {
-                if let Some(error) = reactive_engine.last_error() {
-                    format!(
-                        "Reactive transport: WS error ({error}); retrying; verified HTTP fallback armed"
-                    )
-                } else {
-                    "Reactive transport: connecting; verified HTTP fallback armed".to_string()
-                }
-            } else {
-                format!(
-                    "Reactive transport ready: {active_ws}/{} WS subscription(s) healthy; HTTP fallback armed",
-                    ws_clients.len()
-                )
-            };
-            if last_ws_message.as_ref() != Some(&message) {
-                report_phase(reporter.as_ref(), "wait", message.clone());
-                last_ws_message = Some(message);
-            }
             let left = remaining_ms.saturating_add(999) / 1000;
 
             if left != last_printed {
@@ -2914,6 +3023,7 @@ pub async fn run_opensea_mint(
         let quantity_owned = wallet_quantities.get(&addr).copied().unwrap_or(quantity);
         let calldata_value = price_wei * U256::from(quantity_owned);
         let stage_type_owned = stage_type_owned.clone();
+        let expected_stage_index_owned = selected_stage_index;
         let stage_token_id_owned = stage_token_id.clone();
         let seadrop_address_owned = seadrop_address.clone();
         let fee_recipient_owned = fee_recipient.clone();
@@ -3165,6 +3275,7 @@ pub async fn run_opensea_mint(
                                     &chain_owned,
                                     &stage_token_id_owned,
                                     quantity_owned,
+                                    expected_stage_index_owned,
                                     &payment_asset_owned,
                                     &calldata_value,
                                     &mint_started_at,
@@ -3245,6 +3356,7 @@ pub async fn run_opensea_mint(
                             &chain_owned,
                             &stage_token_id_owned,
                             quantity_owned,
+                            expected_stage_index_owned,
                             &payment_asset_owned,
                             &calldata_value,
                             &mint_started_at,
@@ -3728,12 +3840,11 @@ pub async fn run_opensea_mint(
                         } else {
                             format!(" after {} failed", send_report.losers.len())
                         };
-                        log_always(reporter.as_ref(), format!("[{}] SEND OK {}ms via {}{} (fanout ws={} http={}, winner_ack={}ms) tx={}",
+                        log_always(reporter.as_ref(), format!("[{}] SEND OK {}ms via {}{} (fanout http={}, winner_ack={}ms) tx={}",
                             sign::shorten_address(&addr),
                             send_start.elapsed().as_millis(),
                             send_report.winner,
                             failed_note,
-                            send_report.ws_attempts,
                             send_report.http_attempts,
                             send_report.winner_latency_ms,
                             sign::shorten_hash(&h)));
@@ -4615,7 +4726,7 @@ mod tests {
         classify_mint_error, enrich_mint_rpc_error, estimate_fail_policy, fire_lag_ms_from_clock,
         format_not_active, format_rpc_plan, gql_stagger_step_ms, in_phase_open_lag_window,
         parse_not_active, parse_tx_calldata_hex, pre_sign_ready_wallets, rate_limit_backoff,
-        resolve_mint_gas_limit,
+        resolve_mint_gas_limit, validate_seadrop_calldata,
     };
     use crate::proxy::ProxyManager;
     use crate::types::Signer;
@@ -4852,6 +4963,64 @@ mod tests {
         assert_eq!(b.as_ref(), &[0xa0, 0x71, 0x2d, 0x68]);
         let b2 = parse_tx_calldata_hex("a0712d68").unwrap();
         assert_eq!(b.as_ref(), b2.as_ref());
+    }
+
+    #[test]
+    fn validates_public_seadrop_wallet_contract_and_quantity() {
+        let nft: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let minter: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        let tx = crate::opensea::build_public_mint_tx(
+            &format!("{nft:?}"),
+            2,
+            U256::from(1u64),
+            None,
+            None,
+            Some(&format!("{minter:?}")),
+        )
+        .unwrap();
+        let data = parse_tx_calldata_hex(tx["data"].as_str().unwrap()).unwrap();
+        validate_seadrop_calldata(data.as_ref(), nft, minter, 2, None).unwrap();
+
+        let other: Address = "0x4444444444444444444444444444444444444444"
+            .parse()
+            .unwrap();
+        assert!(validate_seadrop_calldata(data.as_ref(), nft, other, 2, None).is_err());
+        assert!(validate_seadrop_calldata(data.as_ref(), nft, minter, 1, None).is_err());
+    }
+
+    #[test]
+    fn validates_signed_stage_and_signature_bounds() {
+        use alloy_primitives::keccak256;
+        let nft: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let minter: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        let mut data = keccak256("mintSigned(address,address,address,uint256,(uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool),uint256,bytes)".as_bytes())[..4].to_vec();
+        let mut words = vec![[0u8; 32]; 14];
+        words[0][12..].copy_from_slice(nft.as_slice());
+        words[2][12..].copy_from_slice(minter.as_slice());
+        words[3][24..].copy_from_slice(&2u64.to_be_bytes());
+        words[8][24..].copy_from_slice(&7u64.to_be_bytes());
+        words[11][31] = 1;
+        words[13][24..].copy_from_slice(&(14u64 * 32).to_be_bytes());
+        for word in words {
+            data.extend_from_slice(&word);
+        }
+        let mut length = [0u8; 32];
+        length[24..].copy_from_slice(&65u64.to_be_bytes());
+        data.extend_from_slice(&length);
+        data.extend_from_slice(&[0xabu8; 65]);
+
+        validate_seadrop_calldata(&data, nft, minter, 2, Some(7)).unwrap();
+        assert!(validate_seadrop_calldata(&data, nft, minter, 2, Some(8)).is_err());
+        data.truncate(data.len() - 1);
+        assert!(validate_seadrop_calldata(&data, nft, minter, 2, Some(7)).is_err());
     }
 
     #[test]

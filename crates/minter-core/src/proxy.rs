@@ -436,7 +436,7 @@ async fn probe_direct() -> ProbeResult {
             };
         }
     };
-    match client.get("https://opensea.io/").send().await {
+    match client.head("https://gql.opensea.io/graphql").send().await {
         Ok(resp) if resp.status().as_u16() < 500 => ProbeResult {
             ok: true,
             latency_ms: Some(started.elapsed().as_millis() as u64),
@@ -481,7 +481,7 @@ async fn probe_proxy_url(proxy_url: &str) -> ProbeResult {
             };
         }
     };
-    match client.get("https://opensea.io/").send().await {
+    match client.head("https://gql.opensea.io/graphql").send().await {
         Ok(resp) if resp.status().as_u16() < 500 => ProbeResult {
             ok: true,
             latency_ms: Some(started.elapsed().as_millis() as u64),

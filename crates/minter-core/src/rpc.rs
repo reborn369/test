@@ -57,9 +57,11 @@ impl RpcTuning {
 pub struct RpcClient {
     client: reqwest::Client,
     urls: Vec<String>,
+    /// HTTP endpoints used only for `eth_sendRawTransaction`. They are never
+    /// queried for chain id, nonce, fees, simulation, or receipts.
+    send_only_urls: Vec<String>,
     next_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
     tuning: RpcTuning,
-    ws_clients: Vec<crate::ws::WsClient>,
 }
 
 impl Clone for RpcClient {
@@ -67,9 +69,9 @@ impl Clone for RpcClient {
         Self {
             client: self.client.clone(),
             urls: self.urls.clone(),
+            send_only_urls: self.send_only_urls.clone(),
             next_id: self.next_id.clone(),
             tuning: self.tuning,
-            ws_clients: self.ws_clients.clone(),
         }
     }
 }
@@ -96,16 +98,9 @@ impl RpcClient {
             .filter(|u| u.starts_with("ws://") || u.starts_with("wss://"))
             .cloned()
             .collect();
-        let ws_clients = ws_urls
-            .iter()
-            .cloned()
-            .map(crate::ws::WsClient::spawn)
-            .collect();
-
-        // Receipt polling and the verified fallback always need HTTP. Most EVM
-        // providers expose HTTP and WS JSON-RPC on the same URL, so derive the
-        // counterpart when an operator configured WSS only. Explicit HTTP URLs
-        // retain their original order and remain the preferred fallback.
+        // WebSocket transport is intentionally not used. Keep a compatibility
+        // conversion for old configs that contain a WSS provider URL so an
+        // upgrade cannot leave the operator with zero usable RPC endpoints.
         let mut http_urls: Vec<String> = urls
             .iter()
             .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
@@ -132,21 +127,30 @@ impl RpcClient {
         Ok(Self {
             client,
             urls: http_urls,
+            send_only_urls: Vec::new(),
             next_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             tuning: RpcTuning::from_lookup(|k| std::env::var(k).ok()),
-            ws_clients,
         })
     }
 
-    pub fn ws_clients(&self) -> &[crate::ws::WsClient] {
-        &self.ws_clients
+    /// Add an HTTP JSON-RPC ingress used exclusively for broadcast fan-out.
+    /// This is for sequencers that accept `eth_sendRawTransaction` but do not
+    /// implement read methods such as `eth_chainId`.
+    pub fn add_send_only_url(&mut self, url: impl Into<String>) {
+        let url = url.into();
+        if (url.starts_with("http://") || url.starts_with("https://"))
+            && !self
+                .urls
+                .iter()
+                .chain(&self.send_only_urls)
+                .any(|u| u == &url)
+        {
+            self.send_only_urls.push(url);
+        }
     }
 
-    pub fn connected_ws_count(&self) -> usize {
-        self.ws_clients
-            .iter()
-            .filter(|client| client.is_connected())
-            .count()
+    pub fn send_only_count(&self) -> usize {
+        self.send_only_urls.len()
     }
 
     pub fn short_url(url: &str) -> String {
@@ -813,12 +817,16 @@ impl RpcClient {
     /// the errors from the others (`losers`). Useful for latency/observability
     /// (which node is winning broadcasts) without changing the hash contract.
     pub async fn send_raw_transaction_report(&self, raw: &Bytes) -> Result<SendReport> {
-        let urls: Vec<String> = self
+        let mut urls: Vec<String> = self
             .urls
             .iter()
             .take(self.tuning.max_nodes)
             .cloned()
             .collect();
+        // Send-only ingress is additive and must not consume the normal
+        // max-nodes budget: the latter protects read fan-out, while broadcast
+        // redundancy is the entire purpose of these endpoints.
+        urls.extend(self.send_only_urls.iter().cloned());
         let http_attempts = urls.len();
         if http_attempts == 0 {
             bail!("No HTTP RPC URLs configured for verified broadcast and receipt fallback");
@@ -829,13 +837,7 @@ impl RpcClient {
         // serde serialization off the hot path — they used to run per-endpoint.
         let raw_hex = format!("0x{}", hex::encode(raw));
         let expected_hash = alloy_primitives::keccak256(raw.as_ref());
-        let connected_ws: Vec<_> = self
-            .ws_clients
-            .iter()
-            .filter(|client| client.is_connected())
-            .cloned()
-            .collect();
-        let max_attempts = http_attempts + connected_ws.len();
+        let max_attempts = http_attempts;
 
         let prebuilt_body: Vec<u8> = {
             let base_id = self
@@ -863,29 +865,6 @@ impl RpcClient {
             std::result::Result<serde_json::Value, String>,
             u64,
         )> = tokio::task::JoinSet::new();
-
-        // Persistent WS sends start first, but are bounded and acknowledged.
-        // The verified HTTP path below always starts as well and stays alive
-        // after the first ACK, so WebSocket remains an accelerator, not a SPOF.
-        for (index, ws) in connected_ws.into_iter().enumerate() {
-            let raw_hex = raw_hex.clone();
-            set.spawn(async move {
-                let started = std::time::Instant::now();
-                let result = ws
-                    .call_timeout(
-                        "eth_sendRawTransaction",
-                        json!([raw_hex]),
-                        Duration::from_millis(1_500),
-                    )
-                    .await
-                    .map_err(|error| error.to_string());
-                (
-                    format!("websocket#{}", index + 1),
-                    result,
-                    started.elapsed().as_millis() as u64,
-                )
-            });
-        }
 
         for (attempt, url) in urls.into_iter().enumerate() {
             crate::rlog!(
@@ -1018,7 +997,6 @@ impl RpcClient {
                         winner,
                         nodes_tried: max_attempts,
                         winner_latency_ms,
-                        ws_attempts: max_attempts.saturating_sub(http_attempts),
                         http_attempts,
                         losers,
                     });
@@ -1212,8 +1190,6 @@ pub struct SendReport {
     pub nodes_tried: usize,
     /// Time from the winning attempt starting until its verified ACK.
     pub winner_latency_ms: u64,
-    /// Connected persistent WebSocket endpoints included in the fan-out.
-    pub ws_attempts: usize,
     /// HTTP endpoints included in the fan-out.
     pub http_attempts: usize,
     /// `"shorturl: error"` for endpoints that errored before the winner.
@@ -1585,7 +1561,6 @@ mod tests {
         assert_eq!(report.hash, hash_hex.parse::<B256>().unwrap());
         assert_eq!(report.winner, good_short);
         assert_eq!(report.nodes_tried, 2);
-        assert_eq!(report.ws_attempts, 0);
         assert_eq!(report.http_attempts, 2);
         assert_eq!(report.losers.len(), 1, "the failed lead node is recorded");
         assert!(report.losers[0].contains("nope"));
@@ -1604,10 +1579,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wss_only_configuration_derives_http_fallback() {
+    async fn legacy_wss_configuration_derives_http_without_opening_a_websocket() {
         let rpc = RpcClient::new(vec!["ws://127.0.0.1:9/provider".to_string()]);
         assert_eq!(rpc.urls, vec!["http://127.0.0.1:9/provider"]);
-        assert_eq!(rpc.ws_clients.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_only_endpoint_joins_broadcast_but_not_reads() {
+        let raw = Bytes::from(vec![7u8, 8, 9]);
+        let hash_hex = format!(
+            "0x{}",
+            hex::encode(alloy_primitives::keccak256(raw.as_ref()).as_slice())
+        );
+        let read = spawn_mock(ok_body(&hash_hex), Duration::from_millis(50));
+        let send_only = spawn_mock(ok_body(&hash_hex), Duration::ZERO);
+        let send_only_short = RpcClient::short_url(&send_only);
+        let mut rpc = RpcClient::new(vec![read]);
+        rpc.add_send_only_url(send_only);
+        assert_eq!(rpc.send_only_count(), 1);
+        let report = rpc.send_raw_transaction_report(&raw).await.unwrap();
+        assert_eq!(report.nodes_tried, 2);
+        assert_eq!(report.http_attempts, 2);
+        assert_eq!(report.winner, send_only_short);
     }
 
     #[tokio::test]

@@ -3243,20 +3243,17 @@ mod rpc_collect_tests {
 
     #[test]
     fn public_fallback_is_appended_even_with_a_paid_provider_key() {
-        // A paid Alchemy provider contributes its persistent WSS fast path and
-        // verified HTTPS counterpart; the public HTTP fallback is still
-        // appended unconditionally.
+        // A paid Alchemy HTTPS endpoint leads; the public HTTP fallback is
+        // still appended unconditionally.
         let mut env = HashMap::new();
         env.insert("ALCHEMY_API_KEY".into(), "myKey99".into());
         let labeled = collect_rpc_urls_for_chain_labeled(&env, Some("robinhood"), &[]);
-        assert_eq!(labeled.len(), 3, "{labeled:?}");
+        assert_eq!(labeled.len(), 2, "{labeled:?}");
         assert_eq!(labeled[0].1, RpcOrigin::Provider);
-        assert!(labeled[0].0.starts_with("wss://"));
+        assert!(labeled[0].0.starts_with("https://"));
         assert!(labeled[0].0.contains("robinhood-mainnet.g.alchemy.com"));
-        assert_eq!(labeled[1].1, RpcOrigin::Provider);
-        assert!(labeled[1].0.starts_with("https://"));
-        assert_eq!(labeled[2].1, RpcOrigin::Public);
-        assert!(labeled[2].0.contains("rpc.mainnet.chain.robinhood.com"));
+        assert_eq!(labeled[1].1, RpcOrigin::Public);
+        assert!(labeled[1].0.contains("rpc.mainnet.chain.robinhood.com"));
     }
 
     #[test]
@@ -3822,10 +3819,6 @@ fn provider_rpc_urls_for_chain(env: &HashMap<String, String>, chain: Option<&str
 
     // Private Alchemy only (`/v2/{key}`). Never `*.g.alchemy.com/public`.
     if let (Some(key), Some(slug)) = (alchemy_api_key_from_env(env), alchemy_slug) {
-        add_unique_url(
-            &mut urls,
-            format!("wss://{}.g.alchemy.com/v2/{}", slug, key),
-        );
         add_unique_url(
             &mut urls,
             format!("https://{}.g.alchemy.com/v2/{}", slug, key),

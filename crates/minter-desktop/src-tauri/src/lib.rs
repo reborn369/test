@@ -309,6 +309,41 @@ fn canonical_wallet_addresses(addresses: &[String]) -> Vec<String> {
     out
 }
 
+/// Refuse a partial LIVE mint if the UI/task expected a different wallet set.
+/// This is intentionally checked again across the IPC boundary: a future UI
+/// filter bug must fail closed instead of silently turning 10 wallets into 1.
+fn validate_wallet_selection_integrity(
+    expected: Option<usize>,
+    addresses: Option<&[String]>,
+    vault_count: usize,
+) -> Result<usize, String> {
+    let received = match addresses {
+        Some(values) if values.iter().any(|value| !value.trim().is_empty()) => {
+            let nonempty = values
+                .iter()
+                .filter(|value| !value.trim().is_empty())
+                .count();
+            let canonical = canonical_wallet_addresses(values);
+            if canonical.len() != nonempty {
+                return Err(format!(
+                    "Wallet selection contains duplicates: {nonempty} entries but {} unique; refusing LIVE mint",
+                    canonical.len()
+                ));
+            }
+            canonical.len()
+        }
+        _ => vault_count,
+    };
+    if let Some(expected) = expected {
+        if expected != received {
+            return Err(format!(
+                "Wallet selection integrity check failed: task expected {expected}, backend received {received}; refusing partial LIVE mint"
+            ));
+        }
+    }
+    Ok(received)
+}
+
 /// Keep a 500-wallet confirmation context comfortably below the 4 KiB
 /// challenge cap while cryptographically binding the exact selected set.
 fn wallet_selection_context(addresses: Option<&[String]>) -> String {
@@ -1300,6 +1335,9 @@ struct RunMintInput {
     confirmation_id: Option<String>,
     /// Selected vault addresses (if empty/absent → all wallets).
     wallet_addresses: Option<Vec<String>>,
+    /// Original task wallet count. Guards the IPC boundary against accidental
+    /// client-side filtering before a LIVE run.
+    expected_wallet_count: Option<usize>,
     /// RPC chain override (ethereum, base, …).
     chain_override: Option<String>,
     /// Gas limit: omit = settings; 0 = auto estimate; n = fixed (manual).
@@ -1330,12 +1368,11 @@ async fn run_mint(
     let busy = MintBusyGuard::try_acquire_cancellable(&state.run_state, &state.run_id)?;
     let session = state.session.lock().clone();
     let dry_run = input.dry_run.unwrap_or(session.dry_run);
-    let wallet_count = input
-        .wallet_addresses
-        .as_ref()
-        .filter(|v| !v.is_empty())
-        .map(Vec::len)
-        .unwrap_or(session.signers.len());
+    let wallet_count = validate_wallet_selection_integrity(
+        input.expected_wallet_count,
+        input.wallet_addresses.as_deref(),
+        session.signers.len(),
+    )?;
     let context = confirmation_context(&[
         input.slug.clone(),
         input.quantity.unwrap_or(1).max(1).to_string(),
@@ -2611,6 +2648,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn live_wallet_integrity_accepts_exact_ten_wallets() {
+        let wallets: Vec<String> = (0..10).map(|i| format!("0x{i:040x}")).collect();
+        assert_eq!(
+            validate_wallet_selection_integrity(Some(10), Some(&wallets), 50).unwrap(),
+            10
+        );
+    }
+
+    #[test]
+    fn live_wallet_integrity_refuses_ten_to_one_regression() {
+        let one = vec!["0x0000000000000000000000000000000000000001".to_string()];
+        let error = validate_wallet_selection_integrity(Some(10), Some(&one), 50).unwrap_err();
+        assert!(error.contains("expected 10"), "{error}");
+        assert!(error.contains("received 1"), "{error}");
+        assert!(error.contains("refusing partial LIVE mint"), "{error}");
+    }
+
+    #[test]
+    fn live_wallet_integrity_refuses_duplicate_entries() {
+        let duplicate = vec![
+            "0x0000000000000000000000000000000000000001".to_string(),
+            "0x0000000000000000000000000000000000000001".to_string(),
+        ];
+        let error = validate_wallet_selection_integrity(Some(2), Some(&duplicate), 50).unwrap_err();
+        assert!(error.contains("duplicates"), "{error}");
+    }
+
+    #[test]
+    fn opensea_task_ui_never_prefilters_before_auto_chain_resolution() {
+        let app = include_str!("../../ui/app.js");
+        let start = app
+            .find("async function startMintTaskInner")
+            .expect("task start function");
+        let tail = &app[start..];
+        let end = tail
+            .find("async function checkForUpdate")
+            .expect("function after task runner");
+        let runner = &tail[..end];
+        assert!(
+            !runner.contains("invoke(\"wallet_balances\""),
+            "OpenSea task runner must defer balances until core resolves Auto chain"
+        );
+        assert!(runner.contains("expectedWalletCount: task.wallets.length"));
+        assert!(runner.contains("walletAddresses: runWallets"));
     }
 
     #[test]

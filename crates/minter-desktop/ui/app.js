@@ -4522,7 +4522,9 @@ function normalizeTask(raw) {
         ? Number(t0.phaseStartAt)
         : null,
     phaseLabel: t0.phaseLabel || null,
-    filterBalance: t0.filterBalance !== false,
+    // Legacy field kept on disk for compatibility. OpenSea balance validation
+    // is mandatory and runs in core after Auto resolves the collection chain.
+    filterBalance: true,
     priorityFeeGwei: t0.priorityFeeGwei || t0.priority_fee_gwei || "",
     atTime: t0.atTime || t0.at_time || "",
     walletQuantities:
@@ -4556,7 +4558,7 @@ function taskToPersist(task) {
     chainOverride: task.chainOverride,
     phaseStartAt: task.phaseStartAt,
     phaseLabel: task.phaseLabel,
-    filterBalance: task.filterBalance !== false,
+    filterBalance: true,
     priorityFeeGwei: task.priorityFeeGwei || "",
     atTime: task.atTime || "",
     walletQuantities: task.walletQuantities || null,
@@ -4845,7 +4847,7 @@ async function openTaskModal(opts = {}) {
         wallets: [...(src.wallets || [])],
         phaseStartAt: src.phaseStartAt,
         phaseLabel: src.phaseLabel,
-        filterBalance: src.filterBalance !== false,
+        filterBalance: true,
         // preserve mint fields 13/14/16 on edit (do not wipe)
         priorityFeeGwei: src.priorityFeeGwei || "",
         atTime: src.atTime || "",
@@ -4873,7 +4875,7 @@ async function openTaskModal(opts = {}) {
   if ($("task-conditional-lead"))
     $("task-conditional-lead").value = String(pref.conditionalLeadMs || 1000);
   syncConditionalSubmitUi();
-  if ($("task-filter-balance")) $("task-filter-balance").checked = pref.filterBalance !== false;
+  if ($("task-filter-balance")) $("task-filter-balance").checked = true;
   if ($("task-skip-est")) $("task-skip-est").checked = pref.skipEstimateOnOpen !== false;
   if ($("task-prio")) $("task-prio").value = pref.priorityFeeGwei || "";
   if ($("task-at")) $("task-at").value = pref.atTime || "";
@@ -5624,7 +5626,7 @@ $("task-modal-save")?.addEventListener("click", () => {
     ),
     phaseStartAt,
     phaseLabel,
-    filterBalance: $("task-filter-balance")?.checked !== false,
+    filterBalance: true,
     skipEstimateOnOpen: $("task-skip-est") ? !!$("task-skip-est").checked : true,
     priorityFeeGwei: ($("task-prio")?.value || "").trim(),
     atTime: ($("task-at")?.value || "").trim(),
@@ -6572,44 +6574,12 @@ async function startMintTaskInner(taskId, opts = {}) {
     return;
   }
 
-  // Optional: drop low-balance wallets before Start
+  // Preserve the task wallet set exactly. In Auto mode the collection chain is
+  // unknown here; the old UI pre-filter used the default Ethereum RPC and
+  // silently removed wallets funded on Robinhood. Core owns the authoritative
+  // balance gate after it resolves the collection chain and checks exact mint
+  // value + current gas. A transient balance RPC error is not a proven zero.
   let runWallets = [...(task.wallets || [])];
-  if (task.filterBalance !== false && runWallets.length) {
-    try {
-      const balChain =
-        task.chainOverride && task.chainOverride !== "auto"
-          ? task.chainOverride
-          : null;
-      appendMintLog(
-        "Balance filter: checking" + (balChain ? ` (${balChain})` : "") + "…"
-      );
-      const rows = await invoke("wallet_balances", {
-        input: { walletAddresses: runWallets, chain: balChain },
-      });
-      const funded = new Set(
-        rows.filter((r) => r.ok).map((r) => addrKey(r.address))
-      );
-      const before = runWallets.length;
-      runWallets = runWallets.filter((a) => funded.has(addrKey(a)));
-      const skipped = before - runWallets.length;
-      if (skipped > 0) {
-        appendMintLog(
-          `Balance filter: ${runWallets.length}/${before} funded (skipped ${skipped})`
-        );
-      } else {
-        appendMintLog(`Balance filter: all ${before} funded`);
-      }
-      if (!runWallets.length) {
-        appendMintLog("No funded wallets — abort start");
-        task.status = "error";
-        renderTaskList();
-        if (!fromQueue) setTimeout(() => processQueue(), 0);
-        return;
-      }
-    } catch (e) {
-      appendMintLog("Balance filter failed (continuing all): " + e);
-    }
-  }
 
   // Tasks Start is LIVE (sim → tx). Optional type-LIVE gate from Settings.
   const gasLabel =
@@ -6718,6 +6688,9 @@ async function startMintTaskInner(taskId, opts = {}) {
   mintRowOrder = [];
   clearMintLog();
   appendMintLog(
+    `Wallet integrity: ${runWallets.length}/${task.wallets.length} preserved; balances are checked on the resolved mint network`
+  );
+  appendMintLog(
     `OpenSea routes: direct=${effectiveDirectCount}, proxy=${effectiveProxiedCount} (${configuredProxyCount} configured)`
   );
   $("mint-summary").textContent = "";
@@ -6750,6 +6723,7 @@ async function startMintTaskInner(taskId, opts = {}) {
         confirm: liveGate.confirm,
         confirmationId: liveGate.confirmationId,
         walletAddresses: runWallets,
+        expectedWalletCount: task.wallets.length,
         chainOverride: task.chainOverride === "auto" ? null : task.chainOverride,
         gasLimit,
         priorityFeeGwei: (task.priorityFeeGwei || "").trim() || null,

@@ -133,6 +133,24 @@ pub(crate) fn late_preflight_proves_rejection(err: &str) -> bool {
         || lower.contains("revert data")
 }
 
+pub(crate) fn validate_wallet_subset_counts(
+    requested_entries: usize,
+    requested_unique: usize,
+    matched_vault_wallets: usize,
+) -> Result<()> {
+    if requested_entries != requested_unique {
+        bail!(
+            "Selected wallet set has {requested_entries} entries but {requested_unique} unique addresses; refusing partial/duplicate mint"
+        );
+    }
+    if matched_vault_wallets != requested_unique {
+        bail!(
+            "Selected wallet set mismatch: requested {requested_unique}, found {matched_vault_wallets} in unlocked vault; refusing partial mint"
+        );
+    }
+    Ok(())
+}
+
 fn format_unix_hms(ts: u64) -> String {
     chrono::DateTime::from_timestamp(ts as i64, 0)
         .map(|d| d.format("%H:%M:%S UTC").to_string())
@@ -1159,9 +1177,7 @@ pub async fn run_opensea_mint(
                     orig_idx.push(i);
                 }
             }
-            if selected.is_empty() {
-                bail!("Selected wallets not found in unlocked vault");
-            }
+            validate_wallet_subset_counts(addrs.len(), want.len(), selected.len())?;
             log_always(
                 reporter.as_ref(),
                 format!(
@@ -4962,7 +4978,7 @@ mod tests {
         format_not_active, format_rpc_plan, gql_stagger_step_ms, in_phase_open_lag_window,
         is_proven_pre_open_revert, late_preflight_proves_rejection, parse_not_active,
         parse_tx_calldata_hex, pre_sign_ready_wallets, rate_limit_backoff, resolve_mint_gas_limit,
-        validate_seadrop_calldata,
+        validate_seadrop_calldata, validate_wallet_subset_counts,
     };
     use crate::proxy::ProxyManager;
     use crate::types::Signer;
@@ -5369,6 +5385,15 @@ mod tests {
         ));
         assert!(!late_preflight_proves_rejection("RPC request timed out"));
         assert!(!late_preflight_proves_rejection("connection reset"));
+    }
+
+    #[test]
+    fn wallet_subset_must_match_the_requested_set_exactly() {
+        assert!(validate_wallet_subset_counts(10, 10, 10).is_ok());
+        let missing = validate_wallet_subset_counts(10, 10, 1).unwrap_err();
+        assert!(missing.to_string().contains("requested 10, found 1"));
+        let duplicate = validate_wallet_subset_counts(10, 9, 9).unwrap_err();
+        assert!(duplicate.to_string().contains("10 entries but 9 unique"));
     }
 
     #[test]

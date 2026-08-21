@@ -320,6 +320,13 @@ fn assigned_proxy_routes(
         .collect()
 }
 
+/// A failed early balance read must never silently remove a selected wallet.
+/// Only a balance proven to be exactly zero is safe to discard before we know
+/// the selected phase price and exact gas requirement.
+fn keep_before_opensea_auth(balance: Option<U256>) -> bool {
+    balance.map(|value| value != U256::ZERO).unwrap_or(true)
+}
+
 fn route_auth_summary(label: &str, wallets: &[WalletAuth], via_proxy: bool) -> String {
     let group: Vec<&WalletAuth> = wallets
         .iter()
@@ -1392,7 +1399,121 @@ pub async fn run_opensea_mint(
         }
     }
 
-    // Limit parallel SIWE calls — OpenSea returns 429 when all wallets auth at once.
+    // Resolve the mint network first, then cheaply discard wallets that are
+    // proven to have no native token at all. OpenSea SIWE plus per-wallet phase
+    // discovery is orders of magnitude slower than eth_getBalance; doing it for
+    // empty wallets made a 50-selected / 10-funded run miss a short public sale.
+    //
+    // This is deliberately only a zero-balance gate. A non-zero balance may
+    // still be too small for price plus gas, but the exact requirement is known
+    // later and remains enforced by the existing balance gate. RPC failures are
+    // fail-open here so transient node trouble cannot recreate silent wallet
+    // loss.
+    report_phase(
+        reporter.as_ref(),
+        "funds",
+        format!(
+            "Checking {} selected wallet balance(s) on {} before OpenSea auth...",
+            signers.len(),
+            chain_for_rpc
+        ),
+    );
+    let selected_before_early_gate = signers.len();
+    let mut balance_handles = Vec::with_capacity(signers.len());
+    for (index, signer) in signers.iter().enumerate() {
+        let rpc = rpc.clone();
+        let address = signer.address();
+        balance_handles.push(tokio::spawn(async move {
+            (index, address, rpc.balance(&address).await)
+        }));
+    }
+
+    let mut keep_selected = vec![true; signers.len()];
+    let mut zero_balance_count = 0usize;
+    let mut balance_read_failures = 0usize;
+    for handle in balance_handles {
+        match handle.await {
+            Ok((index, address, Ok(balance))) => {
+                if !keep_before_opensea_auth(Some(balance)) {
+                    keep_selected[index] = false;
+                    zero_balance_count += 1;
+                    report_wallet(
+                        reporter.as_ref(),
+                        &address,
+                        Some(WalletStatus::Failed),
+                        Some("skipped before OpenSea auth".to_string()),
+                        None,
+                        Some(format!(
+                            "zero balance on resolved mint network {}",
+                            chain_for_rpc
+                        )),
+                    );
+                }
+            }
+            Ok((_, address, Err(error))) => {
+                balance_read_failures += 1;
+                log_always(
+                    reporter.as_ref(),
+                    format!(
+                        "  [{}] early balance read failed; wallet retained: {}",
+                        sign::shorten_address(&address),
+                        error
+                    ),
+                );
+            }
+            Err(error) => {
+                balance_read_failures += 1;
+                log_always(
+                    reporter.as_ref(),
+                    format!("  early balance worker failed; wallet retained: {}", error),
+                );
+            }
+        }
+    }
+
+    let early_signers_owned: Vec<Signer> = signers
+        .iter()
+        .zip(keep_selected.iter())
+        .filter(|(_, keep)| **keep)
+        .map(|(signer, _)| signer.clone())
+        .collect();
+    let early_wallet_proxy_routes: Vec<Option<String>> = wallet_proxy_routes
+        .iter()
+        .zip(keep_selected.iter())
+        .filter(|(_, keep)| **keep)
+        .map(|(route, _)| route.clone())
+        .collect();
+    if early_signers_owned.is_empty() {
+        bail!(
+            "All {} selected wallets have zero balance on resolved mint network '{}'",
+            selected_before_early_gate,
+            chain_for_rpc
+        );
+    }
+    log_always(
+        reporter.as_ref(),
+        format!(
+            "Early balance gate: {}/{} wallet(s) retained for OpenSea auth; {} zero-balance skipped; {} RPC read failure(s) retained",
+            early_signers_owned.len(),
+            selected_before_early_gate,
+            zero_balance_count,
+            balance_read_failures
+        ),
+    );
+
+    // Shadow the selected task set only after the chain-aware gate. Routes stay
+    // paired by original selected-wallet index, including manual/direct routes.
+    let signers: &[Signer] = &early_signers_owned;
+    let wallet_proxy_routes = early_wallet_proxy_routes;
+    let direct_route_count = wallet_proxy_routes.iter().filter(|p| p.is_none()).count();
+    let proxied_route_count = wallet_proxy_routes.len().saturating_sub(direct_route_count);
+    let unique_proxy_count = wallet_proxy_routes
+        .iter()
+        .filter_map(|p| p.as_deref())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+
+    // Limit parallel SIWE calls. OpenSea returns 429 when all wallets auth at once.
     // Mixed A/B runs get a shared cap plus a direct-only cap of 2, so adding
     // proxy wallets cannot raise concurrency against the VPS public IP.
     let auth_override: Option<usize> = env
@@ -4976,9 +5097,9 @@ mod tests {
         RATE_LIMIT_WAIT_BUDGET_MS, WalletAuth, assigned_proxy_routes, build_local_public_mint,
         classify_mint_error, enrich_mint_rpc_error, estimate_fail_policy, fire_lag_ms_from_clock,
         format_not_active, format_rpc_plan, gql_stagger_step_ms, in_phase_open_lag_window,
-        is_proven_pre_open_revert, late_preflight_proves_rejection, parse_not_active,
-        parse_tx_calldata_hex, pre_sign_ready_wallets, rate_limit_backoff, resolve_mint_gas_limit,
-        validate_seadrop_calldata, validate_wallet_subset_counts,
+        is_proven_pre_open_revert, keep_before_opensea_auth, late_preflight_proves_rejection,
+        parse_not_active, parse_tx_calldata_hex, pre_sign_ready_wallets, rate_limit_backoff,
+        resolve_mint_gas_limit, validate_seadrop_calldata, validate_wallet_subset_counts,
     };
     use crate::proxy::ProxyManager;
     use crate::types::Signer;
@@ -5394,6 +5515,27 @@ mod tests {
         assert!(missing.to_string().contains("requested 10, found 1"));
         let duplicate = validate_wallet_subset_counts(10, 9, 9).unwrap_err();
         assert!(duplicate.to_string().contains("10 entries but 9 unique"));
+    }
+
+    #[test]
+    fn early_balance_gate_only_drops_proven_zero_balances() {
+        assert!(!keep_before_opensea_auth(Some(U256::ZERO)));
+        assert!(keep_before_opensea_auth(Some(U256::from(1u64))));
+        // None models an RPC read failure. The wallet must survive for the
+        // existing exact price-plus-gas check instead of disappearing silently.
+        assert!(keep_before_opensea_auth(None));
+
+        let mut fifty_selected = vec![Some(U256::ZERO); 50];
+        for balance in fifty_selected.iter_mut().take(10) {
+            *balance = Some(U256::from(1u64));
+        }
+        assert_eq!(
+            fifty_selected
+                .into_iter()
+                .filter(|balance| keep_before_opensea_auth(*balance))
+                .count(),
+            10
+        );
     }
 
     #[test]

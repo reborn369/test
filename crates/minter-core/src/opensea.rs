@@ -1257,6 +1257,20 @@ pub fn stage_effective_eligible(stage: &StageInfo) -> bool {
         .unwrap_or_else(|| stage.stage_type == "PUBLIC_SALE")
 }
 
+/// A stage whose advertised end is at or before `now` is no longer a valid
+/// choice. Missing/zero end times mean "unknown/no fixed end" and stay
+/// selectable; the contract/OpenSea action remains the final authority.
+pub fn stage_is_expired_at(stage: &StageInfo, now: i64) -> bool {
+    stage
+        .end_time
+        .filter(|end| *end > 0.0)
+        .is_some_and(|end| end as i64 <= now)
+}
+
+pub fn stage_is_selectable_at(stage: &StageInfo, now: i64) -> bool {
+    stage_effective_eligible(stage) && !stage_is_expired_at(stage, now)
+}
+
 fn stage_wallet_limit(stage: &StageInfo) -> Option<i64> {
     stage.max_mintable.or_else(|| {
         stage

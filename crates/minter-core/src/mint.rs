@@ -615,6 +615,126 @@ fn build_local_public_mint(
     Ok((to, value, calldata))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SeaDropPublicState {
+    mint_price: U256,
+    start_time: u64,
+    end_time: u64,
+    max_total_mintable_by_wallet: u64,
+}
+
+fn abi_word_u64(bytes: &[u8]) -> Result<u64> {
+    if bytes.len() != 32 || bytes[..24].iter().any(|byte| *byte != 0) {
+        bail!("SeaDrop ABI word does not fit u64");
+    }
+    Ok(u64::from_be_bytes(bytes[24..32].try_into()?))
+}
+
+/// Read the authoritative public-drop configuration once per collection.
+/// This is intentionally an RPC view call, not one request per wallet.
+async fn read_seadrop_public_state(
+    rpc: &rpc::RpcClient,
+    seadrop_address: Option<&str>,
+    nft_contract: &str,
+) -> Result<SeaDropPublicState> {
+    let seadrop: Address = seadrop_address
+        .unwrap_or(DEFAULT_SEADROP_ADDRESS)
+        .parse()
+        .context("invalid SeaDrop address")?;
+    let nft: Address = nft_contract.parse().context("invalid NFT contract")?;
+    let selector = keccak256("getPublicDrop(address)".as_bytes());
+    let mut calldata = Vec::with_capacity(36);
+    calldata.extend_from_slice(&selector[..4]);
+    calldata.extend_from_slice(&[0u8; 12]);
+    calldata.extend_from_slice(nft.as_slice());
+    let raw = rpc
+        .eth_call(&Address::ZERO, &seadrop, &Bytes::from(calldata))
+        .await
+        .context("SeaDrop getPublicDrop failed")?;
+    if raw.len() < 6 * 32 {
+        bail!(
+            "SeaDrop getPublicDrop returned {} bytes, expected 192",
+            raw.len()
+        );
+    }
+    Ok(SeaDropPublicState {
+        mint_price: U256::from_be_slice(&raw[0..32]),
+        start_time: abi_word_u64(&raw[32..64])?,
+        end_time: abi_word_u64(&raw[64..96])?,
+        max_total_mintable_by_wallet: abi_word_u64(&raw[96..128])?,
+    })
+}
+
+fn validate_seadrop_public_state(
+    state: SeaDropPublicState,
+    authorized_unit_price: U256,
+    quantity: u32,
+    fire_time: i64,
+) -> Result<U256> {
+    if state.mint_price > authorized_unit_price {
+        bail!(
+            "PUBLIC_SALE price changed from authorized {} wei to {} wei; refusing to spend more without explicit user approval",
+            authorized_unit_price,
+            state.mint_price
+        );
+    }
+    if state.max_total_mintable_by_wallet > 0
+        && u64::from(quantity) > state.max_total_mintable_by_wallet
+    {
+        bail!(
+            "PUBLIC_SALE quantity {} exceeds on-chain wallet limit {}",
+            quantity,
+            state.max_total_mintable_by_wallet
+        );
+    }
+    let fire_time = fire_time.max(0) as u64;
+    if state.start_time > 0 && fire_time < state.start_time {
+        bail!(
+            "PUBLIC_SALE opens on chain at unix {}, but task fires at {}",
+            state.start_time,
+            fire_time
+        );
+    }
+    if state.end_time > 0 && fire_time >= state.end_time {
+        bail!(
+            "PUBLIC_SALE is closed on chain (ended at unix {})",
+            state.end_time
+        );
+    }
+    Ok(state.mint_price)
+}
+
+fn rebuild_local_public_wallets(
+    wallets: &mut [WalletAuth],
+    wallet_quantities: &HashMap<Address, u32>,
+    default_quantity: u32,
+    nft_contract: &str,
+    unit_price: U256,
+    seadrop_address: Option<&str>,
+    fee_recipient: Option<&str>,
+) -> Result<usize> {
+    let mut built = 0usize;
+    for wallet in wallets.iter_mut().filter(|wallet| wallet.auth_ok) {
+        let quantity = wallet_quantities
+            .get(&wallet.address)
+            .copied()
+            .unwrap_or(default_quantity);
+        wallet.prefetched_tx = Some(build_local_public_mint(
+            nft_contract,
+            quantity,
+            unit_price,
+            seadrop_address,
+            fee_recipient,
+            wallet.address,
+        )?);
+        // A price/config refresh invalidates any signature made from the old
+        // value. The caller signs the rebuilt transactions before T0.
+        wallet.pre_signed_tx = None;
+        built += 1;
+    }
+    Ok(built)
+}
+
 /// Wall-clock fire lag in ms: `now_ms − start_ts*1000`, floored at 0.
 pub(crate) fn fire_lag_ms_from_clock(start_ts: i64, now_ms: i64) -> u64 {
     let open_ms = start_ts.saturating_mul(1000);
@@ -1050,8 +1170,24 @@ const RATE_LIMIT_WAIT_BUDGET_MS: u64 = 12_000;
 /// calldata.  It is safe to retry because no transaction has been signed or
 /// broadcast yet.  This must consume the operator's configured attempt budget,
 /// not the much smaller generic-error allowance.
-fn is_gql_action_not_ready(err: &str) -> bool {
+fn is_gql_action_not_ready(err: &str, stage_start_ts: Option<i64>, now_wall: i64) -> bool {
+    if !err.contains("OpenSea mint action response has no transactionSubmissionData") {
+        return false;
+    }
+    // An empty action/error set at the exact opening edge can be propagation
+    // lag. Once OpenSea names an action error it is terminal by default. The
+    // sole exception we have observed as time-dependent is DropNotMinting at
+    // T0, and even that is retried only inside the bounded opening window.
+    if !err.contains("action errors:") {
+        return true;
+    }
+    err.contains("DropNotMintingError") && in_phase_open_lag_window(stage_start_ts, now_wall)
+}
+
+fn is_terminal_gql_action_error(err: &str, stage_start_ts: Option<i64>, now_wall: i64) -> bool {
     err.contains("OpenSea mint action response has no transactionSubmissionData")
+        && err.contains("action errors:")
+        && !is_gql_action_not_ready(err, stage_start_ts, now_wall)
 }
 
 /// Keep the first edge retries tight, then ease off enough to avoid needlessly
@@ -1904,27 +2040,33 @@ pub async fn run_opensea_mint(
             .start_time
             .map(|t| format!("start={:.0}", t))
             .unwrap_or_default();
+        let end = stage
+            .end_time
+            .map(|t| format!("end={:.0}", t))
+            .unwrap_or_default();
         phase_labels.push(format!(
-            "#{} {:30} {:12} {:10} {:12} {} {}",
+            "#{} {:30} {:12} {:10} {:12} {} {} {}",
             i + 1,
             label,
             stage.stage_type,
             eligible,
             available,
             price,
-            start
+            start,
+            end
         ));
         log_always(
             reporter.as_ref(),
             format!(
-                "  {} | {} | {} | {} | {} | {} | {}",
+                "  {} | {} | {} | {} | {} | {} | {} | {}",
                 i + 1,
                 label,
                 stage.stage_type,
                 eligible,
                 available,
                 price,
-                start
+                start,
+                end
             ),
         );
     }
@@ -1940,16 +2082,16 @@ pub async fn run_opensea_mint(
         );
     }
 
+    let now = chrono::Utc::now().timestamp();
     let default_pick = stages
         .iter()
         .enumerate()
-        .filter(|(_, s)| opensea::stage_effective_eligible(s))
+        .filter(|(_, s)| opensea::stage_is_selectable_at(s, now))
         .filter(|(_, s)| opensea::available_mint_quantity(&info, s).unwrap_or(0) > 0)
         .min_by_key(|(_, s)| {
             let is_public = s.stage_type == "PUBLIC_SALE";
             // Started = start_time <= wall clock now (missing start_time counts as started).
             // Comparing against 0 marked every real (past) timestamp as "not started".
-            let now = chrono::Utc::now().timestamp();
             let has_started = s.start_time.map(|t| t as i64 <= now).unwrap_or(true);
             (
                 is_public as usize,
@@ -1958,12 +2100,12 @@ pub async fn run_opensea_mint(
             )
         })
         .map(|(i, _)| i)
-        .unwrap_or_else(|| {
+        .or_else(|| {
             stages
                 .iter()
-                .position(opensea::stage_effective_eligible)
-                .unwrap_or(0)
-        });
+                .position(|stage| !opensea::stage_is_expired_at(stage, now))
+        })
+        .context("No open or upcoming eligible drop stages found")?;
     if default_pick > 0 || stages.len() > 1 {
         let rec_stage = &stages[default_pick];
         let rec_available = opensea::available_mint_quantity(&info, rec_stage).unwrap_or(0);
@@ -2031,6 +2173,13 @@ pub async fn run_opensea_mint(
     }
     let _ = (auto_mode, &phase_labels);
     let stage = &stages[pick];
+    if opensea::stage_is_expired_at(stage, chrono::Utc::now().timestamp()) {
+        bail!(
+            "Selected phase {} is closed (ended at unix {:.0}); reload phases and choose an open/upcoming phase",
+            opensea::stage_label(stage),
+            stage.end_time.unwrap_or_default()
+        );
+    }
     log_always(
         reporter.as_ref(),
         format!("Selected: {}", opensea::stage_label(stage)),
@@ -2308,11 +2457,15 @@ pub async fn run_opensea_mint(
         .map(|c| c.as_str())
         .unwrap_or("0x0000000000000000000000000000000000000000");
     let payment_asset = opensea::stage_payment_asset(&info, stage);
-    let price_wei = stage.price_wei.unwrap_or(U256::ZERO);
+    // The price visible when the task is prepared is the maximum authorized
+    // unit price. A later on-chain increase must never be paid implicitly.
+    let authorized_price_wei = stage.price_wei.unwrap_or(U256::ZERO);
+    let mut price_wei = authorized_price_wei;
     let stage_type_owned = stage.stage_type.clone();
     let stage_token_id = opensea::stage_token_id(stage);
     let seadrop_address = env.get("SEADROP_ADDRESS").cloned();
     let fee_recipient = env.get("FEE_RECIPIENT").cloned();
+    let mut public_drop_final_verified = false;
 
     // Explicit schedule must parse cleanly — never silently fall back to phase start.
     let stage_start_ts: Option<i64> = if let Some(ref at_str) = at_time {
@@ -2828,43 +2981,15 @@ pub async fn run_opensea_mint(
                 );
                 prefetched = true;
                 if local_public_prefetch {
-                    let mut built = 0usize;
-                    for w in &mut wallets {
-                        if !w.auth_ok {
-                            continue;
-                        }
-                        let wallet_quantity = wallet_quantities
-                            .get(&w.address)
-                            .copied()
-                            .unwrap_or(quantity);
-                        match build_local_public_mint(
-                            nft_contract,
-                            wallet_quantity,
-                            price_wei,
-                            seadrop_address.as_deref(),
-                            fee_recipient.as_deref(),
-                            w.address,
-                        ) {
-                            Ok(tx) => {
-                                w.prefetched_tx = Some(tx);
-                                built += 1;
-                                log_always(
-                                    reporter.as_ref(),
-                                    format!(
-                                        "[{}] local PUBLIC_SALE calldata ready",
-                                        sign::shorten_address(&w.address)
-                                    ),
-                                );
-                            }
-                            Err(error) => log_always(
-                                reporter.as_ref(),
-                                format!(
-                                    "[{}] local PUBLIC_SALE build failed: {error}",
-                                    sign::shorten_address(&w.address)
-                                ),
-                            ),
-                        }
-                    }
+                    let built = rebuild_local_public_wallets(
+                        &mut wallets,
+                        &wallet_quantities,
+                        quantity,
+                        nft_contract,
+                        price_wei,
+                        seadrop_address.as_deref(),
+                        fee_recipient.as_deref(),
+                    )?;
                     log_always(
                         reporter.as_ref(),
                         format!("  Local PUBLIC_SALE calldata ready for {built} wallet(s)"),
@@ -2899,9 +3024,20 @@ pub async fn run_opensea_mint(
                     "\n  Refreshing nonces + fees (bounded, before open)...".to_string(),
                 );
                 let refresh_deadline =
-                    std::time::Instant::now() + std::time::Duration::from_millis(900);
+                    std::time::Instant::now() + std::time::Duration::from_millis(1_200);
                 let fee_rpc = rpc.clone();
                 let mut fee_handle = tokio::spawn(async move { fee_rpc.fee_history().await });
+                let mut public_state_handle = if local_public_prefetch {
+                    let state_rpc = rpc.clone();
+                    let state_seadrop = seadrop_address.clone();
+                    let state_nft = nft_contract.to_string();
+                    Some(tokio::spawn(async move {
+                        read_seadrop_public_state(&state_rpc, state_seadrop.as_deref(), &state_nft)
+                            .await
+                    }))
+                } else {
+                    None
+                };
                 let mut refresh_handles = tokio::task::JoinSet::new();
                 for w in &wallets {
                     if !w.auth_ok {
@@ -2934,6 +3070,51 @@ pub async fn run_opensea_mint(
                     }
                 }
                 refresh_handles.abort_all();
+
+                if let Some(mut handle) = public_state_handle.take() {
+                    let remaining =
+                        refresh_deadline.saturating_duration_since(std::time::Instant::now());
+                    let state = if handle.is_finished() {
+                        handle.await.context("SeaDrop state task failed")??
+                    } else if remaining.is_zero() {
+                        handle.abort();
+                        bail!("Final SeaDrop state check timed out before T0; mint not broadcast");
+                    } else {
+                        match tokio::time::timeout(remaining, &mut handle).await {
+                            Ok(joined) => joined.context("SeaDrop state task failed")??,
+                            Err(_) => {
+                                handle.abort();
+                                bail!(
+                                    "Final SeaDrop state check timed out before T0; mint not broadcast"
+                                );
+                            }
+                        }
+                    };
+                    let verified_price = validate_seadrop_public_state(
+                        state,
+                        authorized_price_wei,
+                        quantity,
+                        start_ts,
+                    )?;
+                    price_wei = verified_price;
+                    let rebuilt = rebuild_local_public_wallets(
+                        &mut wallets,
+                        &wallet_quantities,
+                        quantity,
+                        nft_contract,
+                        price_wei,
+                        seadrop_address.as_deref(),
+                        fee_recipient.as_deref(),
+                    )?;
+                    public_drop_final_verified = true;
+                    log_always(
+                        reporter.as_ref(),
+                        format!(
+                            "  SeaDrop FINAL OK before T0: price={} wei, rebuilt={rebuilt}",
+                            price_wei
+                        ),
+                    );
+                }
 
                 let fee_remaining =
                     refresh_deadline.saturating_duration_since(std::time::Instant::now());
@@ -3127,6 +3308,37 @@ pub async fn run_opensea_mint(
             start_ts,
             chrono::Utc::now().timestamp_millis(),
         ));
+    }
+
+    // Late/manual launches do not pass through the scheduled T-2 preparation
+    // window. Verify once before spawning workers; this costs latency only on a
+    // launch that is already late and prevents stale-price paid reverts.
+    if stage_type_owned == "PUBLIC_SALE" && !public_drop_final_verified {
+        let state = tokio::time::timeout(
+            std::time::Duration::from_millis(1_500),
+            read_seadrop_public_state(&rpc, seadrop_address.as_deref(), nft_contract),
+        )
+        .await
+        .context("Final SeaDrop state check timed out; mint not broadcast")??;
+        price_wei = validate_seadrop_public_state(
+            state,
+            authorized_price_wei,
+            quantity,
+            chrono::Utc::now().timestamp(),
+        )?;
+        rebuild_local_public_wallets(
+            &mut wallets,
+            &wallet_quantities,
+            quantity,
+            nft_contract,
+            price_wei,
+            seadrop_address.as_deref(),
+            fee_recipient.as_deref(),
+        )?;
+        log_always(
+            reporter.as_ref(),
+            format!("SeaDrop LIVE CHECK OK: price={} wei", price_wei),
+        );
     }
 
     if cancelled(&cancel) {
@@ -3500,7 +3712,12 @@ pub async fn run_opensea_mint(
                                             attempt = attempt.saturating_sub(1);
                                             continue;
                                         }
-                                        if is_gql_action_not_ready(&err_str)
+                                        let now_wall = chrono::Utc::now().timestamp();
+                                        if is_gql_action_not_ready(
+                                            &err_str,
+                                            stage_start_ts_w,
+                                            now_wall,
+                                        )
                                             && attempt < max_attempts
                                         {
                                             let wait = gql_action_not_ready_delay(attempt);
@@ -3518,6 +3735,31 @@ pub async fn run_opensea_mint(
                                             last_error = err_str;
                                             sleep_cancellable(wait, &cancel_w).await;
                                             continue;
+                                        }
+                                        if is_terminal_gql_action_error(
+                                            &err_str,
+                                            stage_start_ts_w,
+                                            now_wall,
+                                        ) {
+                                            log_always(
+                                                reporter.as_ref(),
+                                                format!(
+                                                    "[{}] OpenSea rejected the selected phase; not retrying a terminal action error: {}",
+                                                    sign::shorten_address(&addr),
+                                                    err_str
+                                                ),
+                                            );
+                                            break (
+                                                addr,
+                                                MintResult {
+                                                    address: addr,
+                                                    tx_hash: None,
+                                                    status: WalletStatus::Failed,
+                                                    gas_used: None,
+                                                    block_number: None,
+                                                    error: Some(err_str),
+                                                },
+                                            );
                                         }
                                         if attempt > 3 {
                                             break (
@@ -3597,7 +3839,13 @@ pub async fn run_opensea_mint(
                                     attempt = attempt.saturating_sub(1);
                                     continue;
                                 }
-                                if is_gql_action_not_ready(&err_str) && attempt < max_attempts {
+                                let now_wall = chrono::Utc::now().timestamp();
+                                if is_gql_action_not_ready(
+                                    &err_str,
+                                    stage_start_ts_w,
+                                    now_wall,
+                                ) && attempt < max_attempts
+                                {
                                     let wait = gql_action_not_ready_delay(attempt);
                                     log_always(
                                         reporter.as_ref(),
@@ -3613,6 +3861,31 @@ pub async fn run_opensea_mint(
                                     last_error = err_str;
                                     sleep_cancellable(wait, &cancel_w).await;
                                     continue;
+                                }
+                                if is_terminal_gql_action_error(
+                                    &err_str,
+                                    stage_start_ts_w,
+                                    now_wall,
+                                ) {
+                                    log_always(
+                                        reporter.as_ref(),
+                                        format!(
+                                            "[{}] OpenSea rejected the selected phase; not retrying a terminal action error: {}",
+                                            sign::shorten_address(&addr),
+                                            err_str
+                                        ),
+                                    );
+                                    break (
+                                        addr,
+                                        MintResult {
+                                            address: addr,
+                                            tx_hash: None,
+                                            status: WalletStatus::Failed,
+                                            gas_used: None,
+                                            block_number: None,
+                                            error: Some(err_str),
+                                        },
+                                    );
                                 }
                                 if attempt > 3 {
                                     break (
@@ -5156,13 +5429,14 @@ mod tests {
     use super::{
         GQL_STAGGER_MAX_SPREAD_MS, NOT_ACTIVE_CHAIN_WAIT_MAX_SECS, NotActiveInfo,
         OPENSEA_MINT_ACTION_BUDGET, OPENSEA_MINT_ACTION_REFILL_MS, PHASE_OPEN_LAG_WINDOW_SECS,
-        RATE_LIMIT_WAIT_BUDGET_MS, WalletAuth, assigned_proxy_routes, build_local_public_mint,
-        classify_mint_error, enrich_mint_rpc_error, estimate_fail_policy, fire_lag_ms_from_clock,
-        format_not_active, format_rpc_plan, gql_action_not_ready_delay, gql_stagger_step_ms,
-        in_phase_open_lag_window, is_gql_action_not_ready, is_proven_pre_open_revert,
-        keep_before_opensea_auth, late_preflight_proves_rejection, parse_not_active,
-        parse_tx_calldata_hex, pre_sign_ready_wallets, rate_limit_backoff, resolve_mint_gas_limit,
-        validate_seadrop_calldata, validate_wallet_subset_counts,
+        RATE_LIMIT_WAIT_BUDGET_MS, SeaDropPublicState, WalletAuth, assigned_proxy_routes,
+        build_local_public_mint, classify_mint_error, enrich_mint_rpc_error, estimate_fail_policy,
+        fire_lag_ms_from_clock, format_not_active, format_rpc_plan, gql_action_not_ready_delay,
+        gql_stagger_step_ms, in_phase_open_lag_window, is_gql_action_not_ready,
+        is_proven_pre_open_revert, is_terminal_gql_action_error, keep_before_opensea_auth,
+        late_preflight_proves_rejection, parse_not_active, parse_tx_calldata_hex,
+        pre_sign_ready_wallets, rate_limit_backoff, resolve_mint_gas_limit,
+        validate_seadrop_calldata, validate_seadrop_public_state, validate_wallet_subset_counts,
     };
     use crate::proxy::ProxyManager;
     use crate::types::Signer;
@@ -5726,16 +6000,71 @@ mod tests {
 
     #[test]
     fn missing_signed_action_is_the_only_gql_parse_error_retried_to_full_budget() {
+        let start = 1_000_000;
         assert!(is_gql_action_not_ready(
-            "OpenSea mint action response has no transactionSubmissionData"
+            "OpenSea mint action response has no transactionSubmissionData",
+            Some(start),
+            start,
         ));
         assert!(is_gql_action_not_ready(
-            "OpenSea mint action response has no transactionSubmissionData; action errors: MintNotAvailable"
+            "OpenSea mint action response has no transactionSubmissionData; action errors: DropNotMintingError",
+            Some(start),
+            start,
         ));
         assert!(!is_gql_action_not_ready(
-            "OpenSea transactionSubmissionData has no data"
+            "OpenSea mint action response has no transactionSubmissionData; action errors: MinterNotEligibleForActiveDropStageError",
+            Some(start),
+            start,
         ));
-        assert!(!is_gql_action_not_ready("invalid tx to"));
+        assert!(!is_gql_action_not_ready(
+            "OpenSea mint action response has no transactionSubmissionData; action errors: InsufficientMintsRemainingError",
+            Some(start),
+            start,
+        ));
+        assert!(is_terminal_gql_action_error(
+            "OpenSea mint action response has no transactionSubmissionData; action errors: MinterNotEligibleForActiveDropStageError",
+            Some(start),
+            start,
+        ));
+        assert!(!is_gql_action_not_ready(
+            "OpenSea transactionSubmissionData has no data",
+            Some(start),
+            start,
+        ));
+        assert!(!is_gql_action_not_ready(
+            "invalid tx to",
+            Some(start),
+            start,
+        ));
+    }
+
+    #[test]
+    fn public_price_increase_is_never_implicitly_authorized() {
+        let state = SeaDropPublicState {
+            mint_price: U256::from(250_000_000_000_000u64),
+            start_time: 900,
+            end_time: 2_000,
+            max_total_mintable_by_wallet: 25,
+        };
+        let error = validate_seadrop_public_state(state, U256::ZERO, 25, 1_000)
+            .expect_err("a free task must not turn into a paid mint");
+        assert!(error.to_string().contains("price changed"));
+    }
+
+    #[test]
+    fn public_state_accepts_same_or_lower_authorized_price_only_inside_window() {
+        let state = SeaDropPublicState {
+            mint_price: U256::from(5u64),
+            start_time: 900,
+            end_time: 2_000,
+            max_total_mintable_by_wallet: 25,
+        };
+        assert_eq!(
+            validate_seadrop_public_state(state, U256::from(10u64), 25, 1_000).unwrap(),
+            U256::from(5u64)
+        );
+        assert!(validate_seadrop_public_state(state, U256::from(10u64), 26, 1_000).is_err());
+        assert!(validate_seadrop_public_state(state, U256::from(10u64), 25, 2_000).is_err());
     }
 
     #[test]

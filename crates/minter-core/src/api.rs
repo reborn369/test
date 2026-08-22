@@ -1944,8 +1944,15 @@ impl Session {
         if info.stages.is_empty() {
             bail!("No drop stages found for '{}'", slug);
         }
-        let recommended = recommended_phase_index(&info);
-        let stage_rows = stage_rows_from(&info.stages, Some(recommended));
+        let now = chrono::Utc::now().timestamp();
+        let recommended = recommended_phase_index_at(&info, now);
+        let stage_rows = stage_rows_from_at(&info.stages, Some(recommended), now);
+        if stage_rows.is_empty() {
+            bail!(
+                "No open or upcoming eligible drop stages found for '{}'",
+                slug
+            );
+        }
         Ok(DropPhasesResult {
             slug: info.slug,
             name: info.name,
@@ -3096,6 +3103,19 @@ mod recommended_phase_tests {
         ]);
         assert_eq!(recommended_phase_index(&i), 1);
     }
+
+    #[test]
+    fn expired_stage_is_neither_recommended_nor_returned_to_picker() {
+        let now = 2_000i64;
+        let mut closed = stage("SIGNED_PRESALE", 0, Some(1_000.0));
+        closed.end_time = Some(1_500.0);
+        let open = stage("PUBLIC_SALE", 1, Some(1_900.0));
+        let i = info(vec![closed, open]);
+        assert_eq!(recommended_phase_index_at(&i, now), 1);
+        let rows = stage_rows_from_at(&i.stages, Some(1), now);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].index, 1, "original phase index must be preserved");
+    }
 }
 
 #[cfg(test)]
@@ -3357,17 +3377,20 @@ pub struct DiscoveredFunction {
 }
 
 fn recommended_phase_index(info: &opensea::CollectionInfo) -> usize {
+    recommended_phase_index_at(info, chrono::Utc::now().timestamp())
+}
+
+fn recommended_phase_index_at(info: &opensea::CollectionInfo, now: i64) -> usize {
     let stages = &info.stages;
     stages
         .iter()
         .enumerate()
-        .filter(|(_, s)| opensea::stage_effective_eligible(s))
+        .filter(|(_, s)| opensea::stage_is_selectable_at(s, now))
         .filter(|(_, s)| opensea::available_mint_quantity(info, s).unwrap_or(1) > 0)
         .min_by_key(|(_, s)| {
             let is_public = s.stage_type == "PUBLIC_SALE";
             // Started = start_time <= wall clock now (missing start_time counts as started).
             // Comparing against 0 marked every real (past) timestamp as "not started".
-            let now = chrono::Utc::now().timestamp();
             let has_started = s.start_time.map(|t| t as i64 <= now).unwrap_or(true);
             (
                 is_public as usize,
@@ -3379,15 +3402,27 @@ fn recommended_phase_index(info: &opensea::CollectionInfo) -> usize {
         .unwrap_or_else(|| {
             stages
                 .iter()
-                .position(opensea::stage_effective_eligible)
+                .position(|stage| !opensea::stage_is_expired_at(stage, now))
                 .unwrap_or(0)
         })
 }
 
 fn stage_rows_from(stages: &[opensea::StageInfo], recommended: Option<usize>) -> Vec<StageRow> {
+    stage_rows_from_at(stages, recommended, chrono::Utc::now().timestamp())
+}
+
+fn stage_rows_from_at(
+    stages: &[opensea::StageInfo],
+    recommended: Option<usize>,
+    now: i64,
+) -> Vec<StageRow> {
     stages
         .iter()
         .enumerate()
+        // Eligibility shown by this endpoint belongs to the primary auth
+        // wallet. Keep non-expired stages visible because another selected
+        // wallet can be eligible; only a closed stage is universally invalid.
+        .filter(|(_, stage)| !opensea::stage_is_expired_at(stage, now))
         .map(|(i, s)| {
             let start_time = s
                 .start_time

@@ -1945,7 +1945,7 @@ impl Session {
             bail!("No drop stages found for '{}'", slug);
         }
         let now = chrono::Utc::now().timestamp();
-        let recommended = recommended_phase_index_at(&info, now);
+        let recommended = recommended_phase_index(&info);
         let stage_rows = stage_rows_from_at(&info.stages, Some(recommended), now);
         if stage_rows.is_empty() {
             bail!(

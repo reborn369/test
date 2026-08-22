@@ -1044,6 +1044,32 @@ fn gql_stagger_step_ms(wallets_on_one_proxy: usize) -> u64 {
 /// could be parked past the end of the drop by a limit that keeps renewing.
 const RATE_LIMIT_WAIT_BUDGET_MS: u64 = 12_000;
 
+/// A successful HTTP/GQL response without a transaction is a normal short-lived
+/// state at the exact edge of a signed stage: collection metadata can show the
+/// stage as open before OpenSea's mint-action resolver starts issuing signed
+/// calldata.  It is safe to retry because no transaction has been signed or
+/// broadcast yet.  This must consume the operator's configured attempt budget,
+/// not the much smaller generic-error allowance.
+fn is_gql_action_not_ready(err: &str) -> bool {
+    err.contains("OpenSea mint action response has no transactionSubmissionData")
+}
+
+/// Keep the first edge retries tight, then ease off enough to avoid needlessly
+/// hammering OpenSea while its stage state propagates.  HTTP request latency is
+/// additional to this delay; explicit 429/retry-after responses use the
+/// separate server-directed rate-limit budget below.
+fn gql_action_not_ready_delay(attempt: u32) -> std::time::Duration {
+    let millis = match attempt {
+        0 | 1 => 50,
+        2 => 75,
+        3 => 100,
+        4 => 150,
+        5..=8 => 250,
+        _ => 500,
+    };
+    std::time::Duration::from_millis(millis)
+}
+
 /// The wait OpenSea asked for, when this error is a rate limit and the wallet
 /// can still afford to honour it.
 ///
@@ -3474,6 +3500,25 @@ pub async fn run_opensea_mint(
                                             attempt = attempt.saturating_sub(1);
                                             continue;
                                         }
+                                        if is_gql_action_not_ready(&err_str)
+                                            && attempt < max_attempts
+                                        {
+                                            let wait = gql_action_not_ready_delay(attempt);
+                                            log_always(
+                                                reporter.as_ref(),
+                                                format!(
+                                                    "[{}] OpenSea mint action not ready at T0 (attempt {}/{}); retrying in {}ms: {}",
+                                                    sign::shorten_address(&addr),
+                                                    attempt,
+                                                    max_attempts,
+                                                    wait.as_millis(),
+                                                    err_str
+                                                ),
+                                            );
+                                            last_error = err_str;
+                                            sleep_cancellable(wait, &cancel_w).await;
+                                            continue;
+                                        }
                                         if attempt > 3 {
                                             break (
                                                 addr,
@@ -3550,6 +3595,23 @@ pub async fn run_opensea_mint(
                                     // The server asked us to wait; that is not
                                     // one of the three tries a real error gets.
                                     attempt = attempt.saturating_sub(1);
+                                    continue;
+                                }
+                                if is_gql_action_not_ready(&err_str) && attempt < max_attempts {
+                                    let wait = gql_action_not_ready_delay(attempt);
+                                    log_always(
+                                        reporter.as_ref(),
+                                        format!(
+                                            "[{}] OpenSea mint action not ready at T0 (attempt {}/{}); retrying in {}ms: {}",
+                                            sign::shorten_address(&addr),
+                                            attempt,
+                                            max_attempts,
+                                            wait.as_millis(),
+                                            err_str
+                                        ),
+                                    );
+                                    last_error = err_str;
+                                    sleep_cancellable(wait, &cancel_w).await;
                                     continue;
                                 }
                                 if attempt > 3 {
@@ -5096,10 +5158,11 @@ mod tests {
         OPENSEA_MINT_ACTION_BUDGET, OPENSEA_MINT_ACTION_REFILL_MS, PHASE_OPEN_LAG_WINDOW_SECS,
         RATE_LIMIT_WAIT_BUDGET_MS, WalletAuth, assigned_proxy_routes, build_local_public_mint,
         classify_mint_error, enrich_mint_rpc_error, estimate_fail_policy, fire_lag_ms_from_clock,
-        format_not_active, format_rpc_plan, gql_stagger_step_ms, in_phase_open_lag_window,
-        is_proven_pre_open_revert, keep_before_opensea_auth, late_preflight_proves_rejection,
-        parse_not_active, parse_tx_calldata_hex, pre_sign_ready_wallets, rate_limit_backoff,
-        resolve_mint_gas_limit, validate_seadrop_calldata, validate_wallet_subset_counts,
+        format_not_active, format_rpc_plan, gql_action_not_ready_delay, gql_stagger_step_ms,
+        in_phase_open_lag_window, is_gql_action_not_ready, is_proven_pre_open_revert,
+        keep_before_opensea_auth, late_preflight_proves_rejection, parse_not_active,
+        parse_tx_calldata_hex, pre_sign_ready_wallets, rate_limit_backoff, resolve_mint_gas_limit,
+        validate_seadrop_calldata, validate_wallet_subset_counts,
     };
     use crate::proxy::ProxyManager;
     use crate::types::Signer;
@@ -5659,6 +5722,30 @@ mod tests {
         assert_eq!(OPENSEA_MINT_ACTION_BUDGET, 5);
         assert_eq!(OPENSEA_MINT_ACTION_REFILL_MS, 4_300);
         assert!(100usize.div_ceil(OPENSEA_MINT_ACTION_BUDGET) == 20);
+    }
+
+    #[test]
+    fn missing_signed_action_is_the_only_gql_parse_error_retried_to_full_budget() {
+        assert!(is_gql_action_not_ready(
+            "OpenSea mint action response has no transactionSubmissionData"
+        ));
+        assert!(is_gql_action_not_ready(
+            "OpenSea mint action response has no transactionSubmissionData; action errors: MintNotAvailable"
+        ));
+        assert!(!is_gql_action_not_ready(
+            "OpenSea transactionSubmissionData has no data"
+        ));
+        assert!(!is_gql_action_not_ready("invalid tx to"));
+    }
+
+    #[test]
+    fn missing_action_retry_stays_fast_at_t0_and_bounded_afterwards() {
+        let waits: Vec<u128> = (1..=20)
+            .map(|attempt| gql_action_not_ready_delay(attempt).as_millis())
+            .collect();
+        assert_eq!(&waits[..4], &[50, 75, 100, 150]);
+        assert!(waits.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(waits.iter().all(|wait| *wait <= 500));
     }
 
     #[test]

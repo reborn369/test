@@ -1167,8 +1167,33 @@ fn find_transaction_submission_data(value: &serde_json::Value) -> Option<&serde_
 }
 
 pub fn extract_opensea_action_tx(data: &serde_json::Value) -> Result<serde_json::Value> {
-    let tx = find_transaction_submission_data(data)
-        .context("OpenSea mint action response has no transactionSubmissionData")?;
+    let tx = match find_transaction_submission_data(data) {
+        Some(tx) => tx,
+        None => {
+            // GraphQL itself can return HTTP 200 while the mint-action resolver
+            // has not produced a transaction yet.  Preserve the action-level
+            // error in the normal log so a T0 propagation delay is not reported
+            // as an opaque parser failure.  Do not dump the whole response: it
+            // can contain more wallet-specific data than an operator needs.
+            let action_errors = data
+                .pointer("/data/swap/errors")
+                .filter(|errors| match errors {
+                    serde_json::Value::Null => false,
+                    serde_json::Value::Array(items) => !items.is_empty(),
+                    _ => true,
+                })
+                .map(|errors| {
+                    let rendered = errors.to_string();
+                    crate::safe_truncate(&rendered, 500).to_string()
+                });
+            if let Some(errors) = action_errors {
+                bail!(
+                    "OpenSea mint action response has no transactionSubmissionData; action errors: {errors}"
+                );
+            }
+            bail!("OpenSea mint action response has no transactionSubmissionData");
+        }
+    };
     let to = tx
         .get("to")
         .or_else(|| tx.get("target"))
@@ -1536,6 +1561,21 @@ mod extract_action_tx_tests {
         });
         let tx = extract_opensea_action_tx(&data).unwrap();
         assert_eq!(tx.get("value").unwrap().as_str(), Some("0x0"));
+    }
+
+    #[test]
+    fn missing_transaction_preserves_action_error_details() {
+        let data = json!({
+            "data": {
+                "swap": {
+                    "actions": [],
+                    "errors": [{ "__typename": "MintNotAvailable" }]
+                }
+            }
+        });
+        let error = extract_opensea_action_tx(&data).unwrap_err().to_string();
+        assert!(error.contains("no transactionSubmissionData"), "{error}");
+        assert!(error.contains("MintNotAvailable"), "{error}");
     }
 }
 

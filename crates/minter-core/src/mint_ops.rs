@@ -92,6 +92,7 @@ pub fn explorer_tx_url(chain: &str, tx_hash: &str) -> String {
         "polygon" | "matic" | "137" => "https://polygonscan.com/tx/",
         "arbitrum" | "arb" | "42161" => "https://arbiscan.io/tx/",
         "optimism" | "op" | "10" => "https://optimistic.etherscan.io/tx/",
+        "ink" | "57073" => "https://explorer.inkonchain.com/tx/",
         "bsc" | "bnb" | "56" => "https://bscscan.com/tx/",
         "avalanche" | "avax" | "43114" => "https://snowtrace.io/tx/",
         "blast" | "81457" => "https://blastscan.io/tx/",
@@ -242,6 +243,8 @@ mod tests {
         assert!(u.starts_with("https://basescan.org/tx/0x"));
         let u2 = explorer_tx_url("ethereum", "0xdead");
         assert!(u2.contains("etherscan.io"));
+        let ink = explorer_tx_url("ink", "0xbeef");
+        assert_eq!(ink, "https://explorer.inkonchain.com/tx/0xbeef");
     }
 
     #[test]

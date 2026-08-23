@@ -799,6 +799,7 @@ impl Session {
                 "polygon".into(),
                 "arbitrum".into(),
                 "optimism".into(),
+                "ink".into(),
                 "robinhood".into(),
             ],
         };
@@ -930,6 +931,7 @@ impl Session {
                 "polygon".into(),
                 "arbitrum".into(),
                 "optimism".into(),
+                "ink".into(),
                 "robinhood".into(),
             ],
         };
@@ -3421,6 +3423,11 @@ mod rpc_collect_tests {
         );
         let rh = collect_rpc_urls_for_chain(&env, Some("robinhood"), &[]);
         assert!(rh.iter().any(|u| u.contains("robinhood")));
+        let ink = collect_rpc_urls_for_chain(&env, Some("ink"), &[]);
+        assert!(
+            ink.iter().any(|u| u.contains("inkonchain.com")),
+            "expected official Ink public RPC, got {ink:?}"
+        );
     }
 
     #[test]
@@ -3448,6 +3455,7 @@ mod rpc_collect_tests {
             ("shape", "shape-mainnet.g.alchemy.com/v2/myKey99"),
             ("monad", "monad-mainnet.g.alchemy.com/v2/myKey99"),
             ("blast", "blast-mainnet.g.alchemy.com/v2/myKey99"),
+            ("ink", "ink-mainnet.g.alchemy.com/v2/myKey99"),
         ] {
             let urls = collect_rpc_urls_for_chain(&env, Some(chain), &[]);
             assert!(
@@ -3757,6 +3765,7 @@ fn chain_id_label(id: u64) -> String {
         137 => "Polygon".into(),
         42161 => "Arbitrum".into(),
         10 => "Optimism".into(),
+        57073 => "Ink".into(),
         56 => "BSC".into(),
         43114 => "Avalanche".into(),
         81457 => "Blast".into(),
@@ -3936,6 +3945,7 @@ fn provider_chain_slugs(
         ),
         "arbitrum_nova" | "arbitrum-nova" | "nova" => (None, None, Some("nova")),
         "optimism" => (Some("opt-mainnet"), Some("opt-mainnet"), Some("optimism")),
+        "ink" => (Some("ink-mainnet"), None, None),
         "avalanche" => (
             Some("avax-mainnet"),
             Some("avalanche-mainnet"),
@@ -3984,6 +3994,10 @@ fn public_rpc_fallback(chain: &str) -> Vec<&'static str> {
             "https://mainnet.optimism.io",
             "https://optimism.publicnode.com",
             "https://rpc.ankr.com/optimism",
+        ],
+        "ink" => vec![
+            "https://rpc-gel.inkonchain.com",
+            "https://rpc-qnd.inkonchain.com",
         ],
         "megaeth" | "mega_eth" => vec!["https://mainnet.megaeth.com/rpc"],
         "monad" => vec!["https://rpc.monad.xyz", "https://rpc1.monad.xyz"],

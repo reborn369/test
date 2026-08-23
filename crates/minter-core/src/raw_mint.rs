@@ -133,6 +133,7 @@ pub(crate) fn explorer_api_for_chain(chain: Option<&str>) -> Option<&'static str
         Some("base") => Some("https://base.blockscout.com"),
         Some("ethereum" | "mainnet" | "eth") => Some("https://eth.blockscout.com"),
         Some("optimism" | "op") => Some("https://optimism.blockscout.com"),
+        Some("ink") => Some("https://explorer.inkonchain.com"),
         Some("arbitrum" | "arb") => Some("https://arbitrum.blockscout.com"),
         Some("polygon" | "matic") => Some("https://polygon.blockscout.com"),
         Some("zora") => Some("https://explorer.zora.energy"),
@@ -895,6 +896,14 @@ mod tests {
         assert_eq!(
             crate::abi::function_selector("mint((bytes32,bytes32[]),uint256,address,bytes)"),
             [0x4a, 0x21, 0xa2, 0xdf]
+        );
+    }
+
+    #[test]
+    fn ink_uses_official_blockscout() {
+        assert_eq!(
+            explorer_api_for_chain(Some("ink")),
+            Some("https://explorer.inkonchain.com")
         );
     }
 }

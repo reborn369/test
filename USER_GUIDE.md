@@ -105,7 +105,7 @@ cargo run -p minter-desktop --release
 
 - **A / B / C** — группы.  
 - **Proxy** — привязка прокси к адресу (или auto).  
-- **Network** (селектор) + **Check balances** — native balance **на выбранной сети** (ethereum, base, polygon, arbitrum, optimism, blast, zora, apechain, **robinhood**, monad).  
+- **Network** (селектор) + **Check balances** — native balance **на выбранной сети** (ethereum, base, polygon, arbitrum, optimism, **ink**, blast, zora, apechain, **robinhood**, monad).
   Без выбора сети / с eth-only RPC на L2 балансы будут неверные — сначала Settings + **Ping networks**.  
 - **→ New task** — задача из выбранных.
 
@@ -114,7 +114,7 @@ cargo run -p minter-desktop --release
 1. **Settings** → **Connection**.  
 2. **Alchemy API key** (рекомендуется) *или* custom RPC / eth / base / polygon.  
    - Один ключ → app сам строит **private** URL по сети:  
-     `https://{slug}.g.alchemy.com/v2/{KEY}` (base-mainnet, arb-mainnet, robinhood-mainnet, …).  
+     `https://{slug}.g.alchemy.com/v2/{KEY}` (base-mainnet, arb-mainnet, ink-mainnet, robinhood-mainnet, …).
    - **Public Alchemy** (`…/public`) **не** используется — только свой ключ.  
 3. **Save settings**.  
 4. **RPCs** → **Ping networks** — таблица: chain / ping / **chainId** / path / URL.  

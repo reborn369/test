@@ -63,7 +63,7 @@ Binary: `target\release\minter-desktop.exe`
 1. **Vault** — accept burner warning, set password, **Unlock**
 2. **Wallets** — import burner keys (paste / file; one key per line). Keys are never shown in the table
 3. **Settings → Connection** — paste your **Alchemy** API key (private; multi-chain URLs are built for you) → **Save**
-4. **RPCs → Ping networks** — confirm chainIds look right (Base ≈ 8453, Ethereum = 1, …)
+4. **RPCs → Ping networks** — confirm chainIds look right (Base = 8453, Ink = 57073, Ethereum = 1, …)
 5. **Proxies** — paste one per line (`host:port:user:pass`, `socks5://…`, etc.) and save  
    Multi-wallet OpenSea without proxies often hits HTTP 429
 6. Keep **Dry Run** habits for raw/sweep; for OpenSea Tasks, Start is always LIVE (type `LIVE`)

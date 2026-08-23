@@ -985,6 +985,10 @@ struct SettingsDto {
     rpc_url_ethereum: String,
     rpc_url_base: String,
     rpc_url_polygon: String,
+    rpc_url_robinhood: String,
+    rpc_url_arbitrum: String,
+    rpc_url_optimism: String,
+    rpc_url_ink: String,
     proxy_url: String,
     flashbots_relay_url: String,
     flashbots_max_blocks: u64,
@@ -1017,6 +1021,10 @@ impl SettingsDto {
             rpc_url_ethereum: s.settings.rpc_url_ethereum.clone(),
             rpc_url_base: s.settings.rpc_url_base.clone(),
             rpc_url_polygon: s.settings.rpc_url_polygon.clone(),
+            rpc_url_robinhood: s.settings.rpc_url_robinhood.clone(),
+            rpc_url_arbitrum: s.settings.rpc_url_arbitrum.clone(),
+            rpc_url_optimism: s.settings.rpc_url_optimism.clone(),
+            rpc_url_ink: s.settings.rpc_url_ink.clone(),
             // Mask `user:pass@` — proxy credentials are paid secrets and must
             // not be shipped to the webview on every settings load. Host:port
             // and line order survive so the editor still round-trips; masked
@@ -1063,6 +1071,10 @@ struct SaveSettingsInput {
     rpc_url_ethereum: Option<String>,
     rpc_url_base: Option<String>,
     rpc_url_polygon: Option<String>,
+    rpc_url_robinhood: Option<String>,
+    rpc_url_arbitrum: Option<String>,
+    rpc_url_optimism: Option<String>,
+    rpc_url_ink: Option<String>,
     proxy_url: Option<String>,
     gas_limit: Option<u64>,
     use_gql: Option<bool>,
@@ -1142,6 +1154,18 @@ fn save_settings_inner(state: &AppState, input: SaveSettingsInput) -> Result<Str
     }
     if let Some(v) = input.rpc_url_polygon {
         settings.rpc_url_polygon = v;
+    }
+    if let Some(v) = input.rpc_url_robinhood {
+        settings.rpc_url_robinhood = v;
+    }
+    if let Some(v) = input.rpc_url_arbitrum {
+        settings.rpc_url_arbitrum = v;
+    }
+    if let Some(v) = input.rpc_url_optimism {
+        settings.rpc_url_optimism = v;
+    }
+    if let Some(v) = input.rpc_url_ink {
+        settings.rpc_url_ink = v;
     }
     if let Some(v) = input.proxy_url {
         // The UI only ever saw masked credentials, so restore any still-masked

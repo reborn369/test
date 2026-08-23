@@ -68,6 +68,7 @@ pub fn chain_needs_elevated_gas(chain_id: u64) -> bool {
         chain_id,
         10 | // Optimism
         8453 | // Base
+        57073 | // Ink
         42161 | // Arbitrum One
         42170 | // Arbitrum Nova
         81457 | // Blast
@@ -152,6 +153,7 @@ pub fn chain_has_l1_data_fee(chain_id: u64) -> bool {
         chain_id,
         10 |      // Optimism
         8453 |    // Base
+        57073 |   // Ink
         81457 |   // Blast
         7777777 | // Zora
         360 // Shape
@@ -351,6 +353,13 @@ mod tests {
         assert!(chain_needs_elevated_gas(4663));
         let lim = apply_gas_limit(21_000, 1.15, 4663, 21_000);
         assert!(lim >= 150_000);
+    }
+
+    #[test]
+    fn ink_uses_l2_floor_and_l1_data_fee() {
+        assert!(chain_needs_elevated_gas(57073));
+        assert!(chain_has_l1_data_fee(57073));
+        assert!(apply_gas_limit(21_000, 1.15, 57073, 21_000) >= 150_000);
     }
 
     #[test]

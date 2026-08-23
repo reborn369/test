@@ -23,6 +23,7 @@ pub fn chain_id_map() -> HashMap<&'static str, u64> {
     m.insert("arbitrum-nova", 42170);
     m.insert("nova", 42170);
     m.insert("optimism", 10);
+    m.insert("ink", 57073);
     m.insert("zora", 7777777);
     m.insert("avalanche", 43114);
     m.insert("bsc", 56);
@@ -47,6 +48,7 @@ pub enum ChainId {
     Arbitrum = 42161,
     ArbitrumNova = 42170,
     Optimism = 10,
+    Ink = 57073,
     Zora = 7777777,
     Avalanche = 43114,
     Bsc = 56,
@@ -67,6 +69,7 @@ impl ChainId {
             42161 => Some(Self::Arbitrum),
             42170 => Some(Self::ArbitrumNova),
             10 => Some(Self::Optimism),
+            57073 => Some(Self::Ink),
             7777777 => Some(Self::Zora),
             43114 => Some(Self::Avalanche),
             56 => Some(Self::Bsc),
@@ -92,6 +95,7 @@ impl ChainId {
             Self::Arbitrum => "arbitrum",
             Self::ArbitrumNova => "arbitrum_nova",
             Self::Optimism => "optimism",
+            Self::Ink => "ink",
             Self::Zora => "zora",
             Self::Avalanche => "avalanche",
             Self::Bsc => "bsc",
@@ -112,6 +116,7 @@ impl ChainId {
             Self::Arbitrum,
             Self::ArbitrumNova,
             Self::Optimism,
+            Self::Ink,
             Self::Zora,
             Self::Avalanche,
             Self::Bsc,
@@ -164,6 +169,15 @@ mod chain_id_tests {
         assert_eq!(chain_id_map().get("robinhood"), Some(&4663));
         assert_eq!(chain_id_map().get("robinhood_chain"), Some(&4663));
         assert!(ChainId::all().contains(&ChainId::Robinhood));
+    }
+
+    #[test]
+    fn ink_chain() {
+        assert_eq!(ChainId::from_id(57073), Some(ChainId::Ink));
+        assert_eq!(ChainId::Ink.id(), 57073);
+        assert_eq!(ChainId::Ink.name(), "ink");
+        assert_eq!(chain_id_map().get("ink"), Some(&57073));
+        assert!(ChainId::all().contains(&ChainId::Ink));
     }
 }
 

@@ -28,6 +28,7 @@ pub struct Settings {
     pub rpc_url_robinhood: String,
     pub rpc_url_arbitrum: String,
     pub rpc_url_optimism: String,
+    pub rpc_url_ink: String,
     /// Proxies: one per line (host:port:user:pass, socks5://…, http://…).
     /// Field name kept as `proxy_url` for backward-compatible config.json.
     pub proxy_url: String,
@@ -86,6 +87,7 @@ impl Default for Settings {
             rpc_url_robinhood: String::new(),
             rpc_url_arbitrum: String::new(),
             rpc_url_optimism: String::new(),
+            rpc_url_ink: String::new(),
             proxy_url: String::new(),
             flashbots_relay_url: String::new(),
             flashbots_max_blocks: 3,
@@ -127,6 +129,8 @@ pub const MANAGED_CONNECTION_ENV_KEYS: &[&str] = &[
     "RPC_URL_ROBINHOOD",
     "RPC_URL_ARBITRUM",
     "RPC_URL_OPTIMISM",
+    "RPC_URL_INK",
+    "INK_RPC_URL",
 ];
 
 impl Settings {
@@ -177,6 +181,7 @@ impl Settings {
         self.rpc_url_robinhood.clear();
         self.rpc_url_arbitrum.clear();
         self.rpc_url_optimism.clear();
+        self.rpc_url_ink.clear();
     }
 
     /// Drop managed connection keys from an env map, then apply [`to_env_map`].
@@ -254,6 +259,9 @@ impl Settings {
         }
         if let Some(v) = take(&self.rpc_url_optimism, &["RPC_URL_OPTIMISM"]) {
             self.rpc_url_optimism = v;
+        }
+        if let Some(v) = take(&self.rpc_url_ink, &["RPC_URL_INK", "INK_RPC_URL"]) {
+            self.rpc_url_ink = v;
         }
         if let Some(v) = take(&self.proxy_url, &["PROXY_URL", "HTTP_PROXY", "HTTPS_PROXY"]) {
             // Single-line env; append if multi-line already empty
@@ -645,6 +653,16 @@ impl Settings {
                 self.rpc_url_optimism.trim().to_string(),
             );
         }
+        if !self.rpc_url_ink.trim().is_empty() {
+            m.insert(
+                "RPC_URL_INK".to_string(),
+                self.rpc_url_ink.trim().to_string(),
+            );
+            m.insert(
+                "INK_RPC_URL".to_string(),
+                self.rpc_url_ink.trim().to_string(),
+            );
+        }
         // First proxy as PROXY_URL for single-proxy helpers; full list lives in proxies.txt
         if let Some(first) = self.proxy_lines().into_iter().next() {
             m.insert("PROXY_URL".to_string(), first);
@@ -736,6 +754,7 @@ impl Settings {
             || !self.rpc_url_robinhood.trim().is_empty()
             || !self.rpc_url_arbitrum.trim().is_empty()
             || !self.rpc_url_optimism.trim().is_empty()
+            || !self.rpc_url_ink.trim().is_empty()
     }
 
     /// Mask secrets for UI display (last 4 chars).
@@ -810,11 +829,13 @@ mod tests {
         let mut s = Settings::default();
         s.alchemy_api_key = "testkey123456".into();
         s.rpc_urls = "https://example.com/rpc".into();
+        s.rpc_url_ink = "https://ink.example/rpc".into();
         s.gas_limit = 300_000;
         s.save(&path).unwrap();
         let loaded = Settings::load(&path, None);
         assert_eq!(loaded.alchemy_api_key, "testkey123456");
         assert_eq!(loaded.rpc_urls, "https://example.com/rpc");
+        assert_eq!(loaded.rpc_url_ink, "https://ink.example/rpc");
         assert_eq!(loaded.gas_limit, 300_000);
         let _ = std::fs::remove_dir_all(&dir);
     }

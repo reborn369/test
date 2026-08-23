@@ -116,7 +116,7 @@ MINTER is a **self-contained desktop app**: a Rust engine (`minter-core`) wrappe
 | **OpenSea mint** | Wall-clock phase open → **fixed-gas** send (no estimate gate on LIVE) → on-chain confirm |
 | **Raw Mint** | Safe adapter mode (Archetype public native fixed-price phases) + expert Custom mode · exact on-chain price/phase lock · multi-wallet pre-sign race |
 | **Advanced** | Sweep ETH/NFT, disperse, multicall helpers; Flashbots path on **Ethereum mainnet only** |
-| **RPC** | Private Alchemy multi-chain (your key only) · **per-endpoint ping** tagged by origin, so a paid node is never confused with the public fallback appended to every chain · the mint log names which endpoint leads and which one accepted each broadcast |
+| **RPC** | Private Alchemy multi-chain (your key only), including Ink · **per-endpoint ping** tagged by origin, so a paid node is never confused with the public fallback appended to every chain · the mint log names which endpoint leads and which one accepted each broadcast |
 | **Reliability** | A broadcast that times out is checked against the chain instead of being called a failure, the signed hash is kept, and a run ends with a reconciliation pass — a mint that landed is never reported as lost |
 | **Proxies** | HTTP / SOCKS, health checks, sticky wallet mapping (OpenSea auth path) |
 | **Results** | JSON / CSV export, run history, explorer links, full mint logs |

@@ -648,6 +648,7 @@ fn parse_asset_amount(value: Option<&serde_json::Value>) -> U256 {
 fn blockscout_nft_base(chain_id: u64) -> Option<&'static str> {
     match chain_id {
         4663 => Some("https://robinhoodchain.blockscout.com"),
+        57073 => Some("https://explorer.inkonchain.com"),
         _ => None,
     }
 }

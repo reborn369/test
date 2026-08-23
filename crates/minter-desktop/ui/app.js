@@ -283,6 +283,8 @@ function explorerTxUrlLocal(chain, txHash) {
     robinhood: "https://robinhoodchain.blockscout.com/tx/",
     "robinhood_chain": "https://robinhoodchain.blockscout.com/tx/",
     "4663": "https://robinhoodchain.blockscout.com/tx/",
+    ink: "https://explorer.inkonchain.com/tx/",
+    "57073": "https://explorer.inkonchain.com/tx/",
     apechain: "https://apescan.io/tx/",
     "33139": "https://apescan.io/tx/",
     shape: "https://shapescan.xyz/tx/",
@@ -1715,7 +1717,7 @@ $("btn-remove-wallet").addEventListener("click", async () => {
 // —— RPCs ——
 const RPC_CHAIN_COLORS = {
   ethereum: "#627eea", base: "#0052ff", polygon: "#8247e5", arbitrum: "#28a0f0",
-  optimism: "#ff0420", robinhood: "#00c805", blast: "#f5c84c", zora: "#9aa3b5",
+  optimism: "#ff0420", ink: "#7132f5", robinhood: "#00c805", blast: "#f5c84c", zora: "#9aa3b5",
   apechain: "#0054fa", shape: "#2ee6c7", monad: "#8b7bff", megaeth: "#5b8def",
   bsc: "#f0b90b", avalanche: "#e84142",
 };
@@ -2042,6 +2044,10 @@ async function loadSettings() {
   $("set-rpc-eth").value = s.rpcUrlEthereum || "";
   $("set-rpc-base").value = s.rpcUrlBase || "";
   $("set-rpc-polygon").value = s.rpcUrlPolygon || "";
+  $("set-rpc-robinhood").value = s.rpcUrlRobinhood || "";
+  $("set-rpc-arbitrum").value = s.rpcUrlArbitrum || "";
+  $("set-rpc-optimism").value = s.rpcUrlOptimism || "";
+  $("set-rpc-ink").value = s.rpcUrlInk || "";
   if ($("set-fb-relay")) {
     $("set-fb-relay").value = s.flashbotsRelayUrl || "";
     $("set-fb-relay").placeholder = "https://relay.flashbots.net";
@@ -2098,6 +2104,10 @@ $("btn-save-settings").addEventListener("click", async () => {
       rpcUrlEthereum: $("set-rpc-eth").value,
       rpcUrlBase: $("set-rpc-base").value,
       rpcUrlPolygon: $("set-rpc-polygon").value,
+      rpcUrlRobinhood: $("set-rpc-robinhood").value,
+      rpcUrlArbitrum: $("set-rpc-arbitrum").value,
+      rpcUrlOptimism: $("set-rpc-optimism").value,
+      rpcUrlInk: $("set-rpc-ink").value,
       proxyUrl,
       gasLimit: Number($("set-gas").value) || 0,
       useGql: $("set-gql").checked,

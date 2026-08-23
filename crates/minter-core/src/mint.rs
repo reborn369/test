@@ -214,9 +214,35 @@ pub(crate) fn enrich_mint_rpc_error(err: &str) -> String {
             raw.to_string()
         };
         format!("{decoded} | {short}")
+    } else if let Some(decoded) = decode_common_seadrop_revert(err) {
+        decoded
     } else {
         err.to_string()
     }
+}
+
+fn decode_common_seadrop_revert(err: &str) -> Option<String> {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("f477d26f") {
+        return Some(
+            "FeeRecipientNotAllowed: fee recipient is not approved by this collection".into(),
+        );
+    }
+    let selector = "e12d2314";
+    let index = lower.find(selector)?;
+    let args: String = lower[index + selector.len()..]
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(128)
+        .collect();
+    if args.len() < 128 {
+        return Some("MintQuantityExceedsMaxSupply".into());
+    }
+    let total = U256::from_str_radix(&args[..64], 16).ok()?;
+    let max_supply = U256::from_str_radix(&args[64..128], 16).ok()?;
+    Some(format!(
+        "MintQuantityExceedsMaxSupply: requested total {total}, collection max supply {max_supply}"
+    ))
 }
 
 /// Wall clock is at/after phase start and still inside typical L1 timestamp lag.
@@ -432,6 +458,7 @@ fn pre_sign_ready_wallets(
 }
 
 const DEFAULT_SEADROP_ADDRESS: &str = "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5";
+const DEFAULT_FEE_RECIPIENT: &str = "0x0000a26b00c1F0DF003000390027140000fAa719";
 
 /// Absolute ceiling (0.05 ETH) on the tx value OpenSea may request when the
 /// resolved phase price is zero — i.e. a free mint, or a priced phase whose
@@ -613,12 +640,14 @@ fn build_local_public_mint(
     Ok((to, value, calldata))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SeaDropPublicState {
     mint_price: U256,
     start_time: u64,
     end_time: u64,
     max_total_mintable_by_wallet: u64,
+    restrict_fee_recipients: bool,
+    allowed_fee_recipients: Vec<Address>,
 }
 
 fn abi_word_u64(bytes: &[u8]) -> Result<u64> {
@@ -640,31 +669,111 @@ async fn read_seadrop_public_state(
         .parse()
         .context("invalid SeaDrop address")?;
     let nft: Address = nft_contract.parse().context("invalid NFT contract")?;
-    let selector = keccak256("getPublicDrop(address)".as_bytes());
-    let mut calldata = Vec::with_capacity(36);
-    calldata.extend_from_slice(&selector[..4]);
-    calldata.extend_from_slice(&[0u8; 12]);
-    calldata.extend_from_slice(nft.as_slice());
-    let raw = rpc
-        .eth_call(&Address::ZERO, &seadrop, &Bytes::from(calldata))
-        .await
-        .context("SeaDrop getPublicDrop failed")?;
+    let address_call = |signature: &str| {
+        let selector = keccak256(signature.as_bytes());
+        let mut calldata = Vec::with_capacity(36);
+        calldata.extend_from_slice(&selector[..4]);
+        calldata.extend_from_slice(&[0u8; 12]);
+        calldata.extend_from_slice(nft.as_slice());
+        Bytes::from(calldata)
+    };
+    // Run both views concurrently. This keeps the final safety gate to one RPC
+    // round trip even on high-latency L2 endpoints.
+    let public_call = address_call("getPublicDrop(address)");
+    let recipients_call = address_call("getAllowedFeeRecipients(address)");
+    let (public_result, recipients_result) = tokio::join!(
+        rpc.eth_call(&Address::ZERO, &seadrop, &public_call),
+        rpc.eth_call(&Address::ZERO, &seadrop, &recipients_call),
+    );
+    let raw = public_result.context("SeaDrop getPublicDrop failed")?;
     if raw.len() < 6 * 32 {
         bail!(
             "SeaDrop getPublicDrop returned {} bytes, expected 192",
             raw.len()
         );
     }
+    let restrict_fee_recipients = abi_word_u64(&raw[160..192])? != 0;
+    let allowed_fee_recipients = if restrict_fee_recipients {
+        let encoded = recipients_result.context("SeaDrop getAllowedFeeRecipients failed")?;
+        decode_abi_address_array(&encoded)
+            .context("SeaDrop returned malformed allowed fee recipients")?
+    } else {
+        Vec::new()
+    };
     Ok(SeaDropPublicState {
         mint_price: U256::from_be_slice(&raw[0..32]),
         start_time: abi_word_u64(&raw[32..64])?,
         end_time: abi_word_u64(&raw[64..96])?,
         max_total_mintable_by_wallet: abi_word_u64(&raw[96..128])?,
+        restrict_fee_recipients,
+        allowed_fee_recipients,
     })
 }
 
+fn decode_abi_address_array(raw: &[u8]) -> Result<Vec<Address>> {
+    let offset = usize::try_from(abi_word_u64(
+        raw.get(0..32).context("missing array offset")?,
+    )?)
+    .context("array offset does not fit usize")?;
+    let count_end = offset.checked_add(32).context("array offset overflow")?;
+    let count = usize::try_from(abi_word_u64(
+        raw.get(offset..count_end)
+            .context("array offset is outside result")?,
+    )?)
+    .context("array length does not fit usize")?;
+    let available_words = raw.len().saturating_sub(count_end) / 32;
+    if count > available_words {
+        bail!("address array length {count} exceeds encoded result");
+    }
+    let mut recipients = Vec::with_capacity(count);
+    for index in 0..count {
+        let start = count_end
+            .checked_add(index.checked_mul(32).context("array index overflow")?)
+            .context("array address offset overflow")?;
+        let end = start
+            .checked_add(32)
+            .context("array address end overflow")?;
+        let word = raw.get(start..end).context("truncated address array")?;
+        if word[..12].iter().any(|byte| *byte != 0) {
+            bail!("address array contains non-zero ABI padding");
+        }
+        recipients.push(Address::from_slice(&word[12..]));
+    }
+    Ok(recipients)
+}
+
+fn resolve_public_fee_recipient(
+    state: &SeaDropPublicState,
+    configured: Option<&str>,
+) -> Result<Option<String>> {
+    if !state.restrict_fee_recipients {
+        return Ok(configured.map(str::to_owned));
+    }
+    if state.allowed_fee_recipients.is_empty() {
+        bail!("PUBLIC_SALE restricts fee recipients but SeaDrop has no allowed recipient");
+    }
+    if let Some(configured) = configured {
+        let address: Address = configured.parse().context("invalid FEE_RECIPIENT")?;
+        if !state.allowed_fee_recipients.contains(&address) {
+            bail!("configured FEE_RECIPIENT {address:?} is not allowed by this SeaDrop collection");
+        }
+        return Ok(Some(format!("{address:?}")));
+    }
+    let default: Address = DEFAULT_FEE_RECIPIENT
+        .parse()
+        .expect("valid built-in fee recipient");
+    if state.allowed_fee_recipients.contains(&default) {
+        Ok(None)
+    } else {
+        // Every address in this enumeration was explicitly approved by the
+        // collection owner. Selecting the first mirrors SeaDrop's canonical
+        // configuration order and keeps the mint fully local at T0.
+        Ok(Some(format!("{:?}", state.allowed_fee_recipients[0])))
+    }
+}
+
 fn validate_seadrop_public_state(
-    state: SeaDropPublicState,
+    state: &SeaDropPublicState,
     expected_unit_price: U256,
     quantity: u32,
     fire_time: i64,
@@ -2509,7 +2618,7 @@ async fn run_opensea_mint_inner(
     let stage_type_owned = stage.stage_type.clone();
     let stage_token_id = opensea::stage_token_id(stage);
     let seadrop_address = env.get("SEADROP_ADDRESS").cloned();
-    let fee_recipient = env.get("FEE_RECIPIENT").cloned();
+    let mut fee_recipient = env.get("FEE_RECIPIENT").cloned();
     let mut public_drop_final_verified = false;
 
     // Explicit schedule must parse cleanly — never silently fall back to phase start.
@@ -3152,11 +3261,22 @@ async fn run_opensea_mint_inner(
                         }
                     };
                     let verified_price = validate_seadrop_public_state(
-                        state,
+                        &state,
                         expected_unit_price_wei,
                         quantity,
                         start_ts,
                     )?;
+                    let resolved_fee_recipient =
+                        resolve_public_fee_recipient(&state, fee_recipient.as_deref())?;
+                    if resolved_fee_recipient != fee_recipient {
+                        if let Some(ref recipient) = resolved_fee_recipient {
+                            log_always(
+                                reporter.as_ref(),
+                                format!("  SeaDrop fee recipient resolved on chain: {recipient}"),
+                            );
+                        }
+                        fee_recipient = resolved_fee_recipient;
+                    }
                     price_wei = verified_price;
                     let rebuilt = rebuild_local_public_wallets(
                         &mut wallets,
@@ -3382,11 +3502,22 @@ async fn run_opensea_mint_inner(
         .await
         .context("Final SeaDrop state check timed out; mint not broadcast")??;
         price_wei = validate_seadrop_public_state(
-            state,
+            &state,
             expected_unit_price_wei,
             quantity,
             chrono::Utc::now().timestamp(),
         )?;
+        let resolved_fee_recipient =
+            resolve_public_fee_recipient(&state, fee_recipient.as_deref())?;
+        if resolved_fee_recipient != fee_recipient {
+            if let Some(ref recipient) = resolved_fee_recipient {
+                log_always(
+                    reporter.as_ref(),
+                    format!("SeaDrop fee recipient resolved on chain: {recipient}"),
+                );
+            }
+            fee_recipient = resolved_fee_recipient;
+        }
         rebuild_local_public_wallets(
             &mut wallets,
             &wallet_quantities,
@@ -4902,6 +5033,26 @@ async fn run_opensea_mint_inner(
                             let proven_early = mined_block_ts.is_some_and(|timestamp| {
                                 is_proven_pre_open_revert(stage_start_ts_w, timestamp)
                             });
+                            // Receipt JSON contains only status=0. Re-run the
+                            // exact call as a read-only estimate after a normal
+                            // (non pre-open) revert so the operator sees the
+                            // SeaDrop custom error. This happens after mining
+                            // and therefore cannot delay the mint shot.
+                            let contract_revert = if !proven_early {
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_millis(1_500),
+                                    rpc.estimate_gas(&addr, &tx.to, tx.value, &tx.data),
+                                )
+                                .await
+                                {
+                                    Ok(Err(error)) => {
+                                        Some(enrich_mint_rpc_error(&format!("{error}")))
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
                             let mut recovery_failure: Option<String> = None;
                             if proven_early
                                 && proven_early_recoveries
@@ -5011,6 +5162,8 @@ async fn run_opensea_mint_inner(
                                 if proven_early {
                                     "reverted in a pre-open block; bounded paid recovery exhausted"
                                         .to_string()
+                                } else if let Some(diagnostic) = contract_revert {
+                                    format!("contract reverted: {diagnostic}")
                                 } else if let Some(timestamp) = mined_block_ts {
                                     format!(
                                         "reverted (mined block timestamp={timestamp}, not a proven pre-open revert)"
@@ -5498,13 +5651,14 @@ mod tests {
         GQL_STAGGER_MAX_SPREAD_MS, NOT_ACTIVE_CHAIN_WAIT_MAX_SECS, NotActiveInfo,
         OPENSEA_MINT_ACTION_BUDGET, OPENSEA_MINT_ACTION_REFILL_MS, PHASE_OPEN_LAG_WINDOW_SECS,
         RATE_LIMIT_WAIT_BUDGET_MS, SeaDropPublicState, WalletAuth, assigned_proxy_routes,
-        build_local_public_mint, classify_mint_error, enrich_mint_rpc_error, estimate_fail_policy,
-        fire_lag_ms_from_clock, format_not_active, format_rpc_plan, gql_action_not_ready_delay,
-        gql_stagger_step_ms, in_phase_open_lag_window, is_gql_action_not_ready,
-        is_proven_pre_open_revert, is_terminal_gql_action_error, keep_before_opensea_auth,
-        late_preflight_proves_rejection, parse_not_active, parse_tx_calldata_hex,
-        pre_sign_ready_wallets, rate_limit_backoff, resolve_mint_gas_limit,
-        validate_seadrop_calldata, validate_seadrop_public_state, validate_wallet_subset_counts,
+        build_local_public_mint, classify_mint_error, decode_common_seadrop_revert,
+        enrich_mint_rpc_error, estimate_fail_policy, fire_lag_ms_from_clock, format_not_active,
+        format_rpc_plan, gql_action_not_ready_delay, gql_stagger_step_ms, in_phase_open_lag_window,
+        is_gql_action_not_ready, is_proven_pre_open_revert, is_terminal_gql_action_error,
+        keep_before_opensea_auth, late_preflight_proves_rejection, parse_not_active,
+        parse_tx_calldata_hex, pre_sign_ready_wallets, rate_limit_backoff, resolve_mint_gas_limit,
+        resolve_public_fee_recipient, validate_seadrop_calldata, validate_seadrop_public_state,
+        validate_wallet_subset_counts,
     };
     use crate::proxy::ProxyManager;
     use crate::types::Signer;
@@ -6113,8 +6267,10 @@ mod tests {
             start_time: 900,
             end_time: 2_000,
             max_total_mintable_by_wallet: 25,
+            restrict_fee_recipients: false,
+            allowed_fee_recipients: vec![],
         };
-        let error = validate_seadrop_public_state(state, U256::ZERO, 25, 1_000)
+        let error = validate_seadrop_public_state(&state, U256::ZERO, 25, 1_000)
             .expect_err("a free task must not turn into a paid mint");
         assert!(error.to_string().contains("price changed"));
     }
@@ -6126,14 +6282,59 @@ mod tests {
             start_time: 900,
             end_time: 2_000,
             max_total_mintable_by_wallet: 25,
+            restrict_fee_recipients: false,
+            allowed_fee_recipients: vec![],
         };
         assert_eq!(
-            validate_seadrop_public_state(state, U256::from(5u64), 25, 1_000).unwrap(),
+            validate_seadrop_public_state(&state, U256::from(5u64), 25, 1_000).unwrap(),
             U256::from(5u64)
         );
-        assert!(validate_seadrop_public_state(state, U256::from(10u64), 25, 1_000).is_err());
-        assert!(validate_seadrop_public_state(state, U256::from(5u64), 26, 1_000).is_err());
-        assert!(validate_seadrop_public_state(state, U256::from(5u64), 25, 2_000).is_err());
+        assert!(validate_seadrop_public_state(&state, U256::from(10u64), 25, 1_000).is_err());
+        assert!(validate_seadrop_public_state(&state, U256::from(5u64), 26, 1_000).is_err());
+        assert!(validate_seadrop_public_state(&state, U256::from(5u64), 25, 2_000).is_err());
+    }
+
+    #[test]
+    fn restricted_public_drop_uses_owner_approved_recipient() {
+        let approved: Address = "0x07D3A100c3880830dD43FE5C938B5144721Ce9D6"
+            .parse()
+            .unwrap();
+        let state = SeaDropPublicState {
+            mint_price: U256::ZERO,
+            start_time: 0,
+            end_time: u64::MAX,
+            max_total_mintable_by_wallet: 1,
+            restrict_fee_recipients: true,
+            allowed_fee_recipients: vec![approved],
+        };
+        assert_eq!(
+            resolve_public_fee_recipient(&state, None).unwrap(),
+            Some(format!("{approved:?}"))
+        );
+        assert!(
+            resolve_public_fee_recipient(
+                &state,
+                Some("0x0000a26b00c1F0DF003000390027140000fAa719")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn common_seadrop_reverts_are_human_readable() {
+        assert_eq!(
+            decode_common_seadrop_revert("execution reverted: 0xf477d26f").unwrap(),
+            "FeeRecipientNotAllowed: fee recipient is not approved by this collection"
+        );
+        let supply_error = format!(
+            "rpc data=0xe12d2314{:064x}{:064x}",
+            U256::from(3001u64),
+            U256::from(3000u64)
+        );
+        assert_eq!(
+            decode_common_seadrop_revert(&supply_error).unwrap(),
+            "MintQuantityExceedsMaxSupply: requested total 3001, collection max supply 3000"
+        );
     }
 
     #[test]

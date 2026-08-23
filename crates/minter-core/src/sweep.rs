@@ -1,5 +1,6 @@
 use alloy_primitives::{Address, Bytes, U256};
 use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
 use crate::abi::function_selector;
@@ -16,6 +17,13 @@ const ERC1155_INTERFACE_ID: [u8; 4] = [0xd9, 0xb6, 0x7a, 0x26];
 /// Cap on tokens enumerated via the Alchemy NFT API, mirroring the on-chain
 /// MAX_ENUMERATE guard, so a broken/looping pageKey can't grow unbounded (audit L12).
 const MAX_ALCHEMY_TOKENS: usize = 10_000;
+/// Blockscout can lag behind Ink during a busy mint.  Scan enough recent
+/// on-chain history to bridge that indexing gap without turning Sweep into an
+/// unbounded archive-node crawl.  At Ink's current cadence this is many hours.
+const RECENT_NFT_LOG_LOOKBACK: u64 = 50_000;
+/// Public Ink RPC endpoints reject eth_getLogs ranges larger than 10,000
+/// blocks.  An inclusive 10,000-block chunk therefore has a delta of 9,999.
+const RPC_LOG_CHUNK_BLOCKS: u64 = 10_000;
 
 fn encode_address(addr: &Address) -> Vec<u8> {
     let mut buf = vec![0u8; 32];
@@ -653,6 +661,229 @@ fn blockscout_nft_base(chain_id: u64) -> Option<&'static str> {
     }
 }
 
+fn event_topic(signature: &str) -> String {
+    format!("{:?}", alloy_primitives::keccak256(signature.as_bytes()))
+}
+
+fn address_topic(address: Address) -> String {
+    format!("0x{:0>64}", hex::encode(address.as_slice()))
+}
+
+fn address_from_topic(value: &Value) -> Option<Address> {
+    let raw = value.as_str()?.strip_prefix("0x")?;
+    if raw.len() != 64 {
+        return None;
+    }
+    raw[24..].parse().ok()
+}
+
+fn abi_u256_array(data: &[u8], offset_word: usize) -> Option<Vec<U256>> {
+    let offset_start = offset_word.checked_mul(32)?;
+    let offset_end = offset_start.checked_add(32)?;
+    let offset = usize::try_from(decode_u256(data.get(offset_start..offset_end)?).ok()?).ok()?;
+    let length_end = offset.checked_add(32)?;
+    let length = usize::try_from(decode_u256(data.get(offset..length_end)?).ok()?).ok()?;
+    if length > MAX_ALCHEMY_TOKENS {
+        return None;
+    }
+    let values_start = length_end;
+    let values_end = values_start.checked_add(length.checked_mul(32)?)?;
+    let values = data.get(values_start..values_end)?;
+    Some(
+        values
+            .chunks_exact(32)
+            .filter_map(|word| decode_u256(word).ok())
+            .collect(),
+    )
+}
+
+fn push_recent_asset(
+    assets: &mut HashMap<Address, Vec<NftAsset>>,
+    owners: &HashSet<Address>,
+    owner: Address,
+    asset: NftAsset,
+) {
+    if owners.contains(&owner) {
+        assets.entry(owner).or_default().push(asset);
+    }
+}
+
+/// Parse standard inbound NFT transfer logs.  These are only candidates: the
+/// current owner/balance is checked through RPC immediately before transfer,
+/// so an NFT later sent away cannot be swept accidentally.
+fn collect_recent_transfer_logs(
+    logs: &Value,
+    kind: NftKind,
+    owners: &HashSet<Address>,
+    assets: &mut HashMap<Address, Vec<NftAsset>>,
+) {
+    for log in logs.as_array().into_iter().flatten() {
+        let Some(contract) = log
+            .get("address")
+            .and_then(Value::as_str)
+            .and_then(|raw| raw.parse::<Address>().ok())
+        else {
+            continue;
+        };
+        let Some(topics) = log.get("topics").and_then(Value::as_array) else {
+            continue;
+        };
+        match kind {
+            NftKind::Erc721 => {
+                if topics.len() != 4 {
+                    continue;
+                }
+                let Some(owner) = topics.get(2).and_then(address_from_topic) else {
+                    continue;
+                };
+                let Some(token_id) = topics
+                    .get(3)
+                    .and_then(Value::as_str)
+                    .and_then(parse_token_id_str)
+                else {
+                    continue;
+                };
+                push_recent_asset(
+                    assets,
+                    owners,
+                    owner,
+                    NftAsset {
+                        contract,
+                        token_id,
+                        kind,
+                        amount: U256::from(1u64),
+                    },
+                );
+            }
+            NftKind::Erc1155 => {
+                if topics.len() != 4 {
+                    continue;
+                }
+                let Some(owner) = topics.get(3).and_then(address_from_topic) else {
+                    continue;
+                };
+                let Some(raw_data) = log
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .and_then(|raw| raw.strip_prefix("0x"))
+                    .and_then(|raw| hex::decode(raw).ok())
+                else {
+                    continue;
+                };
+                // TransferSingle has two fixed words (id, value). TransferBatch
+                // has two offsets followed by dynamic id/value arrays.
+                let pairs = if raw_data.len() == 64 {
+                    decode_u256(&raw_data[..32])
+                        .ok()
+                        .zip(decode_u256(&raw_data[32..64]).ok())
+                        .map(|pair| vec![pair])
+                } else {
+                    abi_u256_array(&raw_data, 0)
+                        .zip(abi_u256_array(&raw_data, 1))
+                        .filter(|(ids, amounts)| ids.len() == amounts.len())
+                        .map(|(ids, amounts)| ids.into_iter().zip(amounts).collect())
+                };
+                for (token_id, amount) in pairs.into_iter().flatten() {
+                    if amount.is_zero() {
+                        continue;
+                    }
+                    push_recent_asset(
+                        assets,
+                        owners,
+                        owner,
+                        NftAsset {
+                            contract,
+                            token_id,
+                            kind,
+                            amount,
+                        },
+                    );
+                }
+            }
+        }
+    }
+}
+
+async fn fetch_recent_assets_rpc(
+    rpc: &RpcClient,
+    owners: &[Address],
+    contract_filter: Option<Address>,
+) -> Result<HashMap<Address, Vec<NftAsset>>> {
+    if owners.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let latest = rpc
+        .block_number()
+        .await
+        .context("latest block for NFT fallback")?;
+    let first = latest.saturating_sub(RECENT_NFT_LOG_LOOKBACK.saturating_sub(1));
+    let owner_set: HashSet<Address> = owners.iter().copied().collect();
+    let owner_topics: Vec<Value> = owners
+        .iter()
+        .copied()
+        .map(address_topic)
+        .map(Value::String)
+        .collect();
+    let event_specs = [
+        ("Transfer(address,address,uint256)", 2usize, NftKind::Erc721),
+        (
+            "TransferSingle(address,address,address,uint256,uint256)",
+            3usize,
+            NftKind::Erc1155,
+        ),
+        (
+            "TransferBatch(address,address,address,uint256[],uint256[])",
+            3usize,
+            NftKind::Erc1155,
+        ),
+    ];
+    let mut assets = HashMap::new();
+    let mut successful_queries = 0usize;
+    let mut errors = Vec::new();
+    let mut from = first;
+    while from <= latest {
+        let to = from.saturating_add(RPC_LOG_CHUNK_BLOCKS - 1).min(latest);
+        for (signature, owner_topic_index, kind) in event_specs {
+            let mut topics = vec![Value::Null; owner_topic_index + 1];
+            topics[0] = Value::String(event_topic(signature));
+            topics[owner_topic_index] = Value::Array(owner_topics.clone());
+            let mut filter = json!({
+                "fromBlock": format!("0x{from:x}"),
+                "toBlock": format!("0x{to:x}"),
+                "topics": topics,
+            });
+            if let Some(contract) = contract_filter {
+                filter["address"] = Value::String(format!("{contract:?}"));
+            }
+            match rpc.call("eth_getLogs", json!([filter])).await {
+                Ok(logs) => {
+                    successful_queries += 1;
+                    collect_recent_transfer_logs(&logs, kind, &owner_set, &mut assets);
+                }
+                Err(error) => errors.push(format!("{signature} {from}-{to}: {error}")),
+            }
+        }
+        if to == latest {
+            break;
+        }
+        from = to.saturating_add(1);
+    }
+    if successful_queries == 0 {
+        bail!("recent NFT event fallback failed: {}", errors.join(" | "));
+    }
+    if !errors.is_empty() {
+        crate::rlog!(
+            "  Warning: recent NFT event fallback was partial ({} query error(s))",
+            errors.len()
+        );
+    }
+    for found in assets.values_mut() {
+        let mut seen = HashSet::new();
+        found.retain(|asset| seen.insert((asset.contract, asset.token_id, asset.kind)));
+    }
+    Ok(assets)
+}
+
 async fn fetch_assets_alchemy_v3(
     api_key: &str,
     domain: &str,
@@ -928,7 +1159,8 @@ async fn discover_wallet_assets(
     }
     if let Some(base_url) = blockscout_nft_base(chain_id) {
         match fetch_assets_blockscout(base_url, owner, contract_filter).await {
-            Ok(assets) => return Ok(assets),
+            Ok(assets) if !assets.is_empty() => return Ok(assets),
+            Ok(_) => source_succeeded = true,
             Err(error) => errors.push(format!("Blockscout: {error}")),
         }
     }
@@ -1043,6 +1275,35 @@ pub async fn run_auto_nft_sweep(
 
     let mut results = Vec::new();
     let mut kind_cache: HashMap<Address, NftKind> = HashMap::new();
+    // Ink's Blockscout can trail the chain during busy mints. Enrich its
+    // inventory with recent standard Transfer events read directly from RPC,
+    // batched for every selected wallet so ten wallets do not cause ten full
+    // history scans. This runs only in Sweep and cannot affect mint latency.
+    let recent_rpc_assets = if chain_id == 57073 {
+        let owners: Vec<Address> = signers
+            .iter()
+            .map(Signer::address)
+            .filter(|address| *address != config.destination)
+            .collect();
+        crate::rlog!(
+            "  Ink safety fallback: scanning the latest {} blocks for NFT transfers to {} wallet(s)",
+            RECENT_NFT_LOG_LOOKBACK,
+            owners.len()
+        );
+        match fetch_recent_assets_rpc(rpc, &owners, config.contract).await {
+            Ok(found) => {
+                let count: usize = found.values().map(Vec::len).sum();
+                crate::rlog!("  Ink RPC fallback found {count} recent NFT candidate(s)");
+                found
+            }
+            Err(error) => {
+                crate::rlog!("  Warning: Ink RPC NFT fallback unavailable: {error}");
+                HashMap::new()
+            }
+        }
+    } else {
+        HashMap::new()
+    };
     for signer in signers {
         let address = signer.address();
         if address == config.destination {
@@ -1050,30 +1311,52 @@ pub async fn run_auto_nft_sweep(
             continue;
         }
         crate::rlog!("\n=== Wallet {} ===", shorten_address(&address));
-        let mut assets = match discover_wallet_assets(
+        let discovery = discover_wallet_assets(
             rpc,
             chain_id,
             address,
             config.contract,
             config.alchemy_api_key.as_deref(),
         )
-        .await
-        {
+        .await;
+        let mut assets = match discovery {
             Ok(assets) => assets,
             Err(error) => {
-                crate::rlog!("  Discovery failed: {error}");
-                results.push(nft_sweep_result(
-                    address,
-                    None,
-                    WalletStatus::Failed,
-                    None,
-                    None,
-                    None,
-                    Some(error.to_string()),
-                ));
-                continue;
+                if recent_rpc_assets
+                    .get(&address)
+                    .is_some_and(|found| !found.is_empty())
+                {
+                    crate::rlog!(
+                        "  Indexed discovery failed ({error}); using verified RPC candidates"
+                    );
+                    Vec::new()
+                } else {
+                    crate::rlog!("  Discovery failed: {error}");
+                    results.push(nft_sweep_result(
+                        address,
+                        None,
+                        WalletStatus::Failed,
+                        None,
+                        None,
+                        None,
+                        Some(error.to_string()),
+                    ));
+                    continue;
+                }
             }
         };
+        if let Some(recent) = recent_rpc_assets.get(&address) {
+            let mut seen: HashSet<(Address, U256, NftKind)> = assets
+                .iter()
+                .map(|asset| (asset.contract, asset.token_id, asset.kind))
+                .collect();
+            assets.extend(
+                recent
+                    .iter()
+                    .filter(|asset| seen.insert((asset.contract, asset.token_id, asset.kind)))
+                    .cloned(),
+            );
+        }
         if assets.is_empty() {
             crate::rlog!("  No supported NFTs found");
             continue;
@@ -1619,5 +1902,96 @@ mod fmt_eth_tests {
             &function_selector("safeTransferFrom(address,address,uint256,uint256,bytes)")
         );
         assert_eq!(&data[data.len() - 32..], &[0u8; 32]);
+    }
+
+    #[test]
+    fn recent_erc721_log_parser_recovers_unindexed_mint() {
+        let owner: Address = "0x9398b40726ee913f047c3b7d8da91d6f811f227c"
+            .parse()
+            .unwrap();
+        let contract: Address = "0x29b5dd6dd7b79c7a8fb9f928dc11abaa5da9c02a"
+            .parse()
+            .unwrap();
+        let logs = json!([{
+            "address": format!("{contract:?}"),
+            "topics": [
+                event_topic("Transfer(address,address,uint256)"),
+                format!("0x{:064x}", 0),
+                address_topic(owner),
+                format!("0x{:064x}", 3780),
+            ],
+            "data": "0x"
+        }]);
+        let owners = HashSet::from([owner]);
+        let mut found = HashMap::new();
+        collect_recent_transfer_logs(&logs, NftKind::Erc721, &owners, &mut found);
+        let asset = &found[&owner][0];
+        assert_eq!(asset.contract, contract);
+        assert_eq!(asset.token_id, U256::from(3780u64));
+        assert_eq!(asset.kind, NftKind::Erc721);
+    }
+
+    #[test]
+    fn recent_erc1155_single_log_parser_decodes_id_and_amount() {
+        let owner: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let contract: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let mut data = encode_u256(U256::from(7u64));
+        data.extend(encode_u256(U256::from(3u64)));
+        let logs = json!([{
+            "address": format!("{contract:?}"),
+            "topics": [
+                event_topic("TransferSingle(address,address,address,uint256,uint256)"),
+                address_topic(Address::ZERO),
+                address_topic(Address::ZERO),
+                address_topic(owner),
+            ],
+            "data": format!("0x{}", hex::encode(data))
+        }]);
+        let owners = HashSet::from([owner]);
+        let mut found = HashMap::new();
+        collect_recent_transfer_logs(&logs, NftKind::Erc1155, &owners, &mut found);
+        let asset = &found[&owner][0];
+        assert_eq!(asset.token_id, U256::from(7u64));
+        assert_eq!(asset.amount, U256::from(3u64));
+    }
+
+    #[test]
+    fn recent_erc1155_batch_log_parser_decodes_parallel_arrays() {
+        let owner: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let contract: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let mut data = encode_u256(U256::from(64u64));
+        data.extend(encode_u256(U256::from(160u64)));
+        data.extend(encode_u256(U256::from(2u64)));
+        data.extend(encode_u256(U256::from(7u64)));
+        data.extend(encode_u256(U256::from(8u64)));
+        data.extend(encode_u256(U256::from(2u64)));
+        data.extend(encode_u256(U256::from(3u64)));
+        data.extend(encode_u256(U256::from(4u64)));
+        let logs = json!([{
+            "address": format!("{contract:?}"),
+            "topics": [
+                event_topic("TransferBatch(address,address,address,uint256[],uint256[])"),
+                address_topic(Address::ZERO),
+                address_topic(Address::ZERO),
+                address_topic(owner),
+            ],
+            "data": format!("0x{}", hex::encode(data))
+        }]);
+        let owners = HashSet::from([owner]);
+        let mut found = HashMap::new();
+        collect_recent_transfer_logs(&logs, NftKind::Erc1155, &owners, &mut found);
+        assert_eq!(found[&owner].len(), 2);
+        assert_eq!(found[&owner][0].token_id, U256::from(7u64));
+        assert_eq!(found[&owner][0].amount, U256::from(3u64));
+        assert_eq!(found[&owner][1].token_id, U256::from(8u64));
+        assert_eq!(found[&owner][1].amount, U256::from(4u64));
     }
 }

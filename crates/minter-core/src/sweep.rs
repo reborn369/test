@@ -691,7 +691,9 @@ fn abi_u256_array(data: &[u8], offset_word: usize) -> Option<Vec<U256>> {
     let values = data.get(values_start..values_end)?;
     Some(
         values
-            .chunks_exact(32)
+            .as_chunks::<32>()
+            .0
+            .iter()
             .filter_map(|word| decode_u256(word).ok())
             .collect(),
     )

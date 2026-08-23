@@ -5352,10 +5352,6 @@ async fn run_opensea_mint_inner(
             confirmed, total, failed, elapsed
         ),
     );
-    if let Some(ref p) = _mint_log_path {
-        log_always(reporter.as_ref(), format!("Log file: {p}"));
-    }
-
     let mut export_json = None;
     let mut export_csv = None;
     if do_export {

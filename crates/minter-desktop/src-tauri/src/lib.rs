@@ -885,6 +885,25 @@ async fn warm_rpc_latency(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct FireLagInput {
+    chain: String,
+}
+
+#[tauri::command]
+async fn measure_fire_lag(
+    state: State<'_, Arc<AppState>>,
+    input: FireLagInput,
+) -> Result<minter_core::FireLagReport, String> {
+    let _slot = net_slot(&state).await?;
+    let session = state.session.lock().clone();
+    session
+        .measure_fire_lag(&input.chain)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawProbeInput {
     chain: String,
     contract: String,
@@ -2548,6 +2567,7 @@ pub fn run() {
             wallet_balances,
             probe_networks,
             warm_rpc_latency,
+            measure_fire_lag,
             load_wallet_meta,
             save_wallet_meta,
             pick_files,

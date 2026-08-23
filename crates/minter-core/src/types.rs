@@ -28,6 +28,7 @@ pub fn chain_id_map() -> HashMap<&'static str, u64> {
     m.insert("bsc", 56);
     m.insert("blast", 81457);
     m.insert("shape", 360);
+    m.insert("ink", 57073);
     m.insert("ape_chain", 33139);
     m.insert("apechain", 33139);
     m.insert("monad", 143);
@@ -52,6 +53,7 @@ pub enum ChainId {
     Bsc = 56,
     Blast = 81457,
     Shape = 360,
+    Ink = 57073,
     ApeChain = 33139,
     Monad = 143,
     MegaEth = 4326,
@@ -72,6 +74,7 @@ impl ChainId {
             56 => Some(Self::Bsc),
             81457 => Some(Self::Blast),
             360 => Some(Self::Shape),
+            57073 => Some(Self::Ink),
             33139 => Some(Self::ApeChain),
             143 => Some(Self::Monad),
             4326 => Some(Self::MegaEth),
@@ -97,6 +100,7 @@ impl ChainId {
             Self::Bsc => "bsc",
             Self::Blast => "blast",
             Self::Shape => "shape",
+            Self::Ink => "ink",
             Self::ApeChain => "apechain",
             Self::Monad => "monad",
             Self::MegaEth => "megaeth",
@@ -117,6 +121,7 @@ impl ChainId {
             Self::Bsc,
             Self::Blast,
             Self::Shape,
+            Self::Ink,
             Self::ApeChain,
             Self::Monad,
             Self::MegaEth,

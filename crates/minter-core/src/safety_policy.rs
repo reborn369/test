@@ -116,12 +116,29 @@ pub fn should_refresh_fees_at_fire(chain_id: u64, mode: FeeRefreshMode) -> bool 
     }
 }
 
-/// Default auth concurrency: low without proxies, modest with proxies.
+/// Ceiling on concurrent SIWE logins, chosen from measurement rather than feel.
+///
+/// OpenSea rate-limits per source IP. Measured against the live endpoint:
+/// 5 concurrent logins from one address are fine, 10 already produce failures,
+/// and 20 fail outright. Spread across distinct proxies the picture changes
+/// completely — 40 concurrent over 50 proxies (so ≤1 in flight per IP)
+/// completed with zero failures.
+///
+/// The old ceiling of 6 ignored how many proxies were configured, so a 50-proxy
+/// setup ran at the same speed as a 6-proxy one: ~13 s of authentication for
+/// 100 wallets instead of ~2 s. Scale roughly one in-flight login per proxy,
+/// which is the ratio actually verified, and cap it so a huge list cannot open
+/// an unbounded burst. `AUTH_CONCURRENCY` still overrides this outright.
+///
+/// Deliberately *not* pushed to the per-IP limit of 5: a single 429 flips the
+/// whole run into serial mode, which costs far more than the extra parallelism
+/// would have saved.
 pub fn default_auth_concurrency(proxy_count: usize) -> usize {
     if proxy_count == 0 {
+        // One shared IP — stay well under the ~5 where failures start.
         2
     } else {
-        proxy_count.clamp(2, 6)
+        proxy_count.clamp(2, 48)
     }
 }
 
@@ -186,9 +203,28 @@ mod tests {
 
     #[test]
     fn auth_concurrency_defaults() {
+        // No proxies: one IP, and failures start around 5 concurrent.
         assert_eq!(default_auth_concurrency(0), 2);
+        // A single proxy is still a single IP — do not read it as permission
+        // to run one login per wallet.
         assert_eq!(default_auth_concurrency(1), 2);
-        assert_eq!(default_auth_concurrency(10), 6);
         assert_eq!(auth_concurrency_after_rate_limit(), 1);
+    }
+
+    #[test]
+    fn auth_concurrency_scales_with_the_proxy_pool() {
+        // Roughly one in-flight login per proxy: this is the ratio measured to
+        // complete with zero failures (40 concurrent across 50 proxies).
+        assert_eq!(default_auth_concurrency(10), 10);
+        assert_eq!(default_auth_concurrency(50), 48);
+        // Capped, so a very large list cannot open an unbounded burst.
+        assert_eq!(default_auth_concurrency(500), 48);
+        // Monotonic — more proxies must never mean less parallelism.
+        let mut prev = 0;
+        for n in [0usize, 1, 2, 5, 10, 25, 50, 100] {
+            let c = default_auth_concurrency(n);
+            assert!(c >= prev, "concurrency dropped at {n}: {prev} -> {c}");
+            prev = c;
+        }
     }
 }

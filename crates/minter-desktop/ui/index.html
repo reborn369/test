@@ -127,7 +127,8 @@
         <div id="update-banner" class="update-banner hidden" role="status">
           <span id="update-text"></span>
           <a id="update-link" href="#" target="_blank" rel="noopener" data-i18n="update.open">Open Releases</a>
-          <button type="button" id="update-dismiss" class="update-dismiss" aria-label="Dismiss">�</button>
+          <span class="muted small" data-i18n="update.keepFolder">Unzip it over your current folder — your keys and settings live there.</span>
+          <button type="button" id="update-dismiss" class="update-dismiss" aria-label="Dismiss">&times;</button>
         </div>
         <div id="toast-host" class="toast-host" aria-live="polite"></div>
         <div id="confirm-badge" class="confirm-badge hidden">✓ First confirm</div>
@@ -322,6 +323,7 @@
                           <option value="zora">Zora</option>
                           <option value="apechain">ApeChain</option>
                           <option value="shape">Shape</option>
+                          <option value="ink">Ink</option>
                           <option value="monad">Monad</option>
                           <option value="megaeth">MegaETH</option>
                           <option value="robinhood" selected>Robinhood Chain</option>
@@ -403,6 +405,9 @@
                       <label class="check tight"><input type="checkbox" id="raw-wallets-all" checked /> <span data-i18n="tasks.selectAll">Select all</span></label>
                       <label class="check tight"><input type="checkbox" id="raw-filter-balance" checked /> <span data-i18n="raw.filterBalance">Funded only</span></label>
                       <label class="check tight"><input type="checkbox" id="raw-fee-refresh-l2" /> <span data-i18n="raw.feeRefreshL2">Refresh fees at fire on L2 (slower)</span></label>
+                      <label class="check tight" title="Guarded by timestampMin: pushes before the chain opens are refused by the node, costing no gas and no nonce."><span data-i18n="raw.pushLead">Push early, ms</span> <input type="number" id="raw-push-lead" class="tight-num" min="0" max="3000" step="50" placeholder="0" /></label>
+                      <button type="button" id="btn-raw-lag" class="ghost-btn tight-btn" data-i18n="raw.lagTest">Measure</button>
+                      <span id="raw-lag-out" class="muted"></span>
                       <button type="button" id="btn-raw-balances" class="ghost-btn tight-btn" data-i18n="raw.checkBal">Balances</button>
                     </div>
                     <div id="raw-wallet-list" class="task-wallet-list muted">Unlock vault…</div>
@@ -508,6 +513,7 @@
                         <option value="zora">Zora</option>
                         <option value="apechain">ApeChain</option>
                         <option value="shape">Shape</option>
+                        <option value="ink">Ink</option>
                         <option value="monad">Monad</option>
                         <option value="megaeth">MegaETH</option>
                         <option value="robinhood">Robinhood Chain</option>
@@ -571,6 +577,7 @@
                       <option value="zora">Zora</option>
                       <option value="apechain">ApeChain</option>
                       <option value="shape">Shape</option>
+                      <option value="ink">Ink</option>
                       <option value="monad">Monad</option>
                       <option value="megaeth">MegaETH</option>
                       <option value="robinhood">Robinhood Chain</option>
@@ -632,6 +639,7 @@
                         <option value="zora">Zora</option>
                         <option value="apechain">ApeChain</option>
                         <option value="shape">Shape</option>
+                        <option value="ink">Ink</option>
                         <option value="monad">Monad</option>
                         <option value="megaeth">MegaETH</option>
                         <option value="robinhood">Robinhood Chain</option>
@@ -694,6 +702,7 @@
                         <option value="zora">Zora</option>
                         <option value="apechain">ApeChain</option>
                         <option value="shape">Shape</option>
+                        <option value="ink">Ink</option>
                         <option value="monad">Monad</option>
                         <option value="megaeth">MegaETH</option>
                         <option value="robinhood">Robinhood Chain</option>
@@ -1140,6 +1149,7 @@
               <option value="zora">Zora</option>
               <option value="apechain">ApeChain</option>
               <option value="shape">Shape</option>
+              <option value="ink">Ink</option>
               <option value="monad">Monad</option>
               <option value="megaeth">MegaETH</option>
               <option value="robinhood">Robinhood Chain</option>

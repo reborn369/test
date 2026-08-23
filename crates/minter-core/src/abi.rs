@@ -1256,3 +1256,41 @@ mod canonical_selector_tests {
         assert!(parse_function_signature(")(").is_err());
     }
 }
+
+#[cfg(test)]
+mod ukiyo_check {
+    use super::*;
+
+    /// The Archetype mint used by scatter.art: a tuple carrying a merkle key
+    /// and proof, then quantity, affiliate and an optional signature.
+    ///
+    /// Verified against the live contract by `eth_call`, which reached the
+    /// mint logic and returned `MintNotYetStarted()` — so this encoding is
+    /// what the chain accepts, not a guess.
+    #[test]
+    fn archetype_public_mint_encodes_as_the_chain_expects() {
+        let data = build_calldata(
+            "mint((bytes32,bytes32[]),uint256,address,bytes)",
+            &[
+                "(0x0000000000000000000000000000000000000000000000000000000000000000,[])".into(),
+                "5".into(),
+                "0x0000000000000000000000000000000000000000".into(),
+                "0x".into(),
+            ],
+        )
+        .expect("public mint calldata");
+        let hex = format!("0x{}", hex::encode(&data));
+        assert_eq!(&hex[..10], "0x4a21a2df", "selector");
+        // head: tuple offset, quantity, affiliate, signature offset
+        assert_eq!(&hex[10..74], format!("{}80", "0".repeat(62)));
+        assert!(
+            hex.ends_with(&"0".repeat(64)),
+            "empty signature length word"
+        );
+        assert_eq!(
+            hex.len(),
+            2 + 8 + 64 * 8,
+            "4 head + 3 tuple + 1 signature words"
+        );
+    }
+}

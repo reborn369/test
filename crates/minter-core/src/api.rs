@@ -1110,6 +1110,42 @@ impl Session {
         g
     }
 
+    /// Read a no-argument view function and return its first word as a `U256`.
+    ///
+    /// A launchpad that opens its public sale by an owner transaction rather
+    /// than a timestamp cannot be waited on with a clock — the only honest
+    /// signal is the contract's own state, polled. Exposed as a narrow read
+    /// rather than by handing out an `RpcClient`, so chain resolution and the
+    /// endpoint fallbacks stay in one place, and so this can never be used to
+    /// send anything.
+    pub async fn read_uint(
+        &self,
+        chain: &str,
+        contract: &str,
+        signature: &str,
+    ) -> Result<alloy_primitives::U256> {
+        let to: Address = contract
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid contract address: {contract}"))?;
+        let selector = &alloy_primitives::keccak256(signature.trim().as_bytes())[..4];
+        let rpc = self.rpc_client_for_chain(chain)?;
+        let out = rpc
+            .eth_call(
+                &Address::ZERO,
+                &to,
+                &alloy_primitives::Bytes::copy_from_slice(selector),
+            )
+            .await
+            .with_context(|| format!("eth_call {signature} on {contract}"))?;
+        if out.is_empty() {
+            bail!("{signature} on {contract} returned no data (wrong address or not a contract?)");
+        }
+        // A uint/bool return is right-aligned in a 32-byte word.
+        let word = &out[out.len().saturating_sub(32)..];
+        Ok(alloy_primitives::U256::from_be_slice(word))
+    }
+
     fn rpc_client(&self) -> Result<RpcClient> {
         let urls = collect_rpc_urls(&self.env);
         if urls.is_empty() {
@@ -2359,6 +2395,17 @@ impl Session {
 
     /// Raw sniper: pre-sign race — clock fire at `at_time`, blast send (no estimate at T0).
     /// Live runs require typed `LIVE` when `require_live_confirm` is on (`input.confirm`).
+    /// Measure what the "push early" box should hold for this chain.
+    ///
+    /// The engine fires off the local clock, so the two things that decide
+    /// whether a scheduled run is early or late are how far that clock is off
+    /// and how long a packet takes to reach the sequencer. Both are measured
+    /// here rather than guessed at; see [`crate::timing`].
+    pub async fn measure_fire_lag(&self, chain: &str) -> Result<crate::timing::FireLagReport> {
+        let rpc = self.rpc_client_for_chain(chain)?;
+        crate::timing::measure_fire_lag(&rpc).await
+    }
+
     pub async fn raw_sniper(
         &self,
         input: RawSniperInput,
@@ -2486,6 +2533,8 @@ impl Session {
             concurrency: input.concurrency.unwrap_or(64).max(1) as usize,
             gas_limit,
             fee_refresh,
+            push_lead_ms: input.push_lead_ms.unwrap_or(0),
+            push_interval_ms: input.push_interval_ms.unwrap_or(100),
         };
 
         cancel.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -2732,6 +2781,15 @@ pub struct RawSniperInput {
     pub gas_limit: Option<u64>,
     /// Fee refresh at fire: mainnetOnly | always | never (default settings / mainnetOnly).
     pub fee_refresh_at_fire: Option<String>,
+    /// Start pushing transactions this many ms before `at_time`; 0 (default)
+    /// fires only at T0.
+    ///
+    /// Each push before the open is guarded by `timestampMin`, so the node
+    /// refuses it without spending gas or a nonce, and the open is detected by
+    /// the chain answering rather than by the local clock.
+    pub push_lead_ms: Option<u64>,
+    /// Gap between early pushes in ms (default 100, about one block).
+    pub push_interval_ms: Option<u64>,
 }
 
 /// Serializable sweep/mint row for desktop UI.
@@ -3519,6 +3577,7 @@ fn chain_id_label(id: u64) -> String {
         7777777 => "Zora".into(),
         33139 => "ApeChain".into(),
         360 => "Shape".into(),
+        57073 => "Ink".into(),
         143 => "Monad".into(),
         4326 => "MegaETH".into(),
         4663 => "Robinhood Chain".into(),
@@ -3709,6 +3768,7 @@ fn provider_chain_slugs(
             (Some("robinhood-mainnet"), None, None)
         }
         "shape" => (Some("shape-mainnet"), None, None),
+        "ink" => (Some("ink-mainnet"), None, None),
         _ => (None, None, None),
     }
 }
@@ -3747,6 +3807,10 @@ fn public_rpc_fallback(chain: &str) -> Vec<&'static str> {
             vec!["https://rpc.mainnet.chain.robinhood.com"]
         }
         "shape" => vec!["https://mainnet.shape.network"],
+        "ink" => vec![
+            "https://rpc-gel.inkonchain.com",
+            "https://rpc-qnd.inkonchain.com",
+        ],
         "zora" => vec!["https://rpc.zora.energy"],
         "apechain" | "ape_chain" => vec!["https://rpc.apechain.com/http"],
         "blast" => vec!["https://rpc.blast.io"],

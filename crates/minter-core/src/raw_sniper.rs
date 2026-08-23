@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use alloy_primitives::{Address, B256, Bytes, U256};
 use anyhow::{Context, Result, bail};
@@ -31,6 +31,14 @@ use crate::types::{GasParams, MintResult, Signer, WalletStatus};
 const DEFAULT_GAS_LIMIT: u64 = 650_000;
 /// Start pre-sign this many seconds before `at_time`.
 const PREP_LEAD_SECS: i64 = 5;
+/// Ceiling on how early the push loop may start.
+///
+/// Transactions are pre-signed at `at_time - PREP_LEAD_SECS`, so a longer lead
+/// would ask the loop to push bytes that do not exist yet. Two seconds are held
+/// back for the pre-sign itself and the fee refresh that follows it.
+const MAX_PUSH_LEAD_MS: u64 = (PREP_LEAD_SECS as u64 - 2) * 1_000;
+/// Gap left between the fee refresh and the first push.
+const PUSH_FEE_MARGIN_MS: u64 = 400;
 /// Reject a scheduled `at_time` further ahead than this (30 days).
 ///
 /// Guards against a mistyped date parking the run in the pre-fire wait forever.
@@ -88,6 +96,14 @@ pub struct RawSniperConfig {
     pub gas_limit: Option<u64>,
     /// When to re-fetch fees + re-sign at fire (default mainnet-only).
     pub fee_refresh: FeeRefreshMode,
+    /// Start pushing this many ms before `at_time`; 0 fires only at T0.
+    ///
+    /// The point is that `at_time` is read off the local clock and the chain
+    /// opens on its own. Pushing early lets the node decide the moment instead
+    /// of us guessing it.
+    pub push_lead_ms: u64,
+    /// Gap between pushes while waiting for the chain to open.
+    pub push_interval_ms: u64,
 }
 
 impl Default for RawSniperConfig {
@@ -107,8 +123,62 @@ impl Default for RawSniperConfig {
             concurrency: 16,
             gas_limit: None,
             fee_refresh: FeeRefreshMode::MainnetOnly,
+            push_lead_ms: 0,
+            push_interval_ms: 15,
         }
     }
+}
+
+/// Normalise the two push knobs into what the loop will actually use.
+///
+/// A lead of zero switches the whole thing off and leaves the old behaviour
+/// untouched, which is why the interval is only meaningful alongside a lead.
+///
+/// The interval, not the lead, is what bounds the miss: a knock refused a
+/// moment before the open waits a whole interval for the next one. Aiming early
+/// with a coarse step is therefore worse than aiming late — 45ms of flight and
+/// a 100ms step turns "5ms early" into "95ms late".
+fn push_plan(lead_ms: u64, interval_ms: u64) -> (u64, u64) {
+    let lead = lead_ms.min(MAX_PUSH_LEAD_MS);
+    if lead == 0 {
+        return (0, 0);
+    }
+    // Below 5ms the knocks outpace the answers and only queue up; above a
+    // second the step is coarser than a block and the lead stops meaning much.
+    (lead, interval_ms.clamp(5, 1_000))
+}
+
+/// How long the loop keeps knocking after the local clock passes `at_time`.
+///
+/// Knocks are refused for free, so stopping dead at T0 only helps a clock that
+/// runs slow. A clock that runs fast would hand the plain blast a mint that has
+/// not opened yet — a revert and a spent nonce — so the loop outlives T0 by a
+/// few blocks and lets the chain, not the clock, end it.
+const PUSH_TAIL_MS: u64 = 300;
+
+/// Where each wallet's knocking starts inside the first interval.
+///
+/// Fifty wallets knocking on the same tick is what put the node into a queue
+/// during measurement: answers came back out of the order they were sent, which
+/// is precisely the precision this loop is trying to buy. Spreading them across
+/// the interval keeps every wallet's own cadence while leaving one or two
+/// requests in flight instead of all of them.
+fn push_stagger_ms(index: usize, wallets: usize, interval_ms: u64) -> u64 {
+    if wallets <= 1 {
+        return 0;
+    }
+    (index as u64 * interval_ms) / wallets as u64
+}
+
+/// Whether a conditional rejection is the node saying "not yet" rather than
+/// something being wrong.
+///
+/// The wait is the expected answer for every push before the open, so it must
+/// not be logged as an error 40 times a second — but a genuine failure (no such
+/// method, malformed tx) has to surface, or the run silently pushes nothing.
+fn is_condition_not_met(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("condition not met") || e.contains("timestampmin") || e.contains("blocknumbermin")
 }
 
 // ─── Decode helpers (MintBay status) ─────────────────────────────────────────
@@ -140,18 +210,15 @@ fn u256_to_u8_sat(v: U256) -> u8 {
         .unwrap_or(u8::MAX)
 }
 
+/// Seconds of true time, corrected for this machine's clock error.
 fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    crate::timing::true_now_secs()
 }
 
+/// Milliseconds of true time. Every wait for a fire time goes through here, so
+/// correcting it here covers the whole raw path at once.
 fn now_unix_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    crate::timing::true_now_ms()
 }
 
 fn cancelled(cancel: &Option<Arc<AtomicBool>>) -> bool {
@@ -189,12 +256,8 @@ async fn sleep_until_unix(target: i64, cancel: &Option<Arc<AtomicBool>>) -> Resu
     }
 }
 
-/// Fine-grained wait for fire: target is unix **seconds**; spins last ~20ms.
-async fn sleep_until_fire(
-    target_unix: i64,
-    cancel: &Option<Arc<AtomicBool>>,
-) -> Result<(), String> {
-    let target_ms = target_unix.saturating_mul(1000);
+/// Fine-grained wait for fire: target is unix **milliseconds**; spins last ~5ms.
+async fn sleep_until_ms(target_ms: i64, cancel: &Option<Arc<AtomicBool>>) -> Result<(), String> {
     loop {
         if cancelled(cancel) {
             return Err("cancelled by user".into());
@@ -294,6 +357,9 @@ struct PreSigned {
     hash: B256,
     /// Needed to re-sign on L1 if fees rise between prep and fire.
     nonce: u64,
+    /// Set when the early push already got this transaction accepted, so the
+    /// blast reports it instead of sending the same bytes a second time.
+    early_hash: Option<B256>,
 }
 
 // ─── MintBay status ──────────────────────────────────────────────────────────
@@ -738,6 +804,7 @@ pub async fn run_raw_sniper(
                 raw,
                 hash,
                 nonce,
+                early_hash: None,
             })
         }));
     }
@@ -814,6 +881,28 @@ pub async fn run_raw_sniper(
     }
 
     // ── Clock fire ──
+    //
+    // With a push lead the wake-up moves earlier by the lead plus a margin for
+    // the fee refresh, so the loop below starts pushing on time with fees that
+    // are current rather than five seconds old.
+    let (push_lead_ms, push_interval_ms) = push_plan(config.push_lead_ms, config.push_interval_ms);
+    let wake_offset_ms = if push_lead_ms > 0 {
+        push_lead_ms + PUSH_FEE_MARGIN_MS
+    } else {
+        0
+    };
+    // Correct the clock before waiting on it, not after.
+    if let Some(at) = fire_at {
+        if at.saturating_mul(1_000).saturating_sub(now_unix_ms())
+            > crate::timing::CLOCK_SYNC_MIN_LEAD_MS
+        {
+            report(
+                &reporter,
+                MintEvent::message(crate::timing::sync_clock().await),
+            );
+        }
+    }
+
     if let Some(at) = fire_at {
         let now = now_unix();
         if now < at {
@@ -824,7 +913,10 @@ pub async fn run_raw_sniper(
                     format!("Armed — firing in {}s (clock {at})", at - now),
                 ),
             );
-            if let Err(e) = sleep_until_fire(at, &cancel).await {
+            let wake_ms = at
+                .saturating_mul(1000)
+                .saturating_sub(wake_offset_ms as i64);
+            if let Err(e) = sleep_until_ms(wake_ms, &cancel).await {
                 return fail_all(signers, e);
             }
         } else {
@@ -943,6 +1035,129 @@ pub async fn run_raw_sniper(
         );
     }
 
+    // ── Early push ──
+    //
+    // `at_time` is read off the local clock, and the chain opens on its own: a
+    // machine 800ms slow fires eight blocks late with nothing in the log to say
+    // so. For the last stretch we therefore stop trusting the clock and let the
+    // node answer instead.
+    //
+    // Every knock before the open carries `timestampMin`, which the node
+    // refuses outright — no gas, no nonce spent, and the same signed bytes go
+    // again next round. A knock is not a probe: it *is* that wallet's mint
+    // attempt, which is why every wallet knocks for itself rather than waiting
+    // on a scout. Waiting would cost them the answer's flight home plus their
+    // own flight out, where knocking costs one interval.
+    if push_lead_ms > 0 {
+        if let Some(at) = fire_at {
+            let open_ms = at.saturating_mul(1000);
+            let deadline_ms = open_ms + PUSH_TAIL_MS as i64;
+            let total = prepared.len();
+            report(
+                &reporter,
+                MintEvent::phase(
+                    "fire",
+                    format!(
+                        "EARLY PUSH T-{}ms · every {}ms · tail +{}ms · {} tx(s)",
+                        push_lead_ms, push_interval_ms, PUSH_TAIL_MS, total
+                    ),
+                ),
+            );
+            let started_ms = now_unix_ms();
+            let mut jobs = tokio::task::JoinSet::new();
+            for (idx, ps) in prepared.iter().enumerate() {
+                let rpc = rpc.clone();
+                let raw = ps.raw.clone();
+                let cancel = cancel.clone();
+                let offset = push_stagger_ms(idx, total, push_interval_ms);
+                jobs.spawn(async move {
+                    // Spread the wallets across the interval so the node answers
+                    // one or two at a time instead of queueing all of them.
+                    if offset > 0 {
+                        tokio::time::sleep(Duration::from_millis(offset)).await;
+                    }
+                    let mut knocks = 0u32;
+                    loop {
+                        if cancelled(&cancel) || now_unix_ms() >= deadline_ms {
+                            return (idx, None, None, knocks);
+                        }
+                        knocks += 1;
+                        match rpc
+                            .send_raw_transaction_conditional(&raw, at.max(0) as u64)
+                            .await
+                        {
+                            Ok(hash) => return (idx, Some(hash), None, knocks),
+                            Err(e) => {
+                                let msg = e.to_string();
+                                // "Not yet" is the expected answer and the whole
+                                // point; anything else means the mechanism is
+                                // not available and knocking cannot help.
+                                if !is_condition_not_met(&msg) {
+                                    return (idx, None, Some(msg), knocks);
+                                }
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(push_interval_ms)).await;
+                    }
+                });
+            }
+
+            let mut accepted = 0usize;
+            let mut knocks_total = 0u32;
+            let mut broken: Option<String> = None;
+            while let Some(joined) = jobs.join_next().await {
+                let Ok((idx, hash, err, knocks)) = joined else {
+                    continue;
+                };
+                knocks_total += knocks;
+                if let Some(hash) = hash {
+                    prepared[idx].early_hash = Some(hash);
+                    accepted += 1;
+                    report(
+                        &reporter,
+                        MintEvent::wallet(
+                            prepared[idx].address,
+                            Some(WalletStatus::Sent),
+                            Some(format!(
+                                "EARLY SEND OK {} (T{:+}ms, knock {})",
+                                shorten_hash(&hash),
+                                now_unix_ms() - open_ms,
+                                knocks
+                            )),
+                            Some(hash),
+                            None,
+                        ),
+                    );
+                } else if let Some(msg) = err {
+                    if broken.is_none() {
+                        broken = Some(msg);
+                    }
+                }
+            }
+            if cancelled(&cancel) {
+                return fail_all(signers, "cancelled by user");
+            }
+            if let Some(msg) = broken.filter(|_| accepted == 0) {
+                report(
+                    &reporter,
+                    MintEvent::message(format!(
+                        "early push unavailable ({msg}) — falling back to the T0 blast"
+                    )),
+                );
+            }
+            report(
+                &reporter,
+                MintEvent::message(format!(
+                    "early push: {}/{} accepted, {} knock(s) over {}ms",
+                    accepted,
+                    total,
+                    knocks_total,
+                    now_unix_ms() - started_ms
+                )),
+            );
+        }
+    }
+
     report(
         &reporter,
         MintEvent::phase(
@@ -971,8 +1186,13 @@ pub async fn run_raw_sniper(
             let addr = ps.address;
             let signed_hash = ps.hash;
 
-            // Send first — only then report Sent with real RPC hash.
-            let send_res = rpc.race_send(&ps.raw).await;
+            // Send first — only then report Sent with real RPC hash. A tx the
+            // early push already placed is not sent twice; re-sending the same
+            // bytes would only earn "already known" and muddy the report.
+            let send_res = match ps.early_hash {
+                Some(hash) => Ok(hash),
+                None => rpc.race_send(&ps.raw).await,
+            };
             // Release the send slot *before* polling for a receipt. Holding it
             // across `wait_for_receipt` (up to 90s) serialized the blast: with
             // more wallets than `concurrency`, wallet N+1 could not fire until
@@ -1232,6 +1452,65 @@ pub fn parse_sniper_at_time(raw: Option<&str>) -> Result<Option<i64>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_lead_of_zero_leaves_the_old_behaviour_alone() {
+        // Nothing to push means nothing to schedule, so the interval must not
+        // quietly turn the loop on.
+        assert_eq!(push_plan(0, 100), (0, 0));
+        assert_eq!(push_plan(0, 0), (0, 0));
+    }
+
+    #[test]
+    fn the_lead_cannot_outrun_the_pre_sign() {
+        // Pre-signing starts at T-5s; a lead past that would push bytes that do
+        // not exist yet, so it is capped rather than trusted.
+        let (lead, _) = push_plan(60_000, 100);
+        assert_eq!(lead, MAX_PUSH_LEAD_MS);
+        assert!(
+            (MAX_PUSH_LEAD_MS as i64) < PREP_LEAD_SECS * 1_000,
+            "the push window has to sit inside the pre-signed stretch"
+        );
+    }
+
+    #[test]
+    fn the_interval_stays_between_a_flood_and_a_block() {
+        assert_eq!(push_plan(1_000, 0).1, 5);
+        assert_eq!(push_plan(1_000, 9_999).1, 1_000);
+        assert_eq!(push_plan(1_000, 40).1, 40);
+    }
+
+    #[test]
+    fn wallets_are_spread_across_the_interval_not_stacked_on_one_tick() {
+        // Fifty wallets on the same tick is what put the node into a queue
+        // during measurement, so no two may share an offset when they fit.
+        let offsets: Vec<u64> = (0..5).map(|i| push_stagger_ms(i, 5, 15)).collect();
+        assert_eq!(offsets, vec![0, 3, 6, 9, 12]);
+        assert!(
+            offsets.iter().all(|o| *o < 15),
+            "an offset may not skip a whole interval"
+        );
+    }
+
+    #[test]
+    fn a_lone_wallet_does_not_wait_for_a_stagger_slot() {
+        assert_eq!(push_stagger_ms(0, 1, 15), 0);
+        assert_eq!(push_stagger_ms(0, 0, 15), 0);
+    }
+
+    #[test]
+    fn waiting_is_told_apart_from_breaking() {
+        // The refusal before the open is the expected answer and must not be
+        // read as the mechanism being unavailable.
+        assert!(is_condition_not_met("TimestampMin condition not met"));
+        assert!(is_condition_not_met("BlockNumberMin condition not met"));
+        assert!(!is_condition_not_met(
+            "the method eth_sendRawTransactionConditional does not exist/is not available"
+        ));
+        assert!(!is_condition_not_met(
+            "insufficient funds for gas * price + value"
+        ));
+    }
     use super::*;
 
     #[test]

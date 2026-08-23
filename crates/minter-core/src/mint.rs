@@ -79,8 +79,9 @@ fn maybe_beep(beep: bool, first_confirm: &AtomicBool) {
         .is_ok()
     {
         // CLI/terminal only. Desktop plays a real system chime in TauriMintReporter.
-        print!("\x07");
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+        // stderr, so the bell cannot land inside a JSON document on stdout.
+        eprint!("\x07");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
     }
 }
 
@@ -821,6 +822,30 @@ fn cancelled(cancel: &Option<Arc<AtomicBool>>) -> bool {
         .unwrap_or(false)
 }
 
+/// How long to sleep before re-reading the clock during the countdown.
+///
+/// `None` means do not sleep at all - yield and re-check immediately.
+///
+/// Every slice is clamped to the time actually left. A sleep scheduled past the
+/// fire is lateness that can never be recovered, and the ladder's steps are the
+/// only thing keeping that from happening: clamping states the rule directly,
+/// so a future change to the steps cannot quietly reintroduce an overshoot.
+fn countdown_sleep_ms(remaining_ms: i64) -> Option<u64> {
+    if remaining_ms <= 5 {
+        return None;
+    }
+    let slice: i64 = if remaining_ms > 10_000 {
+        200
+    } else if remaining_ms > 2_000 {
+        50
+    } else if remaining_ms > 50 {
+        5
+    } else {
+        1
+    };
+    Some(slice.min(remaining_ms).max(1) as u64)
+}
+
 /// Mint-action requests OpenSea allows before it starts refusing.
 ///
 /// Measured against the live endpoint: the fifth request reports
@@ -855,6 +880,33 @@ fn gql_stagger_step_ms(wallets_on_one_proxy: usize) -> u64 {
     GQL_STAGGER_STEP_MS.min(GQL_STAGGER_MAX_SPREAD_MS / gaps)
 }
 
+/// How long before T0 to open the connection the mint query will use.
+///
+/// The ceiling is the client's idle pool, which reqwest keeps for 90s — warm
+/// earlier than that and the connection is evicted before it is used, so the
+/// whole exercise is wasted. Below that ceiling, earlier is strictly better:
+/// the work is done while nothing else needs the machine.
+///
+/// 3s was enough for a handful of wallets and far too little for a real run.
+/// Opening a connection is a TLS handshake, which is CPU, and the VPS has two
+/// cores shared with Xvfb and the app. Measured against gql.opensea.io on that
+/// box: 6 wallets warm in ~0.5s, 20 in ~1.9s, 50 in ~10s, 100 in ~16s. At the
+/// old 3s lead with a 700ms deadline, a 50-wallet run left most wallets cold
+/// and each of them paid the handshake at T0 instead — about 250ms, in the one
+/// place where it cannot be afforded.
+const CONNECTION_WARM_LEAD_MS: i64 = 25_000;
+
+/// How long the countdown will wait for connections to open.
+///
+/// Scales with the number of wallets because the cost does. Bounded well short
+/// of the lead so warming always finishes before the pre-fetch at T0-5s and the
+/// nonce refresh at T0-2s: the countdown loop awaits this, and overrunning it
+/// would delay those instead.
+fn connection_warm_budget_ms(wallets: usize) -> u64 {
+    const CAP_MS: u64 = (CONNECTION_WARM_LEAD_MS as u64).saturating_sub(8_000);
+    (2_000 + 200 * wallets as u64).min(CAP_MS)
+}
+
 /// Total time one wallet may spend in waits OpenSea asked for.
 ///
 /// Bounded because the server decides the length: without a ceiling a wallet
@@ -867,9 +919,9 @@ const RATE_LIMIT_WAIT_BUDGET_MS: u64 = 12_000;
 /// A rate limit is not a failure — it is the server saying "come back in N".
 /// The old path ignored N, slept a flat 100 ms, and spent one of only three GQL
 /// attempts doing it, so a 2.5 s hold was exhausted in 300 ms and the wallet
-/// was reported failed while the mint was still open. These waits therefore
-/// draw on their own budget: a genuine error should still give up after three
-/// tries.
+/// was reported failed while the mint was still open. That is what cost three
+/// of five wallets on the last run. These waits therefore draw on their own
+/// budget: a genuine error should still give up after three tries.
 fn rate_limit_backoff(
     err: &str,
     addr: &Address,
@@ -1225,6 +1277,10 @@ pub async fn run_opensea_mint(
         .unwrap_or(default_auth_concurrency)
         .clamp(1, signers.len().max(1));
     let direct_auth_concurrency = auth_override.unwrap_or(2).clamp(1, 2);
+    // Held until the metrics collector exists, which is only once the workers
+    // start — the collector's t0 has to be the workers' t0 for every per-wallet
+    // offset to mean the same thing the log's `t+Nms` does.
+    let auth_started_at = std::time::Instant::now();
     report_phase(
         reporter.as_ref(),
         "auth",
@@ -1256,6 +1312,23 @@ pub async fn run_opensea_mint(
     }
 
     let mut auth_cache = auth_cache::AuthCache::load(vault_password);
+    // Cache state was previously invisible: a run could not tell a working
+    // cache from one that silently never persisted, so "Warm auth" had no
+    // observable effect to judge. A hit here is the difference between ~0 ms
+    // and a full SIWE round trip per wallet.
+    log_always(
+        reporter.as_ref(),
+        if vault_password.is_none() {
+            "Auth cache: DISABLED (no vault password) — every wallet will do a full SIWE"
+                .to_string()
+        } else {
+            format!(
+                "Auth cache: {} stored token(s) at {}",
+                auth_cache.len(),
+                auth_cache.path().display()
+            )
+        },
+    );
     let mut wallets: Vec<WalletAuth> = Vec::new();
     let mut auth_handles = Vec::new();
     let auth_sem = Arc::new(tokio::sync::Semaphore::new(auth_concurrency));
@@ -1478,11 +1551,25 @@ pub async fn run_opensea_mint(
     }
 
     // One disk encrypt (PBKDF2) for the whole auth batch — not per wallet.
-    if let Err(e) = auth_cache.flush() {
-        log_always(
+    // `Ok(false)` used to be silent, which hid the two cases that matter:
+    // nothing new to store, and "no password so the cache was skipped".
+    match auth_cache.flush() {
+        Ok(true) => log_always(
+            reporter.as_ref(),
+            format!(
+                "Auth cache: saved {} token(s) — the next run can skip SIWE",
+                auth_cache.len()
+            ),
+        ),
+        Ok(false) if vault_password.is_none() => log_always(
+            reporter.as_ref(),
+            "Auth cache: NOT saved (no vault password) — next run repeats every SIWE".to_string(),
+        ),
+        Ok(false) => {}
+        Err(e) => log_always(
             reporter.as_ref(),
             format!("WARN: auth cache flush failed: {e}"),
-        );
+        ),
     }
 
     // A SIWE request already in flight cannot be interrupted safely, but the
@@ -1497,6 +1584,7 @@ pub async fn run_opensea_mint(
     if auth_ok_count == 0 {
         bail!("All wallets failed authentication");
     }
+    let auth_ms = auth_started_at.elapsed().as_millis() as u64;
     log_always(
         reporter.as_ref(),
         format!("Auth: {}/{} wallets OK", auth_ok_count, wallets.len()),
@@ -1618,7 +1706,7 @@ pub async fn run_opensea_mint(
             let is_public = s.stage_type == "PUBLIC_SALE";
             // Started = start_time <= wall clock now (missing start_time counts as started).
             // Comparing against 0 marked every real (past) timestamp as "not started".
-            let now = chrono::Utc::now().timestamp();
+            let now = crate::timing::true_now_secs();
             let has_started = s.start_time.map(|t| t as i64 <= now).unwrap_or(true);
             (
                 is_public as usize,
@@ -1752,15 +1840,19 @@ pub async fn run_opensea_mint(
     );
     // Parallel OpenSea availability — bounded concurrency to limit 429s.
     {
+        // One OpenSea request per wallet, each over that wallet's own proxy —
+        // the same shape as auth, so it gets the same measured ceiling. It was
+        // capped at 4 regardless of pool size, which after raising auth made it
+        // the slowest phase of the whole run: ~17 s for 100 wallets against
+        // ~2 s for authentication.
         let avail_conc = env
             .get("AVAIL_CONCURRENCY")
             .and_then(|v| v.trim().parse().ok())
             .filter(|&n: &usize| n > 0)
             .unwrap_or_else(|| {
-                // Safer defaults: fewer parallel OS drop calls (less 429).
                 (if direct_route_count > 0 { 2 } else { 0 })
                     + if proxied_route_count > 0 {
-                        unique_proxy_count.clamp(2, 4)
+                        crate::safety_policy::default_auth_concurrency(unique_proxy_count)
                     } else {
                         0
                     }
@@ -1972,7 +2064,7 @@ pub async fn run_opensea_mint(
     if conditional_submit_enabled {
         let start = stage_start_ts
             .context("Conditional submit needs a phase start or explicit future At time")?;
-        if start.saturating_mul(1000) <= chrono::Utc::now().timestamp_millis() {
+        if start.saturating_mul(1000) <= crate::timing::true_now_ms() {
             bail!(
                 "Conditional submit needs a future fire time; set At time or select a future phase"
             );
@@ -2286,6 +2378,15 @@ pub async fn run_opensea_mint(
         let mut conditional_started = false;
         let mut last_printed = -1i64;
         let mut logged_chain_lag = false;
+        let mut connections_warmed = false;
+        // How early to prepare calldata.
+        //
+        // This window used to be scaled by wallet count so a big run could get
+        // every wallet armed over OpenSea before T0. That was built on a false
+        // premise: OpenSea issues no calldata at all until the stage opens, so
+        // the window could only ever spend request budget, never fill it. The
+        // only preparation left here is the local PUBLIC_SALE build, which is
+        // pure computation and needs no lead time worth scaling.
         let prefetch_lead_ms = if conditional_submit_enabled {
             5_000u64.max(conditional_lead_ms.saturating_add(3_000))
         } else {
@@ -2323,11 +2424,20 @@ pub async fn run_opensea_mint(
             Option<PrefetchedMintTx>,
         )> = tokio::task::JoinSet::new();
 
+        // Ask what the time really is before counting down to it. A machine
+        // whose clock is a second slow fires a second late, and its own log
+        // still shows a countdown that reached zero exactly on the mark.
+        if target_ms.saturating_sub(chrono::Utc::now().timestamp_millis())
+            > crate::timing::CLOCK_SYNC_MIN_LEAD_MS
+        {
+            log_always(reporter.as_ref(), crate::timing::sync_clock().await);
+        }
+
         loop {
             if cancelled(&cancel) {
                 bail!("Mint cancelled while waiting for phase open");
             }
-            let wall_ms = chrono::Utc::now().timestamp_millis();
+            let wall_ms = crate::timing::true_now_ms();
             let remaining_ms = target_ms.saturating_sub(wall_ms);
             if remaining_ms <= 0 {
                 break;
@@ -2380,7 +2490,10 @@ pub async fn run_opensea_mint(
             if !prefetched && should_prefetch && remaining_ms <= prefetch_lead_ms {
                 log_always(
                     reporter.as_ref(),
-                    format!("\n  Preparing calldata ({left}s before open)..."),
+                    format!(
+                        "\n  Preparing calldata for {} wallet(s), {left}s before open",
+                        wallets.iter().filter(|w| w.auth_ok).count()
+                    ),
                 );
                 prefetched = true;
                 if local_public_prefetch {
@@ -2446,6 +2559,67 @@ pub async fn run_opensea_mint(
                             "  {stage_type_owned}: calldata is issued only once the stage opens                              — keeping OpenSea's request budget for T0"
                         ),
                     );
+                }
+            }
+
+            // Open the connection to gql.opensea.io before it is needed. SIWE
+            // authenticates against opensea.io — a different host — so without
+            // this the first calldata request of the run pays DNS + TCP + TLS
+            // through the proxy at the exact moment the stage opens.
+            if !connections_warmed && remaining_ms <= CONNECTION_WARM_LEAD_MS {
+                connections_warmed = true;
+                let mut warm_handles = tokio::task::JoinSet::new();
+                for w in &wallets {
+                    if !w.auth_ok || w.session.is_none() {
+                        continue;
+                    }
+                    let session = w.session.clone().unwrap();
+                    warm_handles
+                        .spawn(async move { opensea::warm_gql_connection(&session).await.ok() });
+                }
+                let total = warm_handles.len();
+                let budget = connection_warm_budget_ms(total);
+                let warm_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(budget);
+                let mut warmed = 0usize;
+                let mut slowest_ms = 0u128;
+                while !warm_handles.is_empty() {
+                    let left = warm_deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    match tokio::time::timeout(left, warm_handles.join_next()).await {
+                        Ok(Some(Ok(Some(d)))) => {
+                            warmed += 1;
+                            slowest_ms = slowest_ms.max(d.as_millis());
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+                // Never let a slow proxy hold the countdown: an unwarmed wallet
+                // is merely as slow as it used to be.
+                warm_handles.abort_all();
+                if total > 0 {
+                    log_always(
+                        reporter.as_ref(),
+                        format!(
+                            "  Warmed gql.opensea.io on {warmed}/{total} wallet(s) \
+                             (slowest {slowest_ms}ms, budget {budget}ms)"
+                        ),
+                    );
+                    if warmed < total {
+                        // The ones that missed pay a TLS handshake at T0. Say so
+                        // rather than let the run look uniformly prepared.
+                        log_always(
+                            reporter.as_ref(),
+                            format!(
+                                "  WARNING: {} wallet(s) did not warm in time and will pay the \
+                                 handshake at T0 (~250ms each)",
+                                total - warmed
+                            ),
+                        );
+                    }
                 }
             }
 
@@ -2641,19 +2815,10 @@ pub async fn run_opensea_mint(
                 prep_frozen = true;
             }
 
-            let sleep_ms = if remaining_ms > 10_000 {
-                200
-            } else if remaining_ms > 2_000 {
-                50
-            } else if remaining_ms > 50 {
-                5
-            } else if remaining_ms > 5 {
-                1
-            } else {
-                tokio::task::yield_now().await;
-                continue;
-            };
-            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+            match countdown_sleep_ms(remaining_ms) {
+                Some(ms) => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
+                None => tokio::task::yield_now().await,
+            }
         }
 
         if !prep_frozen {
@@ -2690,6 +2855,29 @@ pub async fn run_opensea_mint(
 
     let rpc_clone = rpc.clone();
     let mint_started_at = std::time::Instant::now();
+    // The wall clock at the same instant. `Instant` cannot be formatted, and
+    // reading the clock again at export time is what made every results file
+    // claim the run started when it finished.
+    let mint_started_wall = chrono::Utc::now();
+    // Built here rather than from the finished results, so `t0UnixMs` is the
+    // instant the workers start and every per-wallet offset is measured from
+    // the same origin the log's `t+Nms` uses. Assembling it at the end made t0
+    // the moment of export — the run appeared to start when it finished.
+    //
+    // Recording happens next to the log lines that already report these
+    // numbers, always *after* the network call they measure, so nothing new
+    // runs before a broadcast. The lock is uncontended and never held across
+    // an await.
+    let metrics = Arc::new(crate::metrics::MetricsCollector::new(
+        "opensea",
+        info.slug.clone(),
+        info.chain.clone(),
+        dry_run,
+        Some(stage_type_owned.clone()),
+    ));
+    // Measured before t0 — negative on the same scale as the rest — so it is
+    // recorded as its own span rather than an offset.
+    metrics.mark_span("auth", auth_ms);
     let fb_pieces: Arc<std::sync::Mutex<Vec<BundleTx>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
 
@@ -2800,6 +2988,7 @@ pub async fn run_opensea_mint(
         let dry_run_w = dry_run;
         // Bound at auth time (signer index) — never re-derive from wallets order.
         let proxy_url_w = w.proxy_url.clone();
+        let metrics_w = metrics.clone();
 
         handles.spawn(async move {
             let mut attempt = 0u32;
@@ -3087,6 +3276,7 @@ pub async fn run_opensea_mint(
                             );
                         }
                         // UI surfaces re-auth on 401 via message (see mint_ops::reauth_required_message)
+                        let calldata_started = std::time::Instant::now();
                 match fetch_calldata_reauth(
                             reporter.as_ref(),
                             &mut session,
@@ -3106,6 +3296,15 @@ pub async fn run_opensea_mint(
                             quiet_w,
                         )
                         .await
+                        .inspect(|_| {
+                            // Only a successful fetch is timed: a failure's
+                            // duration is a rate-limit wait or a dead proxy,
+                            // which would make the median meaningless.
+                            let ms = calldata_started.elapsed().as_millis() as u64;
+                            metrics_w.update_wallet(&format!("{:?}", addr), |m| {
+                                m.calldata_ms = Some(ms);
+                            });
+                        })
                         {
                             Ok(result) => result,
                             Err(e) => {
@@ -3859,10 +4058,22 @@ pub async fn run_opensea_mint(
                     }
                 };
 
+                let send_ack_ms = mint_started_at.elapsed().as_millis() as u64;
                 log_always(reporter.as_ref(), format!("[{}] SENT t+{}ms tx={}",
                     sign::shorten_address(&addr),
-                    mint_started_at.elapsed().as_millis(),
+                    send_ack_ms,
                     sign::shorten_hash(&tx_hash)));
+                let addr_key = format!("{:?}", addr);
+                metrics_w.update_wallet(&addr_key, |m| {
+                    m.t_send_ack_ms = Some(send_ack_ms);
+                    // The route is bound at auth time; recording it here is what
+                    // makes a rate-limit post-mortem possible, since the budget
+                    // is per exit IP. Reporting it as null once sent the last
+                    // investigation looking for a proxy failure that never was.
+                    m.proxy = proxy_url_w.clone();
+                    m.send_attempts = attempt;
+                });
+                metrics_w.mark_first("first_send_ack", send_ack_ms);
 
                 // Track original + every RBF hash; receipt on any candidate is success.
                 // Seed with every hash this worker broadcast, not just the last
@@ -3949,16 +4160,21 @@ pub async fn run_opensea_mint(
                     Ok(receipt) => {
                         let info = rpc::parse_receipt(&receipt);
                         if info.success {
+                            let confirm_ms = mint_started_at.elapsed().as_millis() as u64;
                             mint_log(reporter.as_ref(), quiet_w,
                                 format!(
                                     "[{}] CONFIRMED t+{}ms gas={} block={} tx={}",
                                     sign::shorten_address(&addr),
-                                    mint_started_at.elapsed().as_millis(),
+                                    confirm_ms,
                                     info.gas_used,
                                     info.block_number,
                                     sign::shorten_hash(&mined_hash)
                                 ),
                             );
+                            metrics_w.update_wallet(&format!("{:?}", addr), |m| {
+                                m.t_confirm_ms = Some(confirm_ms);
+                            });
+                            metrics_w.mark_first("first_confirm", confirm_ms);
                             maybe_beep(beep_w, &first_confirm_w);
                             report_wallet(reporter.as_ref(),
                                 &addr,
@@ -4043,6 +4259,14 @@ pub async fn run_opensea_mint(
             format!(
                 "Scheduled fire lag={fire_lag_ms}ms pre_signed={scheduled_pre_signed}/{n_workers} | A/B direct={scheduled_direct_pre_signed}/{scheduled_direct_ready} proxy={scheduled_proxy_pre_signed}/{scheduled_proxy_ready}"
             ),
+        );
+        // How late the fire actually was. Every per-wallet offset is measured
+        // from the workers starting, so without this the lag before them is
+        // invisible in the metrics — and it is paid by every wallet equally.
+        metrics.set_open_signal(
+            stage_type_owned.clone(),
+            stage_start_ts.map(|ts| ts.saturating_mul(1000)),
+            fire_lag_ms as i64,
         );
     }
     log_always(
@@ -4351,7 +4575,7 @@ pub async fn run_opensea_mint(
             slug: info.slug.clone(),
             chain: info.chain.clone(),
             phase: stage_type_owned.clone(),
-            started_at: chrono::Utc::now().to_rfc3339(),
+            started_at: mint_started_wall.to_rfc3339(),
             elapsed_ms: elapsed,
             quiet,
             skip_preflight,
@@ -4390,32 +4614,33 @@ pub async fn run_opensea_mint(
             Err(e) => log_always(reporter.as_ref(), format!("Export failed: {}", e)),
         }
 
-        // Structured run metrics (plan #9): wallet outcomes + failure histogram
-        // + total elapsed, assembled from the finished run. Per-phase spans and
-        // precise t0 are a follow-up (they require threading the collector
-        // through the mint loop); this keeps the hot path untouched.
-        let collector = crate::metrics::MetricsCollector::new(
-            "opensea",
-            info.slug.clone(),
-            info.chain.clone(),
-            dry_run,
-            Some(stage_type_owned.clone()),
-        );
+        // Structured run metrics: the collector has been live since the workers
+        // started, so it already holds each wallet's send/confirm offsets, its
+        // route, and the fire lag. Only the final outcome is folded in here —
+        // amended onto the existing rows rather than replacing them, which is
+        // what used to discard everything the run had recorded.
         for w in &results {
-            let mut wm = crate::metrics::WalletMetrics::new(format!("{:?}", w.address));
-            wm.status = w.status.to_string();
-            wm.tx_hash = w
+            let addr = format!("{:?}", w.address);
+            let status = w.status.to_string();
+            let tx_hash = w
                 .tx_hash
                 .map(|h| format!("0x{}", hex::encode(h.as_slice())));
-            wm.gas_used = w.gas_used;
-            if let Some(err) = w.error.clone() {
-                wm = wm.with_error(err);
-            }
-            collector.upsert_wallet(wm);
+            let gas_used = w.gas_used;
+            let error = w.error.clone();
+            metrics.update_wallet(&addr, |m| {
+                m.status = status;
+                m.tx_hash = tx_hash;
+                m.gas_used = gas_used;
+                if let Some(err) = error {
+                    m.error_class = Some(crate::metrics::error_class(&err).to_string());
+                    m.error = Some(err);
+                }
+            });
         }
-        let mut metrics = collector.finish();
-        metrics.summary.elapsed_ms = elapsed; // authoritative run duration
-        metrics.spans.done_ms = Some(elapsed);
+        let mut run_metrics = metrics.finish();
+        run_metrics.summary.elapsed_ms = elapsed; // authoritative run duration
+        run_metrics.spans.done_ms = Some(elapsed);
+        let metrics = run_metrics;
         match export::write_run_metrics(&metrics) {
             Ok(p) => log_always(
                 reporter.as_ref(),
@@ -4461,10 +4686,11 @@ pub async fn run_opensea_mint(
 #[cfg(test)]
 mod tests {
     use super::{
-        GQL_STAGGER_MAX_SPREAD_MS, NOT_ACTIVE_CHAIN_WAIT_MAX_SECS, NotActiveInfo,
-        OPENSEA_MINT_ACTION_BUDGET, OPENSEA_MINT_ACTION_REFILL_MS, PHASE_OPEN_LAG_WINDOW_SECS,
-        RATE_LIMIT_WAIT_BUDGET_MS, WalletAuth, assigned_proxy_routes, build_local_public_mint,
-        classify_mint_error, enrich_mint_rpc_error, estimate_fail_policy, fire_lag_ms_from_clock,
+        CONNECTION_WARM_LEAD_MS, GQL_STAGGER_MAX_SPREAD_MS, NOT_ACTIVE_CHAIN_WAIT_MAX_SECS,
+        NotActiveInfo, OPENSEA_MINT_ACTION_BUDGET, OPENSEA_MINT_ACTION_REFILL_MS,
+        PHASE_OPEN_LAG_WINDOW_SECS, RATE_LIMIT_WAIT_BUDGET_MS, WalletAuth, assigned_proxy_routes,
+        build_local_public_mint, classify_mint_error, connection_warm_budget_ms,
+        countdown_sleep_ms, enrich_mint_rpc_error, estimate_fail_policy, fire_lag_ms_from_clock,
         format_not_active, format_rpc_plan, gql_stagger_step_ms, in_phase_open_lag_window,
         parse_not_active, parse_tx_calldata_hex, pre_sign_ready_wallets, rate_limit_backoff,
         resolve_mint_gas_limit,
@@ -4865,6 +5091,71 @@ mod tests {
         let mut b = [0u8; 20];
         b[19] = last_byte;
         Address::from(b)
+    }
+
+    #[test]
+    fn the_countdown_never_sleeps_past_the_fire() {
+        // The old ladder slept a flat 5ms whenever more than 50ms remained, so
+        // at T-52ms it could wake at T-47ms — but at T-21ms it slept 5ms and
+        // landed at T-16ms, and the last stretch was a 1ms drumbeat whose
+        // rounding is the whole error budget. Nothing may overshoot now.
+        for remaining in [
+            1i64, 5, 6, 19, 21, 51, 60, 100, 1_999, 2_001, 9_999, 10_001, 60_000,
+        ] {
+            if let Some(ms) = countdown_sleep_ms(remaining) {
+                assert!(
+                    (ms as i64) <= remaining,
+                    "with {remaining}ms left it sleeps {ms}ms, reaching past the fire"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_countdown_looks_more_often_as_the_fire_approaches() {
+        // Far out it must not wake pointlessly often; close in it must not be
+        // asleep when the moment arrives.
+        assert_eq!(countdown_sleep_ms(60_000), Some(200));
+        assert_eq!(countdown_sleep_ms(5_000), Some(50));
+        assert_eq!(countdown_sleep_ms(500), Some(5));
+        assert_eq!(countdown_sleep_ms(20), Some(1));
+        // The last few milliseconds are not worth a timer at all.
+        assert_eq!(countdown_sleep_ms(5), None);
+        assert_eq!(countdown_sleep_ms(0), None);
+    }
+
+    #[test]
+    fn the_warm_budget_grows_with_the_run_and_still_clears_the_countdown() {
+        // Measured on the VPS: 6 wallets warm in ~0.5s, 20 in ~1.9s, 50 in ~10s.
+        // The budget has to cover that, or the wallets that miss it pay a TLS
+        // handshake at T0 — which is the one moment it cannot be afforded.
+        assert!(connection_warm_budget_ms(6) >= 2_000);
+        assert!(
+            connection_warm_budget_ms(50) >= 10_000,
+            "50 wallets measured ~10s to warm; a smaller budget leaves most of them cold"
+        );
+        // And it must always finish before the pre-fetch at T0-5s and the nonce
+        // refresh at T0-2s, both of which the countdown runs after this.
+        for n in [1usize, 6, 50, 100, 500, 5_000] {
+            let budget = connection_warm_budget_ms(n) as i64;
+            assert!(
+                budget <= CONNECTION_WARM_LEAD_MS - 8_000,
+                "{n} wallets: warming could still be running at T0-{}ms",
+                CONNECTION_WARM_LEAD_MS - budget
+            );
+        }
+    }
+
+    #[test]
+    fn warming_happens_inside_the_connection_pool_lifetime() {
+        // Warming earlier than the client's idle pool keeps a connection is
+        // worse than not warming at all: the entry is evicted before T0 and the
+        // handshake is paid twice.
+        const REQWEST_POOL_IDLE_MS: i64 = 90_000;
+        assert!(
+            CONNECTION_WARM_LEAD_MS < REQWEST_POOL_IDLE_MS,
+            "connections warmed this early are reaped before the fire"
+        );
     }
 
     #[test]

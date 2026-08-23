@@ -286,6 +286,37 @@ fn set_connected_account_cookie(session: &AuthSession, address: &Address) -> Res
     Ok(())
 }
 
+/// Open the TLS connection the mint query will use, before it is needed.
+///
+/// Authentication talks to `opensea.io`; the calldata query talks to
+/// `gql.opensea.io`. Different hosts, so a freshly authenticated session has no
+/// connection to the host that actually matters, and the first mint query pays
+/// DNS + TCP + TLS + HTTP/2 setup — through a proxy a few hundred ms, spent at
+/// the one instant that decides whether the mint lands.
+///
+/// Sends the CORS preflight a browser sends before the very same POST: it opens
+/// the connection without spending a GraphQL operation against the rate limit.
+/// Returns how long the warm took, for the operator log.
+pub async fn warm_gql_connection(session: &AuthSession) -> Result<std::time::Duration> {
+    let started = std::time::Instant::now();
+    session
+        .client
+        .request(reqwest::Method::OPTIONS, GQL_URL)
+        .header("origin", OPENSEA_ORIGIN)
+        .header("access-control-request-method", "POST")
+        .header(
+            "access-control-request-headers",
+            "content-type,authorization",
+        )
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .context("warm gql connection")?;
+    // Any answer means the connection is open, which is the whole point; the
+    // status is irrelevant.
+    Ok(started.elapsed())
+}
+
 fn gql_request(client: &reqwest::Client) -> reqwest::RequestBuilder {
     client
         .post(GQL_URL)
@@ -597,13 +628,45 @@ async fn siwe_auth_once(
     let auth_data: serde_json::Value = verify_resp.json().await?;
     // Two success shapes (bearer token vs cookie-only session) — see
     // [`extract_verify_token`].
-    let access_token = extract_verify_token(&auth_data)?;
+    let mut access_token = extract_verify_token(&auth_data)?;
+
+    // OpenSea now returns the credential as a `Set-Cookie: access_token=…`
+    // rather than in the JSON body, so the body-only extraction above yields an
+    // empty string on every successful login. That is not just cosmetic: the
+    // auth cache refuses to store an empty bearer, so nothing was ever cached,
+    // `auth_cache.bin` was never written, and "Warm auth" bought exactly
+    // nothing — every run re-did a full SIWE for every wallet.
+    //
+    // The cookie is a JWT valid for ~84 hours, so recovering it here turns
+    // authentication into a once-every-few-days cost instead of a per-run one.
+    if access_token.is_empty() {
+        access_token = cookie_access_token(&cookie_jar).unwrap_or_default();
+    }
 
     Ok(AuthSession {
         access_token,
         address: addr_str,
         client,
         cookie_jar,
+    })
+}
+
+/// Read the `access_token` cookie the OpenSea login sets, if present.
+///
+/// Returned verbatim so it can be re-injected by
+/// [`set_connected_account_cookie`] on a later run.
+fn cookie_access_token(jar: &Arc<reqwest::cookie::Jar>) -> Option<String> {
+    use reqwest::cookie::CookieStore;
+    let url: reqwest::Url = OPENSEA_ORIGIN.parse().ok()?;
+    let header = jar.cookies(&url)?;
+    let raw = header.to_str().ok()?;
+    raw.split(';').find_map(|kv| {
+        let (name, value) = kv.split_once('=')?;
+        if name.trim() != "access_token" {
+            return None;
+        }
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_string())
     })
 }
 
@@ -1564,5 +1627,51 @@ mod verify_token_tests {
             "user": { "address": "0xabc" }
         });
         assert_eq!(extract_verify_token(&v).unwrap(), "");
+    }
+}
+
+#[cfg(test)]
+mod cookie_token_tests {
+    use super::cookie_access_token;
+    use std::sync::Arc;
+
+    fn jar_with(cookie: &str) -> Arc<reqwest::cookie::Jar> {
+        let jar = Arc::new(reqwest::cookie::Jar::default());
+        let url: reqwest::Url = "https://opensea.io/".parse().unwrap();
+        jar.add_cookie_str(cookie, &url);
+        jar
+    }
+
+    #[test]
+    fn reads_the_access_token_cookie() {
+        let jar = jar_with("access_token=abc.def.ghi; Path=/; Domain=.opensea.io");
+        assert_eq!(cookie_access_token(&jar).as_deref(), Some("abc.def.ghi"));
+    }
+
+    #[test]
+    fn picks_the_right_cookie_out_of_several() {
+        // The login also sets __cf_bm / auth_hint / os_privacy; a naive
+        // "first cookie" read would grab one of those instead.
+        let jar = Arc::new(reqwest::cookie::Jar::default());
+        let url: reqwest::Url = "https://opensea.io/".parse().unwrap();
+        for c in [
+            "__cf_bm=cloudflare; Path=/; Domain=.opensea.io",
+            "auth_hint=1; Path=/; Domain=.opensea.io",
+            "access_token=the.real.one; Path=/; Domain=.opensea.io",
+            "os_privacy=x; Path=/; Domain=.opensea.io",
+        ] {
+            jar.add_cookie_str(c, &url);
+        }
+        assert_eq!(cookie_access_token(&jar).as_deref(), Some("the.real.one"));
+    }
+
+    #[test]
+    fn absent_or_empty_yields_none() {
+        let empty = Arc::new(reqwest::cookie::Jar::default());
+        assert_eq!(cookie_access_token(&empty), None);
+        // An empty value must not be cached: it would look like a valid hit and
+        // silently downgrade every request to anonymous.
+        let blank = jar_with("access_token=; Path=/; Domain=.opensea.io");
+        assert_eq!(cookie_access_token(&blank), None);
     }
 }

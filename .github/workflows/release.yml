@@ -182,6 +182,15 @@ jobs:
 
             No server needed. Your machine has to be awake at mint time.
 
+            ### Updating from an earlier version
+            Unzip **over your existing folder**, replacing `minter-desktop.exe`.
+
+            Your wallets and settings live in that folder — `keys.vault`,
+            `config.json`, `auth_cache.bin`, results and logs. The archive holds
+            only the program and its documentation, so nothing of yours is
+            touched. Unzipping somewhere new gives you a second, empty install
+            while everything stays behind in the old folder.
+
             ### Linux VPS — run it 24/7 near the chain
             On a fresh Linux server — Ubuntu, Debian, Fedora, RHEL or Arch, no desktop required:
 

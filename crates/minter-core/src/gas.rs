@@ -74,6 +74,7 @@ pub fn chain_needs_elevated_gas(chain_id: u64) -> bool {
         7777777 | // Zora
         33139 | // ApeChain
         360 | // Shape
+        57073 | // Ink
         4326 | // MegaETH
         4663 | // Robinhood Chain
         143 // Monad
@@ -154,7 +155,8 @@ pub fn chain_has_l1_data_fee(chain_id: u64) -> bool {
         8453 |    // Base
         81457 |   // Blast
         7777777 | // Zora
-        360 // Shape
+        360 | // Shape
+        57073 // Ink
     )
 }
 
@@ -486,7 +488,7 @@ mod auto_priority_cap_tests {
 
     #[test]
     fn l1_data_fee_chains() {
-        for id in [10u64, 8453, 81457, 7777777, 360] {
+        for id in [10u64, 8453, 81457, 7777777, 360, 57073] {
             assert!(chain_has_l1_data_fee(id), "chain {id} is OP-stack");
         }
         for id in [1u64, 137, 42161, 56] {

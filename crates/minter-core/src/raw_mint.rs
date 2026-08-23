@@ -125,6 +125,7 @@ fn explorer_api_for_chain(chain: Option<&str>) -> Option<&'static str> {
         Some("zora") => Some("https://explorer.zora.energy"),
         Some("blast") => Some("https://blast.blockscout.com"),
         Some("shape") => Some("https://shapescan.xyz"),
+        Some("ink") => Some("https://explorer.inkonchain.com"),
         _ => None,
     }
 }

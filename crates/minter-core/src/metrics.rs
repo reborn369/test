@@ -87,6 +87,11 @@ pub struct WalletMetrics {
     pub proxy: Option<String>,
     pub status: String,
     pub send_attempts: u32,
+    /// Time to obtain mint calldata, including any re-auth retry. For a
+    /// whitelist stage this is a live round trip to OpenSea at T0 and usually
+    /// the largest controllable cost in the run; a locally built `PUBLIC_SALE`
+    /// spends nothing here and leaves it `None`.
+    pub calldata_ms: Option<u64>,
     pub t_send_ack_ms: Option<u64>,
     pub t_confirm_ms: Option<u64>,
     pub tx_hash: Option<String>,
@@ -103,6 +108,7 @@ impl WalletMetrics {
             proxy: None,
             status: String::new(),
             send_attempts: 0,
+            calldata_ms: None,
             t_send_ack_ms: None,
             t_confirm_ms: None,
             tx_hash: None,
@@ -230,6 +236,40 @@ impl MetricsCollector {
         });
     }
 
+    /// Amend one wallet's metrics in place, creating the row if this is the
+    /// first thing recorded for that address.
+    ///
+    /// A run reports a wallet more than once — the broadcast is acknowledged
+    /// long before the receipt arrives — and [`Self::upsert_wallet`] replaces
+    /// the whole row, so using it for the second report silently drops what the
+    /// first one recorded. Callers that fill in one field at a time want this.
+    pub fn update_wallet(&self, address: &str, f: impl FnOnce(&mut WalletMetrics)) {
+        let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match m.wallets.iter_mut().find(|x| x.address == address) {
+            Some(existing) => f(existing),
+            None => {
+                let mut fresh = WalletMetrics::new(address);
+                f(&mut fresh);
+                m.wallets.push(fresh);
+            }
+        }
+    }
+
+    /// Offset from t0 to the first wallet to reach a milestone. Later calls are
+    /// ignored, so the caller can report every wallet and still record the
+    /// first — which is what `firstSendAckMs` / `firstConfirmMs` mean.
+    pub fn mark_first(&self, name: &str, ms: u64) {
+        let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = match name {
+            "first_send_ack" => &mut m.spans.first_send_ack_ms,
+            "first_confirm" => &mut m.spans.first_confirm_ms,
+            _ => return,
+        };
+        if slot.is_none() {
+            *slot = Some(ms);
+        }
+    }
+
     /// Insert or replace the metrics for a wallet (matched by address).
     pub fn upsert_wallet(&self, w: WalletMetrics) {
         let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -341,6 +381,50 @@ mod tests {
         let sig = m.open_signal.unwrap();
         assert_eq!(sig.kind, "mintbay_view");
         assert_eq!(sig.fire_lag_ms, -8);
+    }
+
+    #[test]
+    fn update_wallet_amends_instead_of_clobbering() {
+        let c = MetricsCollector::new("opensea", "d", "ethereum", false, None);
+        // What a run actually does: the route and the broadcast offset are known
+        // at send time, the receipt only much later, and the final status later
+        // still. Each must survive the next.
+        c.update_wallet("0xA", |m| {
+            m.proxy = Some("1.2.3.4:9000".into());
+            m.t_send_ack_ms = Some(750);
+            m.calldata_ms = Some(499);
+        });
+        c.update_wallet("0xA", |m| m.t_confirm_ms = Some(13318));
+        c.update_wallet("0xA", |m| {
+            m.status = "CONFIRMED".into();
+            m.tx_hash = Some("0xdead".into());
+        });
+
+        let m = c.finish();
+        assert_eq!(m.wallets.len(), 1, "same address must not duplicate");
+        let w = &m.wallets[0];
+        assert_eq!(w.proxy.as_deref(), Some("1.2.3.4:9000"));
+        assert_eq!(w.calldata_ms, Some(499));
+        assert_eq!(w.t_send_ack_ms, Some(750));
+        assert_eq!(w.t_confirm_ms, Some(13318));
+        assert_eq!(m.summary.confirmed, 1);
+    }
+
+    #[test]
+    fn mark_first_keeps_the_earliest_wallet() {
+        let c = MetricsCollector::new("opensea", "d", "ethereum", false, None);
+        // Wallets report in completion order, not in time order.
+        c.mark_first("first_send_ack", 754);
+        c.mark_first("first_send_ack", 750);
+        c.mark_first("first_confirm", 13318);
+        c.mark_first("unknown_ignored", 1);
+        let m = c.finish();
+        assert_eq!(
+            m.spans.first_send_ack_ms,
+            Some(754),
+            "the first report wins, later ones are not overwritten"
+        );
+        assert_eq!(m.spans.first_confirm_ms, Some(13318));
     }
 
     #[test]

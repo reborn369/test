@@ -287,6 +287,8 @@ function explorerTxUrlLocal(chain, txHash) {
     "33139": "https://apescan.io/tx/",
     shape: "https://shapescan.xyz/tx/",
     "360": "https://shapescan.xyz/tx/",
+    ink: "https://explorer.inkonchain.com/tx/",
+    "57073": "https://explorer.inkonchain.com/tx/",
   };
   return (map[c] || "https://etherscan.io/tx/") + h;
 }
@@ -1716,7 +1718,7 @@ $("btn-remove-wallet").addEventListener("click", async () => {
 const RPC_CHAIN_COLORS = {
   ethereum: "#627eea", base: "#0052ff", polygon: "#8247e5", arbitrum: "#28a0f0",
   optimism: "#ff0420", robinhood: "#00c805", blast: "#f5c84c", zora: "#9aa3b5",
-  apechain: "#0054fa", shape: "#2ee6c7", monad: "#8b7bff", megaeth: "#5b8def",
+  apechain: "#0054fa", shape: "#2ee6c7", ink: "#7132f5", monad: "#8b7bff", megaeth: "#5b8def",
   bsc: "#f0b90b", avalanche: "#e84142",
 };
 function rpcChainColor(name) {
@@ -3826,9 +3828,17 @@ async function runRawSniperOnce() {
         gasMult: $("raw-gas-mult")?.value || "",
         gasLimit: $("raw-gas-limit")?.value || "",
         feeRefreshL2: !!$("raw-fee-refresh-l2")?.checked,
+        pushLeadMs: $("raw-push-lead")?.value || "",
       })
     );
   } catch (_) {}
+
+  // How early to start pushing. Only meaningful with a scheduled fire: without
+  // an at_time there is no open to run up to.
+  const pushLeadMs = Math.max(
+    0,
+    Math.min(3000, parseInt($("raw-push-lead")?.value || "0", 10) || 0)
+  );
 
   // Fee refresh: checkbox forces Always (L2+L1); else settings / mainnetOnly default.
   let feeRefreshAtFire = null;
@@ -3858,6 +3868,7 @@ async function runRawSniperOnce() {
         maxFeeGwei: gas.maxFeeGwei,
         gasMultiplier: null,
         gasLimit,
+        pushLeadMs,
         feeRefreshAtFire,
       },
     });
@@ -3890,6 +3901,9 @@ try {
     if (saved.preset) setRawPreset(saved.preset);
     else setRawPreset("simpleMintUint");
     if (saved.qty != null && $("raw-qty")) $("raw-qty").value = saved.qty;
+    if (saved.pushLeadMs != null && $("raw-push-lead")) {
+      $("raw-push-lead").value = saved.pushLeadMs;
+    }
     if (saved.atTime) {
       const ts = isoToUnixTs(saved.atTime);
       if ($("raw-at")) $("raw-at").value = ts || saved.atTime;
@@ -3952,6 +3966,42 @@ $("raw-chain")?.addEventListener("change", () => {
   scheduleRawProbe();
 });
 $("raw-qty")?.addEventListener("change", scheduleRawProbe);
+// Fills the "push early" box from a real measurement rather than a guess: the
+// engine aims with this machine's clock, and how far that clock is off decides
+// whether a scheduled run is early or late far more than the network does.
+$("btn-raw-lag")?.addEventListener("click", async () => {
+  const btn = $("btn-raw-lag");
+  const out = $("raw-lag-out");
+  const chain = $("raw-chain")?.value || "";
+  if (!chain) {
+    if (out) out.textContent = t("raw.lagNoChain") || "pick a network first";
+    return;
+  }
+  btn.disabled = true;
+  if (out) out.textContent = "…";
+  try {
+    const r = await invoke("measure_fire_lag", { input: { chain } });
+    if ($("raw-push-lead")) $("raw-push-lead").value = String(r.suggestedLeadMs);
+    const clock =
+      r.clockOffsetMs == null
+        ? t("raw.lagClockUnknown") || "clock unknown"
+        : `${t("raw.lagClock") || "clock"} ${r.clockOffsetMs > 0 ? "+" : ""}${r.clockOffsetMs}`;
+    // The round trip is shown next to its minimum because the gap between them
+    // is queueing, and queueing is what a single well-timed packet will dodge.
+    if (out) {
+      out.textContent =
+        `${t("raw.lagFlight") || "flight"} ${r.oneWayMs} мс · ${clock} мс · ` +
+        `RTT ${r.rttMinMs}/${r.rttMedianMs} → ${r.suggestedLeadMs} мс`;
+      out.title = `${r.summary}
+${r.clockSource}`;
+    }
+  } catch (e) {
+    if (out) out.textContent = String(e);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 $("btn-raw-balances")?.addEventListener("click", async () => {
   const w = selectedRawWallets();
   const all = w.length

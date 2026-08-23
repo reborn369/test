@@ -49,6 +49,7 @@ pub mod safety_policy;
 pub mod settings;
 pub mod sign;
 pub mod sweep;
+pub mod timing;
 pub mod types;
 pub mod update;
 pub mod vault;
@@ -72,10 +73,11 @@ pub fn quiet_mode() -> bool {
     }
 }
 
+/// Function form of [`rlog!`], on the same stream and under the same quiet gate.
 #[inline]
 pub fn core_print(msg: impl AsRef<str>) {
     if !quiet_mode() {
-        println!("{}", msg.as_ref());
+        eprintln!("{}", msg.as_ref());
     }
 }
 
@@ -102,26 +104,34 @@ pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
     safe_truncate(s, max_bytes)
 }
 
-/// `println!` that respects `QUIET=1` (desktop default).
+/// Operator log line that respects `QUIET=1` (desktop default).
+///
+/// Goes to **stderr**, not stdout. These are progress notes for a human, and a
+/// caller that wants machine-readable output needs stdout left alone: the
+/// headless CLI prints a JSON document there, and a single stray log line —
+/// `WL export → …` was the one that surfaced this — makes the whole document
+/// unparseable at its first byte. The desktop is unaffected either way, since
+/// it runs with `QUIET=1` and reads progress through `MintReporter`.
 #[macro_export]
 macro_rules! rlog {
     ($($arg:tt)*) => {{
         if !$crate::quiet_mode() {
-            println!($($arg)*);
+            eprintln!($($arg)*);
         }
     }};
 }
 
-/// `print!` (no newline, flushed) that respects `QUIET=1` (desktop default).
+/// Partial log line, no newline, flushed. Same stream and quiet rules as
+/// [`rlog!`].
 ///
 /// Raw `print!` bypassed the quiet gate, so partial "Simulating…"/"Sending…"
-/// lines leaked to stdout even in the desktop's default `QUIET=1` mode.
+/// lines leaked out even in the desktop's default `QUIET=1` mode.
 #[macro_export]
 macro_rules! rprint {
     ($($arg:tt)*) => {{
         if !$crate::quiet_mode() {
-            print!($($arg)*);
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+            eprint!($($arg)*);
+            let _ = std::io::Write::flush(&mut std::io::stderr());
         }
     }};
 }
@@ -145,6 +155,7 @@ pub use safety_policy::{
     should_warn_no_proxy,
 };
 pub use settings::Settings;
+pub use timing::{FireLagReport, measure_fire_lag, suggest_lead_ms};
 pub use types::*;
 pub use vault::Vault;
 
@@ -189,5 +200,32 @@ mod safe_truncate_tests {
         let e = "err 🔥🔥";
         assert_eq!(truncate_str(e, 5), "err ");
         assert_eq!(truncate_str(e, 8), "err 🔥");
+    }
+
+    /// stdout belongs to whatever the caller is emitting there — the headless
+    /// CLI puts a JSON document on it. Operator logs must not join it.
+    ///
+    /// Checked against the source rather than by capturing output, because
+    /// `println!` writes to the process stdout that the test harness itself
+    /// owns; a source check also catches a new call site that no test exercises.
+    #[test]
+    fn operator_logging_never_writes_to_stdout() {
+        let src = include_str!("lib.rs");
+        let macro_body: String = src
+            .lines()
+            .skip_while(|l| !l.contains("macro_rules! rlog"))
+            .take_while(|l| !l.contains("macro_rules! rprint"))
+            .collect();
+        assert!(
+            macro_body.contains("eprintln!"),
+            "rlog! should still log somewhere"
+        );
+        // `eprintln!` contains `println!` as a substring, so the stdout check
+        // has to run on the text with the stderr calls removed first.
+        let without_stderr = macro_body.replace("eprintln!", "");
+        assert!(
+            !without_stderr.contains("println!"),
+            "rlog! must log to stderr: a stray line on stdout corrupts the CLI's JSON"
+        );
     }
 }

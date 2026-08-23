@@ -1946,13 +1946,7 @@ impl Session {
         }
         let now = chrono::Utc::now().timestamp();
         let recommended = recommended_phase_index(&info);
-        let stage_rows = stage_rows_from_at(&info.stages, Some(recommended), now);
-        if stage_rows.is_empty() {
-            bail!(
-                "No open or upcoming eligible drop stages found for '{}'",
-                slug
-            );
-        }
+        let stage_rows = stage_rows_from_at(&info.stages, recommended, now);
         Ok(DropPhasesResult {
             slug: info.slug,
             name: info.name,
@@ -2823,11 +2817,17 @@ pub struct StageRow {
     pub stage_type: String,
     pub eligible: String,
     pub price_eth: Option<String>,
+    /// Exact native-token unit price used for durable task snapshots.
+    pub price_wei: Option<String>,
     pub max_mintable: Option<i64>,
     pub stage_index: Option<i64>,
     pub recommended: bool,
     /// Unix seconds when phase opens. None / 0 = already open or unknown.
     pub start_time: Option<i64>,
+    /// Unix seconds when phase ends. None / 0 = unknown/no fixed end.
+    pub end_time: Option<i64>,
+    /// Ended stages remain visible for history but cannot be selected.
+    pub expired: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -3081,7 +3081,7 @@ mod recommended_phase_tests {
             stage("SIGNED_PRESALE", 0, Some(now + 3600.0)),
             stage("SIGNED_PRESALE", 1, Some(now - 3600.0)),
         ]);
-        assert_eq!(recommended_phase_index(&i), 1);
+        assert_eq!(recommended_phase_index(&i), Some(1));
     }
 
     #[test]
@@ -3091,7 +3091,7 @@ mod recommended_phase_tests {
             stage("PUBLIC_SALE", 0, Some(now - 3600.0)),
             stage("ALLOW_LIST", 1, Some(now - 3600.0)),
         ]);
-        assert_eq!(recommended_phase_index(&i), 1);
+        assert_eq!(recommended_phase_index(&i), Some(1));
     }
 
     #[test]
@@ -3101,20 +3101,23 @@ mod recommended_phase_tests {
             stage("SIGNED_PRESALE", 0, Some(now + 3600.0)),
             stage("SIGNED_PRESALE", 1, None),
         ]);
-        assert_eq!(recommended_phase_index(&i), 1);
+        assert_eq!(recommended_phase_index(&i), Some(1));
     }
 
     #[test]
-    fn expired_stage_is_neither_recommended_nor_returned_to_picker() {
+    fn expired_stage_is_visible_but_disabled_and_never_recommended() {
         let now = 2_000i64;
         let mut closed = stage("SIGNED_PRESALE", 0, Some(1_000.0));
         closed.end_time = Some(1_500.0);
         let open = stage("PUBLIC_SALE", 1, Some(1_900.0));
         let i = info(vec![closed, open]);
-        assert_eq!(recommended_phase_index_at(&i, now), 1);
+        assert_eq!(recommended_phase_index_at(&i, now), Some(1));
         let rows = stage_rows_from_at(&i.stages, Some(1), now);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].index, 1, "original phase index must be preserved");
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].expired);
+        assert!(!rows[0].recommended);
+        assert!(!rows[1].expired);
+        assert!(rows[1].recommended);
     }
 }
 
@@ -3129,10 +3132,13 @@ mod wl_classify_tests {
             stage_type: stage_type.into(),
             eligible: eligible.into(),
             price_eth: None,
+            price_wei: None,
             max_mintable: Some(1),
             stage_index: idx,
             recommended: false,
             start_time: None,
+            end_time: None,
+            expired: false,
         }
     }
 
@@ -3332,7 +3338,7 @@ pub struct DropPhasesResult {
     pub name: String,
     pub chain: String,
     pub address: String,
-    pub recommended_index: usize,
+    pub recommended_index: Option<usize>,
     pub stages: Vec<StageRow>,
 }
 
@@ -3376,11 +3382,11 @@ pub struct DiscoveredFunction {
     pub source: String,
 }
 
-fn recommended_phase_index(info: &opensea::CollectionInfo) -> usize {
+fn recommended_phase_index(info: &opensea::CollectionInfo) -> Option<usize> {
     recommended_phase_index_at(info, chrono::Utc::now().timestamp())
 }
 
-fn recommended_phase_index_at(info: &opensea::CollectionInfo, now: i64) -> usize {
+fn recommended_phase_index_at(info: &opensea::CollectionInfo, now: i64) -> Option<usize> {
     let stages = &info.stages;
     stages
         .iter()
@@ -3399,11 +3405,10 @@ fn recommended_phase_index_at(info: &opensea::CollectionInfo, now: i64) -> usize
             )
         })
         .map(|(i, _)| i)
-        .unwrap_or_else(|| {
+        .or_else(|| {
             stages
                 .iter()
                 .position(|stage| !opensea::stage_is_expired_at(stage, now))
-                .unwrap_or(0)
         })
 }
 
@@ -3419,10 +3424,6 @@ fn stage_rows_from_at(
     stages
         .iter()
         .enumerate()
-        // Eligibility shown by this endpoint belongs to the primary auth
-        // wallet. Keep non-expired stages visible because another selected
-        // wallet can be eligible; only a closed stage is universally invalid.
-        .filter(|(_, stage)| !opensea::stage_is_expired_at(stage, now))
         .map(|(i, s)| {
             let start_time = s
                 .start_time
@@ -3439,10 +3440,15 @@ fn stage_rows_from_at(
                     .price_wei
                     .map(crate::amount::wei_to_eth_string)
                     .or_else(|| s.price_eth.map(|p| format!("{p}"))),
+                price_wei: s.price_wei.map(|price| price.to_string()),
                 max_mintable: s.max_mintable,
                 stage_index: s.stage_index,
                 recommended: recommended == Some(i),
                 start_time,
+                end_time: s
+                    .end_time
+                    .and_then(|t| if t > 0.0 { Some(t as i64) } else { None }),
+                expired: opensea::stage_is_expired_at(s, now),
             }
         })
         .collect()
@@ -3459,6 +3465,8 @@ pub struct MintOptions {
     pub auto_phase: bool,
     /// 0-based stage index (overrides auto when set).
     pub phase_index: Option<usize>,
+    /// Exact unit price captured when the operator loaded and saved the phase.
+    pub expected_unit_price_wei: Option<String>,
     /// Schedule: RFC3339 or unix timestamp string.
     pub at_time: Option<String>,
     /// Override env USE_GQL when Some.
@@ -3501,6 +3509,7 @@ impl Default for MintOptions {
             dry_run: true,
             auto_phase: true,
             phase_index: None,
+            expected_unit_price_wei: None,
             at_time: None,
             use_gql: None,
             skip_preflight: None,

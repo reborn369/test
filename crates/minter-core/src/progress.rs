@@ -169,7 +169,7 @@ impl MintReporter for FileTeeReporter {
             }
             if let Some(ref phase) = event.phase {
                 let lab = event.phase_label.as_deref().unwrap_or("");
-                let _ = writeln!(f, "[{ts}] PHASE {phase}: {lab}");
+                let _ = writeln!(f, "[{ts}] === {} | {} ===", phase.to_uppercase(), lab);
             }
             if let Some(ref addr) = event.address {
                 let _ = writeln!(

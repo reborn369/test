@@ -4961,7 +4961,18 @@ button.spend-btn,
 .spend-btn {
   background: var(--green);
   border-color: var(--green);
+  color: #06140d;
   box-shadow: none;
+}
+
+button.spend-btn:hover:not(:disabled),
+.spend-btn:hover:not(:disabled) {
+  color: #06140d;
+}
+
+select option:disabled {
+  color: var(--muted-2);
+  background: #0c1118;
 }
 
 input[type="password"],

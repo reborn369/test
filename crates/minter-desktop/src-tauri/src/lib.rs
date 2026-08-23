@@ -1331,6 +1331,8 @@ struct RunMintInput {
     quantity: Option<u32>,
     dry_run: Option<bool>,
     phase_index: Option<usize>,
+    /// Exact unit price captured when phases were loaded and the task saved.
+    expected_unit_price_wei: Option<String>,
     confirm: Option<String>,
     confirmation_id: Option<String>,
     /// Selected vault addresses (if empty/absent → all wallets).
@@ -1422,6 +1424,7 @@ async fn run_mint(
         dry_run,
         auto_phase: input.phase_index.is_none(),
         phase_index: input.phase_index,
+        expected_unit_price_wei: input.expected_unit_price_wei,
         at_time,
         use_gql: None,
         // LIVE path ignores preflight estimate (core always fixed-gas on live).

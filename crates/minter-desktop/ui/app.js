@@ -4522,6 +4522,11 @@ function normalizeTask(raw) {
         ? Number(t0.phaseStartAt)
         : null,
     phaseLabel: t0.phaseLabel || null,
+    phasePriceWei:
+      t0.phasePriceWei != null && /^\d+$/.test(String(t0.phasePriceWei))
+        ? String(t0.phasePriceWei)
+        : null,
+    lastError: t0.lastError ? String(t0.lastError).slice(0, 1000) : null,
     // Legacy field kept on disk for compatibility. OpenSea balance validation
     // is mandatory and runs in core after Auto resolves the collection chain.
     filterBalance: true,
@@ -4558,6 +4563,8 @@ function taskToPersist(task) {
     chainOverride: task.chainOverride,
     phaseStartAt: task.phaseStartAt,
     phaseLabel: task.phaseLabel,
+    phasePriceWei: task.phasePriceWei,
+    lastError: task.lastError || null,
     filterBalance: true,
     priorityFeeGwei: task.priorityFeeGwei || "",
     atTime: task.atTime || "",
@@ -4672,6 +4679,9 @@ function computeBlockReasons(task) {
   if (task.status === "running") {
     reasons.push(t("tasks.block.running") || "Already running");
   }
+  if (!task.phasePriceWei) {
+    reasons.push("Reload phases and save the task to lock its exact mint price");
+  }
   return reasons;
 }
 
@@ -4749,17 +4759,25 @@ function setModalTitle(mode) {
 function fillPhaseSelect(stages, recommendedIndex, selectedIndex) {
   const sel = $("wizard-phase");
   if (!sel) return;
-  const rec = recommendedIndex ?? 0;
-  sel.innerHTML = `<option value="">— auto #${rec + 1} —</option>`;
+  const rec = Number.isInteger(recommendedIndex) ? recommendedIndex : null;
+  sel.innerHTML = `<option value="">— auto —</option>`;
+  const auto = sel.options[0];
+  auto.textContent = rec == null
+    ? "— no open/upcoming phase —"
+    : `— auto #${rec + 1} —`;
+  auto.disabled = rec == null;
   for (const s of stages || []) {
     const opt = document.createElement("option");
     opt.value = String(s.index);
     const price = s.priceEth ? ` · ${s.priceEth} ETH` : "";
     const star = s.recommended ? " ★" : "";
-    opt.textContent = `#${s.index + 1} ${s.label} (${s.stageType}) ${s.eligible}${price}${star}`;
+    const ended = s.expired ? " · ЗАВЕРШЕНА" : "";
+    opt.textContent = `#${s.index + 1} ${s.label} (${s.stageType}) ${s.eligible}${price}${star}${ended}`;
+    opt.disabled = !!s.expired;
     sel.appendChild(opt);
   }
-  if (selectedIndex == null || selectedIndex === "") sel.value = "";
+  const selected = (stages || []).find((s) => s.index === Number(selectedIndex));
+  if (selectedIndex == null || selectedIndex === "" || selected?.expired) sel.value = "";
   else sel.value = String(selectedIndex);
 }
 
@@ -4769,6 +4787,8 @@ function phaseMetaFromSelection() {
     phaseRaw === "" || phaseRaw == null ? null : Number(phaseRaw);
   let phaseStartAt = null;
   let phaseLabel = null;
+  let phasePriceWei = null;
+  let phaseExpired = false;
   if (lastLoadedPhases?.stages?.length) {
     const idx =
       phaseIndex != null && Number.isFinite(phaseIndex)
@@ -4781,12 +4801,24 @@ function phaseMetaFromSelection() {
           ? Number(st.startTime)
           : null;
       phaseLabel = st.label || `#${idx + 1}`;
+      phasePriceWei = st.priceWei == null ? null : String(st.priceWei);
+      phaseExpired = !!st.expired;
     }
   }
   return {
-    phaseIndex: Number.isFinite(phaseIndex) ? phaseIndex : null,
+    // "Auto" is resolved when the task is saved. A durable task must point to
+    // one exact stage; otherwise a later recommendation change could silently
+    // switch both phase and terms at launch.
+    phaseIndex:
+      Number.isFinite(phaseIndex)
+        ? phaseIndex
+        : Number.isInteger(lastLoadedPhases?.recommendedIndex)
+          ? lastLoadedPhases.recommendedIndex
+          : null,
     phaseStartAt,
     phaseLabel,
+    phasePriceWei,
+    phaseExpired,
   };
 }
 
@@ -4847,6 +4879,7 @@ async function openTaskModal(opts = {}) {
         wallets: [...(src.wallets || [])],
         phaseStartAt: src.phaseStartAt,
         phaseLabel: src.phaseLabel,
+        phasePriceWei: src.phasePriceWei,
         filterBalance: true,
         // preserve mint fields 13/14/16 on edit (do not wipe)
         priorityFeeGwei: src.priorityFeeGwei || "",
@@ -5424,7 +5457,8 @@ function renderTaskList() {
       disp !== "running" &&
       disp !== "queued" &&
       disp !== "blocked" &&
-      task.status !== "running";
+      task.status !== "running" &&
+      reasons.length === 0;
     // Only lock edit/delete while THIS task is the live run or queued — not zombie "running"
     const busy = isActiveRun || task.status === "queued";
     card.className =
@@ -5454,7 +5488,9 @@ function renderTaskList() {
     const blockLine =
       disp === "blocked" && reasons.length
         ? `<div class="task-card-block">${escapeHtml(reasons[0])}</div>`
-        : "";
+        : disp === "error" && task.lastError
+          ? `<div class="task-card-block">Last error: ${escapeHtml(task.lastError)}</div>`
+          : "";
     card.innerHTML = `
       <div class="task-card-main">
         <div class="task-card-title">
@@ -5608,7 +5644,22 @@ $("task-modal-save")?.addEventListener("click", () => {
   if (gasMode === "manual") {
     gasLimit = Math.max(21000, Number($("task-gas-limit")?.value) || 250000);
   }
-  const { phaseIndex, phaseStartAt, phaseLabel } = phaseMetaFromSelection();
+  if (!lastLoadedPhases?.stages?.length) {
+    $("wizard-msg").textContent =
+      "Load phases before saving so the exact price and phase status are locked";
+    return;
+  }
+  const { phaseIndex, phaseStartAt, phaseLabel, phasePriceWei, phaseExpired } =
+    phaseMetaFromSelection();
+  if (phaseExpired) {
+    $("wizard-msg").textContent = "This phase has ended and cannot be selected";
+    return;
+  }
+  if (phasePriceWei == null) {
+    $("wizard-msg").textContent =
+      "Selected phase has no exact price; task was not saved";
+    return;
+  }
   const base = {
     name,
     slug,
@@ -5626,6 +5677,7 @@ $("task-modal-save")?.addEventListener("click", () => {
     ),
     phaseStartAt,
     phaseLabel,
+    phasePriceWei,
     filterBalance: true,
     skipEstimateOnOpen: $("task-skip-est") ? !!$("task-skip-est").checked : true,
     priorityFeeGwei: ($("task-prio")?.value || "").trim(),
@@ -5681,7 +5733,11 @@ $("btn-load-phases")?.addEventListener("click", async () => {
     lastLoadedPhases = r;
     const prev = $("wizard-phase")?.value;
     fillPhaseSelect(r.stages, r.recommendedIndex, prev === "" ? null : prev);
-    $("phase-hint").textContent = `${r.name} · ${r.chain} · ${r.stages.length} phase(s) · recommended #${r.recommendedIndex + 1}`;
+    const ended = (r.stages || []).filter((s) => s.expired).length;
+    const recommendation = Number.isInteger(r.recommendedIndex)
+      ? `recommended #${r.recommendedIndex + 1}`
+      : "no open/upcoming phase";
+    $("phase-hint").textContent = `${r.name} · ${r.chain} · ${r.stages.length} phase(s) · ${ended} ended · ${recommendation}`;
     if (!$("task-name").value.trim()) $("task-name").value = r.slug || slug;
     $("wizard-msg").textContent = "Phases loaded";
   } catch (e) {
@@ -6188,8 +6244,11 @@ function onMintEvent(ev) {
   const p = ev.payload || {};
   if (p.phase || p.phaseLabel) {
     setMintPhaseBanner(p.phase, p.phaseLabel || p.message || "");
-    // phase events may also carry a mirrored log message
-    if (p.message) appendMintLog(p.message);
+    // Countdown belongs in the banner, not as hundreds of repeated log rows.
+    // Other phase transitions are useful milestones and stay in the log.
+    if (String(p.phase || "").toLowerCase() !== "wait") {
+      appendMintLog(`${String(p.phase || "phase").toUpperCase()}: ${p.phaseLabel || p.message || ""}`);
+    }
     scheduleMcStats();
     return;
   }
@@ -6720,6 +6779,7 @@ async function startMintTaskInner(taskId, opts = {}) {
         quantity: task.quantity,
         dryRun: false,
         phaseIndex: task.phaseIndex,
+        expectedUnitPriceWei: task.phasePriceWei,
         confirm: liveGate.confirm,
         confirmationId: liveGate.confirmationId,
         walletAddresses: runWallets,
@@ -6748,6 +6808,7 @@ async function startMintTaskInner(taskId, opts = {}) {
     );
     scheduleMcStats();
     task.status = "done";
+    task.lastError = null;
     task.updatedAt = nowMs();
     setMintPhaseBanner(
       "done",
@@ -6758,6 +6819,7 @@ async function startMintTaskInner(taskId, opts = {}) {
     task.status = "error";
     task.updatedAt = nowMs();
     const es = String(e);
+    task.lastError = es;
     appendMintLog("ERROR: " + es);
     setMintPhaseBanner("error", es.slice(0, 120));
     $("mint-summary").textContent = es;

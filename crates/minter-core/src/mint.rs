@@ -31,9 +31,7 @@ fn log_always(reporter: &dyn MintReporter, msg: impl Into<String>) {
 
 fn report_phase(reporter: &dyn MintReporter, phase: &str, label: impl Into<String>) {
     let label = label.into();
-    reporter.report(MintEvent::phase(phase, label.clone()));
-    // Also mirror into log stream so file/UI log stays complete
-    log_always(reporter, format!("[{}] {}", phase.to_uppercase(), label));
+    reporter.report(MintEvent::phase(phase, label));
 }
 
 fn report_wallet(
@@ -667,14 +665,14 @@ async fn read_seadrop_public_state(
 
 fn validate_seadrop_public_state(
     state: SeaDropPublicState,
-    authorized_unit_price: U256,
+    expected_unit_price: U256,
     quantity: u32,
     fire_time: i64,
 ) -> Result<U256> {
-    if state.mint_price > authorized_unit_price {
+    if state.mint_price != expected_unit_price {
         bail!(
-            "PUBLIC_SALE price changed from authorized {} wei to {} wei; refusing to spend more without explicit user approval",
-            authorized_unit_price,
+            "PUBLIC_SALE price changed after the task was saved: expected {} wei, on-chain {} wei; refusing changed mint terms",
+            expected_unit_price,
             state.mint_price
         );
     }
@@ -1284,22 +1282,52 @@ pub async fn run_opensea_mint(
     }
 
     // Full verbose trail on disk + UI reporter
-    let (reporter, mint_log_path): (Arc<dyn MintReporter>, Option<String>) =
-        match FileTeeReporter::create(reporter.clone(), &slug) {
-            Ok(tee) => {
-                let p = tee.path.display().to_string();
-                log_always(&tee, format!("Full log file: {p}"));
-                (Arc::new(tee) as Arc<dyn MintReporter>, Some(p))
-            }
-            Err(e) => {
-                log_always(
-                    reporter.as_ref(),
-                    format!("WARN: could not open mint log file: {e}"),
-                );
-                (reporter, None)
-            }
-        };
-    let _mint_log_path = mint_log_path;
+    let reporter: Arc<dyn MintReporter> = match FileTeeReporter::create(reporter.clone(), &slug) {
+        Ok(tee) => {
+            let p = tee.path.display().to_string();
+            log_always(&tee, format!("Full log file: {p}"));
+            Arc::new(tee) as Arc<dyn MintReporter>
+        }
+        Err(e) => {
+            log_always(
+                reporter.as_ref(),
+                format!("WARN: could not open mint log file: {e}"),
+            );
+            reporter
+        }
+    };
+
+    let result = run_opensea_mint_inner(
+        signers,
+        env,
+        proxies,
+        opts,
+        vault_password,
+        reporter.clone(),
+        cancel,
+        &slug,
+    )
+    .await;
+    if let Err(error) = &result {
+        let message = format!("Mint stopped before completion: {error}");
+        report_phase(reporter.as_ref(), "error", message.clone());
+        log_always(reporter.as_ref(), format!("FATAL ERROR | {message}"));
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_opensea_mint_inner(
+    signers: &[Signer],
+    env: &HashMap<String, String>,
+    proxies: &ProxyManager,
+    opts: &MintOptions,
+    vault_password: Option<&str>,
+    reporter: Arc<dyn MintReporter>,
+    cancel: Option<Arc<AtomicBool>>,
+    slug: &str,
+) -> Result<MintRunSummary> {
+    let slug = slug.to_string();
 
     // Optional wallet subset: keep original vault indices for proxy mapping.
     // proxy_overrides: address → proxy list index (manual wallet→proxy map).
@@ -2180,6 +2208,25 @@ pub async fn run_opensea_mint(
             stage.end_time.unwrap_or_default()
         );
     }
+    let expected_unit_price_wei = match opts.expected_unit_price_wei.as_deref() {
+        Some(value) => {
+            parse_hex_u256(value).with_context(|| format!("Invalid saved phase price '{value}'"))?
+        }
+        None if dry_run => stage.price_wei.unwrap_or(U256::ZERO),
+        None => bail!(
+            "This task has no saved phase-price snapshot. Reload phases and save the task again before LIVE mint"
+        ),
+    };
+    let metadata_price_wei = stage.price_wei.context(
+        "OpenSea phase has no exact price; refusing LIVE mint without a verifiable price",
+    )?;
+    if metadata_price_wei != expected_unit_price_wei {
+        bail!(
+            "Phase price changed after the task was saved: expected {} wei, OpenSea now reports {} wei; reload phases and review the new terms",
+            expected_unit_price_wei,
+            metadata_price_wei
+        );
+    }
     log_always(
         reporter.as_ref(),
         format!("Selected: {}", opensea::stage_label(stage)),
@@ -2457,10 +2504,8 @@ pub async fn run_opensea_mint(
         .map(|c| c.as_str())
         .unwrap_or("0x0000000000000000000000000000000000000000");
     let payment_asset = opensea::stage_payment_asset(&info, stage);
-    // The price visible when the task is prepared is the maximum authorized
-    // unit price. A later on-chain increase must never be paid implicitly.
-    let authorized_price_wei = stage.price_wei.unwrap_or(U256::ZERO);
-    let mut price_wei = authorized_price_wei;
+    // Use the operator-approved snapshot, never a silently refreshed price.
+    let mut price_wei = expected_unit_price_wei;
     let stage_type_owned = stage.stage_type.clone();
     let stage_token_id = opensea::stage_token_id(stage);
     let seadrop_address = env.get("SEADROP_ADDRESS").cloned();
@@ -2872,11 +2917,12 @@ pub async fn run_opensea_mint(
             let left = remaining_ms.saturating_add(999) / 1000;
 
             if left != last_printed {
-                log_always(
-                    reporter.as_ref(),
-                    format!("{left}s until phase open (wall clock)"),
-                );
-                if left <= 30 || left % 30 == 0 {
+                // Keep logs useful: minute/30s checkpoints, then 5s, then the
+                // final ten-second precision window. The old one-line-per-second
+                // countdown buried the actual failure hundreds of lines down.
+                let should_report =
+                    left <= 10 || (left <= 30 && left % 5 == 0) || (left > 30 && left % 30 == 0);
+                if should_report {
                     let m = left / 60;
                     let s = left % 60;
                     report_phase(
@@ -3092,7 +3138,7 @@ pub async fn run_opensea_mint(
                     };
                     let verified_price = validate_seadrop_public_state(
                         state,
-                        authorized_price_wei,
+                        expected_unit_price_wei,
                         quantity,
                         start_ts,
                     )?;
@@ -3322,7 +3368,7 @@ pub async fn run_opensea_mint(
         .context("Final SeaDrop state check timed out; mint not broadcast")??;
         price_wei = validate_seadrop_public_state(
             state,
-            authorized_price_wei,
+            expected_unit_price_wei,
             quantity,
             chrono::Utc::now().timestamp(),
         )?;
@@ -6052,7 +6098,7 @@ mod tests {
     }
 
     #[test]
-    fn public_state_accepts_same_or_lower_authorized_price_only_inside_window() {
+    fn public_state_accepts_only_the_exact_saved_price_inside_window() {
         let state = SeaDropPublicState {
             mint_price: U256::from(5u64),
             start_time: 900,
@@ -6060,11 +6106,12 @@ mod tests {
             max_total_mintable_by_wallet: 25,
         };
         assert_eq!(
-            validate_seadrop_public_state(state, U256::from(10u64), 25, 1_000).unwrap(),
+            validate_seadrop_public_state(state, U256::from(5u64), 25, 1_000).unwrap(),
             U256::from(5u64)
         );
-        assert!(validate_seadrop_public_state(state, U256::from(10u64), 26, 1_000).is_err());
-        assert!(validate_seadrop_public_state(state, U256::from(10u64), 25, 2_000).is_err());
+        assert!(validate_seadrop_public_state(state, U256::from(10u64), 25, 1_000).is_err());
+        assert!(validate_seadrop_public_state(state, U256::from(5u64), 26, 1_000).is_err());
+        assert!(validate_seadrop_public_state(state, U256::from(5u64), 25, 2_000).is_err());
     }
 
     #[test]

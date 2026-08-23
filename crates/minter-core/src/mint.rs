@@ -3069,6 +3069,21 @@ async fn run_opensea_mint_inner(
                     reporter.as_ref(),
                     "\n  Refreshing nonces + fees (bounded, before open)...".to_string(),
                 );
+                if chain_id == 57073 {
+                    // Ink submit ingress is especially sensitive to a cold TLS
+                    // burst. Warm every endpoint that can receive a transaction
+                    // in parallel with the existing nonce/fee work, never on the
+                    // critical path and never by submitting a dummy transaction.
+                    let warm_rpc = rpc.clone();
+                    let warm_reporter = reporter.clone();
+                    tokio::spawn(async move {
+                        let (ready, total) = warm_rpc.warm_broadcast_endpoints().await;
+                        log_always(
+                            warm_reporter.as_ref(),
+                            format!("  Ink RPC transports warm: {ready}/{total} ready"),
+                        );
+                    });
+                }
                 let refresh_deadline =
                     std::time::Instant::now() + std::time::Duration::from_millis(1_200);
                 let fee_rpc = rpc.clone();
@@ -3452,7 +3467,7 @@ async fn run_opensea_mint_inner(
             .collect()
     };
 
-    for (_, w) in wallets.iter().enumerate() {
+    for (wallet_lane, w) in wallets.iter().enumerate() {
         if !w.auth_ok {
             continue;
         }
@@ -3505,6 +3520,7 @@ async fn run_opensea_mint_inner(
         let scheduled_fire_lag_ms_w = scheduled_fire_lag_ms;
         // Bound at auth time (signer index) — never re-derive from wallets order.
         let proxy_url_w = w.proxy_url.clone();
+        let ink_broadcast = chain_id == 57073;
 
         handles.spawn(async move {
             let mut attempt = 0u32;
@@ -4452,7 +4468,13 @@ async fn run_opensea_mint_inner(
                 // named in the log and the wallet row. Which node actually took
                 // the transaction is the one fact that tells a paid endpoint
                 // apart from the public fallback under real load.
-                let tx_hash = match rpc.send_raw_transaction_report(&raw).await {
+                let send_result = if ink_broadcast {
+                    rpc.send_raw_transaction_ink_report(&raw, wallet_lane)
+                        .await
+                } else {
+                    rpc.send_raw_transaction_report(&raw).await
+                };
+                let tx_hash = match send_result {
                     Ok(send_report) => {
                         let h = send_report.hash;
                         let failed_note = if send_report.losers.is_empty() {
@@ -5339,17 +5361,21 @@ async fn run_opensea_mint_inner(
         .iter()
         .filter(|r| matches!(r.status, WalletStatus::Failed))
         .count();
+    let unresolved = results
+        .iter()
+        .filter(|r| r.status == WalletStatus::Sent && r.error.is_some())
+        .count();
     report_phase(
         reporter.as_ref(),
         "done",
-        format!("Done: {confirmed} ok · {failed} fail · {elapsed}ms"),
+        format!("Done: {confirmed} ok · {failed} fail · {unresolved} unresolved · {elapsed}ms"),
     );
     let total = results.len();
     log_always(
         reporter.as_ref(),
         format!(
-            "Done: {}/{} ok, {} failed, total={}ms",
-            confirmed, total, failed, elapsed
+            "Done: {}/{} ok, {} failed, {} unresolved, total={}ms",
+            confirmed, total, failed, unresolved, elapsed
         ),
     );
     let mut export_json = None;

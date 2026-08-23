@@ -3428,6 +3428,11 @@ mod rpc_collect_tests {
             ink.iter().any(|u| u.contains("inkonchain.com")),
             "expected official Ink public RPC, got {ink:?}"
         );
+        assert!(
+            ink.iter().any(|u| u == "https://rpc-ten.inkonchain.com")
+                && ink.iter().any(|u| u == "https://ink.drpc.org"),
+            "expected independent Tenderly and dRPC Ink fallbacks, got {ink:?}"
+        );
     }
 
     #[test]
@@ -3998,6 +4003,8 @@ fn public_rpc_fallback(chain: &str) -> Vec<&'static str> {
         "ink" => vec![
             "https://rpc-gel.inkonchain.com",
             "https://rpc-qnd.inkonchain.com",
+            "https://rpc-ten.inkonchain.com",
+            "https://ink.drpc.org",
         ],
         "megaeth" | "mega_eth" => vec!["https://mainnet.megaeth.com/rpc"],
         "monad" => vec!["https://rpc.monad.xyz", "https://rpc1.monad.xyz"],

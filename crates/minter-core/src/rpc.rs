@@ -12,6 +12,16 @@ const RPC_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// lead node near T0, large enough not to spam every node on a healthy link.
 const RPC_HEDGE_DELAY: Duration = Duration::from_millis(350);
 
+// Ink is an OP Stack chain whose public/provider ingress applies much tighter
+// transaction-submit limits during popular mints than its ordinary read RPC.
+// Do not eagerly multiply an N-wallet burst by every endpoint.  The dedicated
+// Ink path starts each wallet on a different lane, adds delayed hedges, and may
+// safely resend the *identical* signed bytes when an ingress times out.
+const INK_SEND_HEDGE_DELAY: Duration = Duration::from_millis(180);
+const INK_SEND_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(900);
+const INK_SEND_WAVES: usize = 3;
+const INK_SEND_LANE_STAGGER: Duration = Duration::from_millis(20);
+
 /// Tunable RPC fan-out / timeout knobs. Defaults match the constants above;
 /// overridable via env / settings keys so fast L2s can tighten timeouts and
 /// slow proxies can loosen them without a code change.
@@ -74,6 +84,67 @@ impl Clone for RpcClient {
             tuning: self.tuning,
         }
     }
+}
+
+/// Submit one pre-serialized raw-transaction request to one endpoint.
+///
+/// Kept separate from the orchestration policy so the Ink broadcaster can
+/// rotate/hedge providers without rebuilding or re-signing a transaction.  A
+/// retry therefore has the same nonce and hash and cannot create a second mint.
+async fn send_prebuilt_raw_attempt(
+    client: reqwest::Client,
+    url: String,
+    body: std::sync::Arc<Vec<u8>>,
+    expected_hash: B256,
+    timeout: Duration,
+) -> (String, std::result::Result<B256, String>, u64) {
+    let started = std::time::Instant::now();
+    let short = RpcClient::short_url(&url);
+    let result = match tokio::time::timeout(timeout, async {
+        let response = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(body.as_ref().clone())
+            .send()
+            .await
+            .with_context(|| format!("RPC eth_sendRawTransaction request failed via {short}"))?;
+        let status = response.status();
+        let text = response.text().await.with_context(|| {
+            format!("RPC eth_sendRawTransaction: failed to read response from {short}")
+        })?;
+        if !status.is_success() {
+            bail!(
+                "RPC eth_sendRawTransaction HTTP {status} via {short}: {}",
+                crate::safe_truncate(&text, 240)
+            );
+        }
+        let data: serde_json::Value = serde_json::from_str(&text).with_context(|| {
+            format!(
+                "RPC eth_sendRawTransaction: bad JSON from {short}: {}",
+                crate::safe_truncate(&text, 240)
+            )
+        })?;
+        if let Some(error) = data.get("error") {
+            bail!("RPC eth_sendRawTransaction via {short} error: {error}");
+        }
+        let hash = data
+            .get("result")
+            .and_then(serde_json::Value::as_str)
+            .context("tx hash not a string")?
+            .parse::<B256>()
+            .context("invalid tx hash")?;
+        if hash != expected_hash {
+            bail!("node returned unexpected tx hash {hash}");
+        }
+        Ok(hash)
+    })
+    .await
+    {
+        Ok(Ok(hash)) => Ok(hash),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err(format!("timeout {}ms", timeout.as_millis())),
+    };
+    (url, result, started.elapsed().as_millis() as u64)
 }
 
 impl RpcClient {
@@ -797,6 +868,179 @@ impl RpcClient {
         Ok((base_fee, priority))
     }
 
+    /// Warm the exact endpoint set used by transaction broadcast.
+    ///
+    /// This is intentionally a read-only `eth_chainId` call.  It opens DNS,
+    /// TCP, TLS and HTTP connections before T0 without submitting a dummy
+    /// transaction or consuming a wallet nonce.
+    pub async fn warm_broadcast_endpoints(&self) -> (usize, usize) {
+        let urls: Vec<String> = self
+            .urls
+            .iter()
+            .take(self.tuning.max_nodes)
+            .chain(self.send_only_urls.iter())
+            .cloned()
+            .collect();
+        let total = urls.len();
+        let mut jobs = tokio::task::JoinSet::new();
+        for url in urls {
+            let client = self.client.clone();
+            let id = self
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            jobs.spawn(async move {
+                tokio::time::timeout(
+                    Duration::from_millis(800),
+                    Self::rpc_call_with_client(client, url, id, "eth_chainId", json!([])),
+                )
+                .await
+                .is_ok_and(|result| result.is_ok())
+            });
+        }
+        let mut ready = 0usize;
+        while let Some(result) = jobs.join_next().await {
+            if matches!(result, Ok(true)) {
+                ready += 1;
+            }
+        }
+        (ready, total)
+    }
+
+    /// Ink-specific rate-aware broadcast.
+    ///
+    /// Wallet `lane`s are rotated across providers so a ten-wallet T0 does not
+    /// become ten simultaneous submissions to every provider.  Secondary
+    /// endpoints are delayed hedges.  If a whole wave is rate-limited or times
+    /// out, the next wave sends the exact same raw bytes/hash; this is
+    /// idempotent and cannot double-mint.
+    pub async fn send_raw_transaction_ink_report(
+        &self,
+        raw: &Bytes,
+        lane: usize,
+    ) -> Result<SendReport> {
+        let mut urls: Vec<String> = self
+            .urls
+            .iter()
+            .take(self.tuning.max_nodes)
+            .cloned()
+            .collect();
+        urls.extend(self.send_only_urls.iter().cloned());
+        if urls.is_empty() {
+            bail!("No HTTP RPC URLs configured for Ink broadcast");
+        }
+
+        let endpoint_count = urls.len();
+        let expected_hash = alloy_primitives::keccak256(raw.as_ref());
+        let raw_hex = format!("0x{}", hex::encode(raw));
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let body = std::sync::Arc::new(
+            serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "eth_sendRawTransaction",
+                "params": [&raw_hex],
+            }))
+            .expect("JSON serialization cannot fail"),
+        );
+
+        // At most four wallets share an initial provider in a ten-wallet run.
+        // Space only wallets in the same provider lane; the first wallet for
+        // every provider still fires at T0.
+        let lane_slot = lane / endpoint_count;
+        if lane_slot > 0 {
+            tokio::time::sleep(INK_SEND_LANE_STAGGER.saturating_mul(lane_slot as u32)).await;
+        }
+
+        let hedge_delay = self.tuning.hedge_delay.min(INK_SEND_HEDGE_DELAY);
+        let attempt_timeout = self.tuning.call_timeout.min(INK_SEND_ATTEMPT_TIMEOUT);
+        let started_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut losers = Vec::new();
+
+        for wave in 0..INK_SEND_WAVES {
+            let mut jobs = tokio::task::JoinSet::new();
+            for rank in 0..endpoint_count {
+                let index = (lane + wave + rank) % endpoint_count;
+                let url = urls[index].clone();
+                let client = self.client.clone();
+                let body = body.clone();
+                let attempts = started_attempts.clone();
+                let delay = hedge_delay.saturating_mul(rank as u32);
+                crate::rlog!(
+                    "Ink send wave {}/{} hedge {}/{} via {} delay={}ms",
+                    wave + 1,
+                    INK_SEND_WAVES,
+                    rank + 1,
+                    endpoint_count,
+                    Self::short_url(&url),
+                    delay.as_millis()
+                );
+                jobs.spawn(async move {
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    send_prebuilt_raw_attempt(client, url, body, expected_hash, attempt_timeout)
+                        .await
+                });
+            }
+
+            while let Some(joined) = jobs.join_next().await {
+                match joined {
+                    Ok((url, Ok(hash), latency_ms)) => {
+                        jobs.abort_all();
+                        return Ok(SendReport {
+                            hash,
+                            winner: Self::short_url(&url),
+                            nodes_tried: started_attempts
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                            winner_latency_ms: latency_ms,
+                            http_attempts: started_attempts
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                            losers,
+                        });
+                    }
+                    Ok((url, Err(error), latency_ms)) => {
+                        if crate::errors::is_already_known(&error) {
+                            jobs.abort_all();
+                            return Ok(SendReport {
+                                hash: expected_hash,
+                                winner: Self::short_url(&url),
+                                nodes_tried: started_attempts
+                                    .load(std::sync::atomic::Ordering::Relaxed),
+                                winner_latency_ms: latency_ms,
+                                http_attempts: started_attempts
+                                    .load(std::sync::atomic::Ordering::Relaxed),
+                                losers,
+                            });
+                        }
+                        losers.push(format!(
+                            "{} ({}ms): {}",
+                            Self::short_url(&url),
+                            latency_ms,
+                            error
+                        ));
+                    }
+                    Err(error) => losers.push(format!("Ink send task join: {error}")),
+                }
+            }
+
+            // Deterministic per-lane jitter prevents every failed wallet from
+            // starting the next wave on the same millisecond (thundering herd).
+            if wave + 1 < INK_SEND_WAVES {
+                let backoff_ms = 45 + (lane as u64 % 7) * 13 + wave as u64 * 35;
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+        }
+
+        bail!(
+            "Ink broadcast exhausted {} identical-raw attempt(s): {}",
+            started_attempts.load(std::sync::atomic::Ordering::Relaxed),
+            losers.join(" | ")
+        )
+    }
+
     /// Broadcast a signed tx to up to `max_nodes` endpoints in parallel and
     /// return the first accepted hash. See [`send_raw_transaction_report`] for
     /// the per-node breakdown.
@@ -1328,6 +1572,90 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Reusable mock that can change its response on each request and records
+    /// every JSON body. Useful for proving an Ink retry sends identical bytes.
+    fn spawn_sequence_mock(
+        responses: Vec<(String, Duration)>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let task_count = count.clone();
+        let task_bodies = bodies.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let responses = responses.clone();
+                let count = task_count.clone();
+                let bodies = task_bodies.clone();
+                tokio::spawn(async move {
+                    let index = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        let Ok(n) = sock.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                        let Some(headers_end) = request.windows(4).position(|w| w == b"\r\n\r\n")
+                        else {
+                            continue;
+                        };
+                        let headers = String::from_utf8_lossy(&request[..headers_end + 4]);
+                        let content_len = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.split_once(':').and_then(|(key, value)| {
+                                    key.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                            })
+                            .unwrap_or(0);
+                        if request.len() < headers_end + 4 + content_len {
+                            continue;
+                        }
+                        let body = String::from_utf8_lossy(
+                            &request[headers_end + 4..headers_end + 4 + content_len],
+                        )
+                        .to_string();
+                        bodies.lock().unwrap().push(body);
+                        break;
+                    }
+                    let (body, delay) = responses
+                        .get(index)
+                        .or_else(|| responses.last())
+                        .cloned()
+                        .unwrap();
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), count, bodies)
+    }
+
     fn ok_body(result_hex: &str) -> String {
         format!("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"{result_hex}\"}}")
     }
@@ -1581,6 +1909,107 @@ mod tests {
         assert_eq!(report.http_attempts, 2);
         assert_eq!(report.losers.len(), 1, "the failed lead node is recorded");
         assert!(report.losers[0].contains("nope"));
+    }
+
+    #[tokio::test]
+    async fn ink_send_shards_primary_by_wallet_lane() {
+        let raw = Bytes::from(vec![0x02, 0xaa, 0xbb]);
+        let hash_hex = format!(
+            "0x{}",
+            hex::encode(alloy_primitives::keccak256(raw.as_ref()).as_slice())
+        );
+        let (first, first_count, _) =
+            spawn_sequence_mock(vec![(ok_body(&hash_hex), Duration::ZERO)]);
+        let (second, second_count, _) =
+            spawn_sequence_mock(vec![(ok_body(&hash_hex), Duration::ZERO)]);
+        let mut rpc = RpcClient::new(vec![first, second.clone()]);
+        rpc.tuning.hedge_delay = Duration::from_millis(80);
+        rpc.tuning.call_timeout = Duration::from_millis(200);
+
+        let report = rpc.send_raw_transaction_ink_report(&raw, 1).await.unwrap();
+        assert_eq!(report.winner, RpcClient::short_url(&second));
+        assert_eq!(second_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(first_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn ink_send_hedges_away_from_rate_limited_provider() {
+        let raw = Bytes::from(vec![0x02, 0x11, 0x22]);
+        let hash_hex = format!(
+            "0x{}",
+            hex::encode(alloy_primitives::keccak256(raw.as_ref()).as_slice())
+        );
+        let rate_limited = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32016,\"message\":\"Your IP has exceeded its request rate limit.\"}}".to_string();
+        let (bad, bad_count, _) = spawn_sequence_mock(vec![(rate_limited, Duration::ZERO)]);
+        let (good, good_count, _) = spawn_sequence_mock(vec![(ok_body(&hash_hex), Duration::ZERO)]);
+        let mut rpc = RpcClient::new(vec![bad, good.clone()]);
+        rpc.tuning.hedge_delay = Duration::from_millis(20);
+        rpc.tuning.call_timeout = Duration::from_millis(150);
+
+        let report = rpc.send_raw_transaction_ink_report(&raw, 0).await.unwrap();
+        assert_eq!(report.hash, hash_hex.parse::<B256>().unwrap());
+        assert_eq!(report.winner, RpcClient::short_url(&good));
+        assert_eq!(bad_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(good_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(report.losers.iter().any(|e| e.contains("rate limit")));
+    }
+
+    #[tokio::test]
+    async fn ink_send_hedges_without_waiting_for_slow_primary_timeout() {
+        let raw = Bytes::from(vec![0x02, 0x33, 0x44]);
+        let hash_hex = format!(
+            "0x{}",
+            hex::encode(alloy_primitives::keccak256(raw.as_ref()).as_slice())
+        );
+        let (slow, _, _) =
+            spawn_sequence_mock(vec![(ok_body(&hash_hex), Duration::from_millis(500))]);
+        let (fast, _, _) = spawn_sequence_mock(vec![(ok_body(&hash_hex), Duration::ZERO)]);
+        let mut rpc = RpcClient::new(vec![slow, fast.clone()]);
+        rpc.tuning.hedge_delay = Duration::from_millis(25);
+        rpc.tuning.call_timeout = Duration::from_millis(300);
+
+        let started = std::time::Instant::now();
+        let report = rpc.send_raw_transaction_ink_report(&raw, 0).await.unwrap();
+        assert_eq!(report.winner, RpcClient::short_url(&fast));
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "hedge must beat the slow primary: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn ink_retry_reuses_exact_same_signed_raw_transaction() {
+        let raw = Bytes::from(vec![0x02, 0xde, 0xad, 0xbe, 0xef]);
+        let hash_hex = format!(
+            "0x{}",
+            hex::encode(alloy_primitives::keccak256(raw.as_ref()).as_slice())
+        );
+        let limited =
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32016,\"message\":\"rate limit\"}}"
+                .to_string();
+        let (first, _, first_bodies) = spawn_sequence_mock(vec![
+            (limited.clone(), Duration::ZERO),
+            (limited.clone(), Duration::ZERO),
+        ]);
+        let (second, _, second_bodies) = spawn_sequence_mock(vec![
+            (limited, Duration::ZERO),
+            (ok_body(&hash_hex), Duration::ZERO),
+        ]);
+        let mut rpc = RpcClient::new(vec![first, second]);
+        rpc.tuning.hedge_delay = Duration::from_millis(10);
+        rpc.tuning.call_timeout = Duration::from_millis(100);
+
+        let report = rpc.send_raw_transaction_ink_report(&raw, 0).await.unwrap();
+        assert_eq!(report.hash, hash_hex.parse::<B256>().unwrap());
+        let expected_raw = format!("0x{}", hex::encode(raw.as_ref()));
+        let mut bodies = first_bodies.lock().unwrap().clone();
+        bodies.extend(second_bodies.lock().unwrap().iter().cloned());
+        assert!(bodies.len() >= 3, "expected a second broadcast wave");
+        for body in bodies {
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["params"][0], expected_raw);
+        }
     }
 
     #[tokio::test]

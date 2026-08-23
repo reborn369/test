@@ -4614,6 +4614,21 @@ textarea#add-key {
   opacity: 1;
 }
 
+.raw-value-fixed input[readonly] {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 8%, var(--input));
+  border-color: color-mix(in srgb, var(--green) 32%, var(--border));
+  cursor: default;
+}
+
+#raw-phase {
+  font-family: var(--mono);
+}
+
+#raw-phase option:disabled {
+  color: var(--muted-2);
+}
+
 /* ============================================================
    Reactive UI 2026
    One quiet, performance-minded presentation layer. The DOM contract and

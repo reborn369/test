@@ -2904,6 +2904,86 @@ function applySweepRowsToResults(rows) {
   }
 }
 
+function selectedRawAdapterPhase() {
+  if (rawLastProbe?.adapter !== "archetype") return null;
+  const key = ($("raw-phase")?.value || "").toLowerCase();
+  return (rawLastProbe.phases || []).find(
+    (phase) => String(phase.key || "").toLowerCase() === key
+  ) || null;
+}
+
+function applyRawAdapterPhase() {
+  const phase = selectedRawAdapterPhase();
+  const hint = $("raw-phase-hint");
+  if (!phase) {
+    if (rawPreset() === "auto" && $("raw-value")) $("raw-value").value = "0";
+    if (hint) hint.textContent = "Select an enabled verified phase";
+    return;
+  }
+  if ($("raw-value")) $("raw-value").value = phase.valueEth || "0";
+  if (hint) {
+    const timing = phase.open
+      ? "OPEN"
+      : phase.startTime
+        ? `starts ${formatUnixLocal(phase.startTime)}`
+        : "start unknown";
+    const supply = phase.maxSupply
+      ? `list ${phase.listSupply || "0"}/${phase.maxSupply}`
+      : "";
+    hint.textContent = [timing, supply, phase.disabledReason].filter(Boolean).join(" · ");
+  }
+  if (phase.startTime && !phase.open && $("raw-at-ts")) {
+    $("raw-at-ts").value = String(phase.startTime);
+    if ($("raw-at")) $("raw-at").value = String(phase.startTime);
+    syncRawAtPreview();
+  }
+}
+
+function fillRawAdapterPhases(row) {
+  const wrap = $("raw-phase-wrap");
+  const select = $("raw-phase");
+  if (!wrap || !select) return;
+  const isArchetype = row?.adapter === "archetype";
+  wrap.classList.toggle("hidden", rawPreset() !== "auto" || !isArchetype);
+  select.innerHTML = "";
+  if (!isArchetype) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = row?.autoSupported
+      ? "Automatic adapter"
+      : "No verified automatic adapter";
+    select.appendChild(option);
+    applyRawAdapterPhase();
+    return;
+  }
+  const recommended = Number.isInteger(row.recommendedPhaseIndex)
+    ? row.recommendedPhaseIndex
+    : -1;
+  (row.phases || []).forEach((phase, index) => {
+    const option = document.createElement("option");
+    option.value = phase.key;
+    option.disabled = !phase.selectable;
+    const state = phase.expired
+      ? "ENDED"
+      : phase.open
+        ? "OPEN"
+        : phase.startTime
+          ? formatUnixLocal(phase.startTime)
+          : "WAIT";
+    const blocked = phase.disabledReason ? ` · ${phase.disabledReason}` : "";
+    option.textContent = `${phase.label} · ${phase.valueEth} ETH total · ${state}${blocked}`;
+    if (index === recommended && phase.selectable) option.selected = true;
+    select.appendChild(option);
+  });
+  if (!select.value) {
+    const first = (row.phases || []).find((phase) => phase.selectable);
+    if (first) select.value = first.key;
+  }
+  applyRawAdapterPhase();
+}
+
+$("raw-phase")?.addEventListener("change", applyRawAdapterPhase);
+
 async function runRawProbe() {
   const chain = rawSelectedChain();
   const contract = ($("raw-contract")?.value || "").trim();
@@ -2918,7 +2998,11 @@ async function runRawProbe() {
     const row = await invoke("probe_raw", {
       input: { chain, contract, quantity: qty, preset },
     });
+    row._chain = chain;
+    row._contract = contract.toLowerCase();
+    row._quantity = qty;
     rawLastProbe = row;
+    fillRawAdapterPhases(row);
     const meta = $("raw-probe-meta");
     if (meta) {
       if (row.ok && (row.valueEth || row.totalMinted != null)) {
@@ -3207,13 +3291,13 @@ $("raw-fn")?.addEventListener("input", updateRawFnHint);
 $("raw-fn")?.addEventListener("change", updateRawFnHint);
 
 function rawPreset() {
-  let p = ($("raw-preset")?.value || "simpleMintUint").trim();
+  let p = ($("raw-preset")?.value || "auto").trim();
   // MintBay tab removed — map legacy saves
   if (p === "mintBayPublic" || p === "mintbay" || p === "mintBay") {
-    p = "simpleMintUint";
+    p = "auto";
     if ($("raw-preset")) $("raw-preset").value = p;
   }
-  return p;
+  return p === "custom" ? "custom" : "auto";
 }
 
 function setRawStatus(text, kind) {
@@ -3366,8 +3450,7 @@ function syncRawTimeoutHidden() {
 }
 
 function setRawPreset(preset) {
-  let p = preset || "simpleMintUint";
-  if (p === "mintBayPublic" || p === "mintbay" || p === "mintBay") p = "simpleMintUint";
+  let p = preset === "custom" ? "custom" : "auto";
   if ($("raw-preset")) $("raw-preset").value = p;
   document.querySelectorAll(".raw-mode-chip").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.preset === p);
@@ -3377,6 +3460,7 @@ function setRawPreset(preset) {
 
 function updateRawPresetUi() {
   const p = rawPreset();
+  const auto = p === "auto";
   const custom = $("raw-custom-call");
   const qtyWrap = $("raw-qty-wrap");
   const fixedWrap = $("raw-value-fixed-wrap");
@@ -3388,19 +3472,28 @@ function updateRawPresetUi() {
   // Simple = mint(uint256) + qty; Custom = any function + params (top of Target)
   if (custom) custom.classList.toggle("hidden", p !== "custom");
   if (qtyWrap) qtyWrap.classList.toggle("hidden", p === "custom");
+  if ($("raw-phase-wrap")) {
+    $("raw-phase-wrap").classList.toggle(
+      "hidden",
+      !auto || rawLastProbe?.adapter !== "archetype"
+    );
+  }
+  if ($("btn-raw-mint")) $("btn-raw-mint").classList.toggle("hidden", auto);
 
   if (valueMode) valueMode.value = "fixed";
   if (fixedWrap) fixedWrap.classList.remove("hidden");
   if (valueLabel) valueLabel.classList.add("hidden");
 
-  if (p === "simpleMintUint") {
-    if ($("raw-fn")) $("raw-fn").value = "mint(uint256)";
+  if (auto) {
+    if ($("raw-value")) $("raw-value").readOnly = true;
     if (modeHint) {
       modeHint.textContent =
         t("raw.modeHintSimple") || "mint(uint256) · qty from field · fixed ETH";
     }
-    if (priceLab) priceLab.textContent = t("raw.pricePer") || "ETH / NFT";
+    if (modeHint) modeHint.textContent = "Adapter detection · on-chain phases · exact price lock · pre-sign race";
+    if (priceLab) priceLab.textContent = "Total ETH (auto)";
   } else {
+    if ($("raw-value")) $("raw-value").readOnly = false;
     if (modeHint) {
       modeHint.textContent =
         t("raw.modeHintCustom") || "any signature · params manual · value = total ETH";
@@ -3412,6 +3505,7 @@ function updateRawPresetUi() {
   syncRawAtPreview();
   updateRawFnHint();
   updateRawWalletSummary();
+  fillRawAdapterPhases(rawLastProbe);
 }
 
 document.querySelectorAll(".raw-mode-chip").forEach((btn) => {
@@ -3527,6 +3621,9 @@ function weiToEthStr(w) {
 
 function rawEffectiveValueEth() {
   const p = rawPreset();
+  if (p === "auto") {
+    return selectedRawAdapterPhase()?.valueEth || "0";
+  }
   // Exact integer (wei) math — never floats. A wei value cannot be represented
   // in an f64, so parseFloat + toFixed(8) silently rounded the price (and
   // zeroed anything below 1e-8 ETH), producing a msg.value the contract's
@@ -3540,9 +3637,7 @@ function rawEffectiveValueEth() {
   if (wei <= 0n) return "0";
   // Simple: field is ETH per NFT → total = per × qty
   // Custom: field is total ETH sent with the call
-  if (p === "custom") return weiToEthStr(wei);
-  const qty = BigInt(Math.max(1, parseInt($("raw-qty")?.value || "1", 10) || 1));
-  return weiToEthStr(wei * qty);
+  return weiToEthStr(wei);
 }
 
 /** Gas fields from Raw UI (empty / auto → omit, use Settings). */
@@ -3582,10 +3677,11 @@ async function runRawMintOnce() {
   const chain = rawSelectedChain();
   const contract = $("raw-contract").value.trim();
   const preset = rawPreset();
-  let fn = ($("raw-fn")?.value || "").trim();
-  if (preset === "simpleMintUint") {
-    fn = "mint(uint256)";
+  if (preset !== "custom") {
+    setRawStatus("Send now is available only in expert Custom mode", "is-error");
+    return;
   }
+  let fn = ($("raw-fn")?.value || "").trim();
   const dry = $("raw-dry")?.checked;
   const wallets = selectedRawWallets();
   if (!chain || !contract || !fn) {
@@ -3692,9 +3788,6 @@ async function runRawSniperOnce() {
   const contract = ($("raw-contract")?.value || "").trim();
   const preset = rawPreset();
   let fn = ($("raw-fn")?.value || "").trim();
-  if (preset === "simpleMintUint") {
-    fn = "mint(uint256)";
-  }
   let wallets = selectedRawWallets();
   if (!chain) {
     setRawStatus(t("raw.needChain") || "Select network", "is-error");
@@ -3729,6 +3822,39 @@ async function runRawSniperOnce() {
     const q0 = parseInt(p0, 10);
     if (Number.isFinite(q0) && q0 > 0) qty = q0;
   }
+
+  let adapter = null;
+  let adapterPhase = null;
+  if (preset === "auto") {
+    const probeStale =
+      !rawLastProbe ||
+      rawLastProbe._chain !== chain ||
+      rawLastProbe._contract !== contract.toLowerCase() ||
+      rawLastProbe._quantity !== qty;
+    if (probeStale) await runRawProbe();
+    if (!rawLastProbe?.ok || !rawLastProbe?.autoSupported) {
+      setRawStatus(
+        rawLastProbe?.summary || "No verified automatic adapter for this contract",
+        "is-error"
+      );
+      return;
+    }
+    adapter = rawLastProbe.adapter;
+    adapterPhase = selectedRawAdapterPhase();
+    if (adapter === "archetype") {
+      if (!adapterPhase?.selectable) {
+        setRawStatus(
+          adapterPhase?.disabledReason || "Select an enabled verified Archetype phase",
+          "is-error"
+        );
+        return;
+      }
+      fn = "mint((bytes32,bytes32[]),uint256,address,bytes)";
+    } else {
+      setRawStatus(`Adapter ${adapter || "unknown"} is not wired to safe auto-send`, "is-error");
+      return;
+    }
+  }
   syncRawTimeoutHidden();
   let timeoutSecs = parseInt($("raw-timeout")?.value || "1800", 10);
   if (!Number.isFinite(timeoutSecs) || timeoutSecs < 30) timeoutSecs = 1800;
@@ -3743,14 +3869,9 @@ async function runRawSniperOnce() {
   const gasLimit = gas.gasLimit || 650000;
 
   let params = splitTopLevelParams($("raw-params")?.value || "");
-  if (preset === "simpleMintUint") {
-    params = []; // core fills qty into mint(uint256)
-  }
+  if (preset === "auto") params = []; // core builds verified adapter calldata
 
   let payHint = `~${valueEth} ETH`;
-  if (!rawLastProbe || rawLastProbe.error) {
-    await runRawProbe();
-  }
   const gasHint = [
     gas.priorityFeeGwei ? `prio ${gas.priorityFeeGwei} gwei` : "prio auto",
     gas.maxFeeGwei ? `max ${gas.maxFeeGwei} gwei` : null,
@@ -3769,15 +3890,17 @@ async function runRawSniperOnce() {
     context: confirmationContext([
       chain,
       contract,
-      fn || "mint(uint256)",
+      fn,
       valueEth,
       wallets.length,
       atTime || "",
+      adapterPhase?.key || "",
+      adapterPhase?.termsHash || "",
     ]),
     title: t("raw.confirmTitle") || "Start pre-sign race?",
     body: t("tasks.liveBody") || "Type LIVE to arm the live race.",
     lines: [
-      `PRE-SIGN RACE · ${chain} · ${wallets.length} wallets · ${preset === "custom" ? fn : "mint(uint256)"} ×${qty}`,
+      `PRE-SIGN RACE · ${chain} · ${wallets.length} wallets · ${fn} ×${qty}`,
       `pay ${payHint}`,
       gasHint,
       contract,
@@ -3841,8 +3964,12 @@ async function runRawSniperOnce() {
       input: {
         chain,
         contract,
+        adapter,
+        phaseKey: adapterPhase?.key || null,
+        expectedTermsHash: adapterPhase?.termsHash || null,
+        expectedValueWei: adapterPhase?.valueWei || null,
         preset,
-        function: fn || "mint(uint256)",
+        function: fn,
         params,
         quantity: qty,
         valueMode,
@@ -3888,7 +4015,7 @@ try {
     if (saved.chain && $("raw-chain")) $("raw-chain").value = saved.chain;
     if (saved.contract && $("raw-contract")) $("raw-contract").value = saved.contract;
     if (saved.preset) setRawPreset(saved.preset);
-    else setRawPreset("simpleMintUint");
+    else setRawPreset("auto");
     if (saved.qty != null && $("raw-qty")) $("raw-qty").value = saved.qty;
     if (saved.atTime) {
       const ts = isoToUnixTs(saved.atTime);

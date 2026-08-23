@@ -88,6 +88,14 @@ pub struct RawSniperConfig {
     pub gas_limit: Option<u64>,
     /// When to re-fetch fees + re-sign at fire (default mainnet-only).
     pub fee_refresh: FeeRefreshMode,
+    /// Optional contract-specific fail-closed terms guard.
+    pub archetype_terms: Option<ArchetypeTermsGuard>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArchetypeTermsGuard {
+    pub phase_key: String,
+    pub expected_terms_hash: String,
 }
 
 impl Default for RawSniperConfig {
@@ -107,6 +115,7 @@ impl Default for RawSniperConfig {
             concurrency: 16,
             gas_limit: None,
             fee_refresh: FeeRefreshMode::MainnetOnly,
+            archetype_terms: None,
         }
     }
 }
@@ -653,8 +662,45 @@ pub async fn run_raw_sniper(
         return fail_all(signers, "cancelled by user");
     }
 
-    // ── Resolve value at prep time (MintBay auto once — not a fire gate) ──
-    let (value, value_detail) = resolve_mint_value(rpc, config).await;
+    // Revalidate adapter terms at prep time, before any wallet is signed. This
+    // stays at T-5 rather than T0, so the hot send path has no network reads.
+    let guarded_value = if let Some(guard) = &config.archetype_terms {
+        match crate::raw_archetype::validate_public_terms(
+            rpc,
+            &config.contract,
+            &guard.phase_key,
+            config.quantity,
+            &guard.expected_terms_hash,
+            fire_at,
+        )
+        .await
+        {
+            Ok(value) => {
+                report(
+                    &reporter,
+                    MintEvent::message(format!(
+                        "Archetype terms revalidated at prep · value={value} wei"
+                    )),
+                );
+                Some(value)
+            }
+            Err(error) => {
+                return fail_all(
+                    signers,
+                    &format!("Archetype safety guard stopped mint: {error:#}"),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    // Resolve value at prep time (MintBay auto once — not a fire gate).
+    let (value, value_detail) = if let Some(value) = guarded_value {
+        (value, format!("Archetype locked {value} wei"))
+    } else {
+        resolve_mint_value(rpc, config).await
+    };
     report(
         &reporter,
         MintEvent::message(format!("Value: {value_detail}")),

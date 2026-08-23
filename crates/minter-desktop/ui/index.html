@@ -298,11 +298,11 @@
                 <div class="raw-col raw-col-setup">
                   <div class="raw-card raw-card-mode">
                     <div class="raw-mode-row" role="group" aria-label="Mode">
-                      <button type="button" class="raw-mode-chip active" data-preset="simpleMintUint" data-i18n="raw.modeSimple">Simple mint</button>
+                      <button type="button" class="raw-mode-chip active" data-preset="auto" data-i18n="raw.modeAuto">Auto (safe)</button>
                       <button type="button" class="raw-mode-chip" data-preset="custom" data-i18n="raw.modeCustom">Custom</button>
                     </div>
                     <p id="raw-mode-hint" class="raw-mode-hint muted small" data-i18n="raw.modeHintSimple">mint(uint256) · qty from field · fixed ETH</p>
-                    <input type="hidden" id="raw-preset" value="simpleMintUint" />
+                    <input type="hidden" id="raw-preset" value="auto" />
                   </div>
 
                   <div class="raw-card">
@@ -336,6 +336,10 @@
                         <input type="text" id="raw-contract" value="" placeholder="0x…" autocomplete="off" spellcheck="false" />
                         <button type="button" id="btn-raw-probe" class="ghost-btn" data-i18n="raw.probe">Probe</button>
                       </div>
+                    </label>
+                    <label id="raw-phase-wrap" class="raw-field-full hidden"><span data-i18n="raw.phase">Contract phase</span> <span class="req-star">*</span>
+                      <select id="raw-phase"><option value="">— probe contract first —</option></select>
+                      <span id="raw-phase-hint" class="muted small"></span>
                     </label>
                     <div id="raw-templates" class="raw-templates" aria-label="Templates">
                       <button type="button" class="raw-tpl-chip" id="raw-tpl-recent" data-i18n="raw.tplRecent">Last</button>

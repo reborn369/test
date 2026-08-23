@@ -42,6 +42,7 @@ pub mod multicall;
 pub mod opensea;
 pub mod progress;
 pub mod proxy;
+pub mod raw_archetype;
 pub mod raw_mint;
 pub mod raw_sniper;
 pub mod rpc;

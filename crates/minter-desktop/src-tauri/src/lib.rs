@@ -1918,6 +1918,8 @@ async fn raw_sniper(
         input.value_eth.clone().unwrap_or_else(|| "0".into()),
         wallet_count.to_string(),
         input.at_time.clone().unwrap_or_default(),
+        input.phase_key.clone().unwrap_or_default(),
+        input.expected_terms_hash.clone().unwrap_or_default(),
     ]);
     confirm_live_spend(
         &state,

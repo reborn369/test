@@ -29,7 +29,7 @@ pub struct RawMintConfig {
 }
 
 /// Resolve EIP-1167 / EIP-1967 proxy → implementation address (if any).
-async fn resolve_implementation(
+pub(crate) async fn resolve_implementation(
     rpc: &RpcClient,
     contract: &Address,
     bytecode: &[u8],
@@ -100,11 +100,7 @@ async fn fetch_explorer_abi_functions(
         let inputs = item
             .get("inputs")
             .and_then(|i| i.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|inp| inp.get("type").and_then(|t| t.as_str()).map(str::to_string))
-                    .collect::<Vec<_>>()
-            })
+            .map(|arr| arr.iter().filter_map(abi_input_type).collect::<Vec<_>>())
             .unwrap_or_default();
         let sig = format!("{name}({})", inputs.join(","));
         out.push((sig, "explorer".to_string()));
@@ -112,7 +108,24 @@ async fn fetch_explorer_abi_functions(
     out
 }
 
-fn explorer_api_for_chain(chain: Option<&str>) -> Option<&'static str> {
+/// Return the canonical Solidity type of an ABI input. Explorer ABIs encode a
+/// struct as `{"type":"tuple","components":[...]}`; hashing the literal word
+/// `tuple` produces the wrong selector. Rebuild `(T1,T2,...)` recursively and
+/// preserve an optional array suffix (`tuple[]`, `tuple[2]`).
+fn abi_input_type(input: &serde_json::Value) -> Option<String> {
+    let ty = input.get("type")?.as_str()?;
+    let Some(suffix) = ty.strip_prefix("tuple") else {
+        return Some(crate::abi::canonical_type_name(ty));
+    };
+    let components = input.get("components")?.as_array()?;
+    let inner = components
+        .iter()
+        .map(abi_input_type)
+        .collect::<Option<Vec<_>>>()?;
+    Some(format!("({}){suffix}", inner.join(",")))
+}
+
+pub(crate) fn explorer_api_for_chain(chain: Option<&str>) -> Option<&'static str> {
     match chain.map(str::to_ascii_lowercase).as_deref() {
         Some("robinhood" | "robinhood_chain" | "robinhood-chain") => {
             Some("https://robinhoodchain.blockscout.com")
@@ -841,4 +854,47 @@ pub async fn run_raw_mint(
         }
     }
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explorer_tuple_input_is_canonicalized() {
+        let input = serde_json::json!({
+            "type": "tuple",
+            "components": [
+                {"type": "bytes32"},
+                {"type": "bytes32[]"}
+            ]
+        });
+        assert_eq!(
+            abi_input_type(&input).as_deref(),
+            Some("(bytes32,bytes32[])")
+        );
+    }
+
+    #[test]
+    fn explorer_tuple_array_preserves_suffix() {
+        let input = serde_json::json!({
+            "type": "tuple[]",
+            "components": [
+                {"type": "uint"},
+                {"type": "address"}
+            ]
+        });
+        assert_eq!(
+            abi_input_type(&input).as_deref(),
+            Some("(uint256,address)[]")
+        );
+    }
+
+    #[test]
+    fn archetype_mint_signature_has_verified_selector() {
+        assert_eq!(
+            crate::abi::function_selector("mint((bytes32,bytes32[]),uint256,address,bytes)"),
+            [0x4a, 0x21, 0xa2, 0xdf]
+        );
+    }
 }

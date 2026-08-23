@@ -14,9 +14,10 @@ use crate::disperse::{self, DisperseConfig};
 use crate::flashbots::FlashbotsConfig;
 use crate::multicall::{self, MULTICALL3, MulticallConfig, MulticallStep};
 use crate::opensea;
-use crate::progress::MintReporter;
+use crate::progress::{FileTeeReporter, MintEvent, MintReporter};
+use crate::raw_archetype;
 use crate::raw_mint::{self, RawMintConfig};
-use crate::raw_sniper::{self, RawSniperConfig, SniperPreset, ValueMode};
+use crate::raw_sniper::{self, ArchetypeTermsGuard, RawSniperConfig, SniperPreset, ValueMode};
 use crate::rpc::RpcClient;
 use crate::settings::Settings;
 use crate::sweep::{self, AutoNftSweepConfig, SweepEthConfig};
@@ -2204,7 +2205,57 @@ impl Session {
             }
         }
         let qty = quantity.max(1) as u64;
+        let wall_now = chrono::Utc::now().timestamp();
         let preset_l = preset.trim().to_lowercase();
+
+        // Adapter detection is the safe default. Archetype phases are
+        // discovered via events but every displayed/signable term is read back
+        // from the contract and bound to an exact terms hash.
+        if let Some(inspection) = raw_archetype::inspect(&rpc, chain, &contract, qty).await? {
+            let recommended = inspection.recommended_index;
+            let selected = recommended
+                .and_then(|index| inspection.phases.get(index))
+                .cloned();
+            let summary = match selected.as_ref() {
+                Some(phase) => format!(
+                    "Archetype · {} · {} ETH total (×{qty}){}",
+                    phase.label,
+                    phase.value_eth,
+                    if phase.open { " · OPEN" } else { "" }
+                ),
+                None => format!(
+                    "Archetype · {} phase(s) found · no safe public phase selectable",
+                    inspection.phases.len()
+                ),
+            };
+            return Ok(RawProbeRow {
+                ok: true,
+                summary,
+                adapter: Some("archetype".into()),
+                implementation: inspection
+                    .implementation
+                    .map(|address| format!("{address:?}")),
+                auto_supported: recommended.is_some(),
+                recommended_phase_index: recommended,
+                phases: inspection.phases,
+                phase_type: Some("Archetype".into()),
+                open: selected.as_ref().map(|phase| phase.open).unwrap_or(false),
+                value_eth: selected.as_ref().map(|phase| phase.value_eth.clone()),
+                value_wei: selected.as_ref().map(|phase| phase.value_wei.clone()),
+                per_nft_eth: selected.as_ref().map(|phase| phase.price_eth.clone()),
+                max_supply: selected.as_ref().map(|phase| phase.max_supply.clone()),
+                total_minted: selected.as_ref().map(|phase| phase.list_supply.clone()),
+                collector_fee_eth: None,
+                phase_start: selected.as_ref().and_then(|phase| phase.start_time),
+                seconds_to_start: selected.as_ref().and_then(|phase| {
+                    phase
+                        .start_time
+                        .and_then(|start| (start > wall_now).then_some(start - wall_now))
+                }),
+                minting_paused: selected.is_none(),
+                error: None,
+            });
+        }
         // MintBay status probe only when explicitly requested (tab removed from UI).
         let is_mintbay = preset_l == "mintbaypublic" || preset_l == "mintbay";
 
@@ -2271,6 +2322,11 @@ impl Session {
                     Ok(RawProbeRow {
                         ok: true,
                         summary,
+                        adapter: Some("mintbay".into()),
+                        implementation: None,
+                        auto_supported: true,
+                        recommended_phase_index: None,
+                        phases: vec![],
                         phase_type: Some(phase.into()),
                         open,
                         value_eth: Some(value_eth),
@@ -2291,6 +2347,11 @@ impl Session {
                     Ok(RawProbeRow {
                         ok: false,
                         summary: format!("Probe failed (check Network=Robinhood + RPC). {full}"),
+                        adapter: Some("mintbay".into()),
+                        implementation: None,
+                        auto_supported: false,
+                        recommended_phase_index: None,
+                        phases: vec![],
                         phase_type: None,
                         open: false,
                         value_eth: None,
@@ -2312,9 +2373,14 @@ impl Session {
                 Ok(code) if !code.is_empty() => Ok(RawProbeRow {
                     ok: true,
                     summary: format!(
-                        "Contract OK · code {} bytes · set price manually",
+                        "Contract OK · code {} bytes · no verified auto adapter; use Custom only",
                         code.len()
                     ),
+                    adapter: Some("custom".into()),
+                    implementation: None,
+                    auto_supported: false,
+                    recommended_phase_index: None,
+                    phases: vec![],
                     phase_type: None,
                     open: false,
                     value_eth: None,
@@ -2331,6 +2397,11 @@ impl Session {
                 Ok(_) => Ok(RawProbeRow {
                     ok: false,
                     summary: "No bytecode at address".into(),
+                    adapter: None,
+                    implementation: None,
+                    auto_supported: false,
+                    recommended_phase_index: None,
+                    phases: vec![],
                     phase_type: None,
                     open: false,
                     value_eth: None,
@@ -2347,6 +2418,11 @@ impl Session {
                 Err(e) => Ok(RawProbeRow {
                     ok: false,
                     summary: format!("Probe error: {e}"),
+                    adapter: None,
+                    implementation: None,
+                    auto_supported: false,
+                    recommended_phase_index: None,
+                    phases: vec![],
                     phase_type: None,
                     open: false,
                     value_eth: None,
@@ -2409,18 +2485,38 @@ impl Session {
             .trim()
             .parse()
             .context("invalid contract address")?;
+        let reporter = match reporter {
+            Some(inner) => {
+                let log_name = format!("raw_{contract:?}");
+                match FileTeeReporter::create(inner.clone(), &log_name) {
+                    Ok(tee) => {
+                        let path = tee.path.display().to_string();
+                        let wrapped: Arc<dyn MintReporter> = Arc::new(tee);
+                        wrapped.report(MintEvent::message(format!("Full raw log file: {path}")));
+                        Some(wrapped)
+                    }
+                    Err(error) => {
+                        inner.report(MintEvent::message(format!(
+                            "WARN: could not open raw mint log file: {error}"
+                        )));
+                        Some(inner)
+                    }
+                }
+            }
+            None => None,
+        };
 
-        let preset = match input.preset.as_deref().unwrap_or("simpleMintUint") {
+        let mut preset = match input.preset.as_deref().unwrap_or("simpleMintUint") {
             "mintBayPublic" | "mintbay" | "mintBay" => SniperPreset::MintBayPublic,
             "custom" => SniperPreset::Custom,
             _ => SniperPreset::SimpleMintUint,
         };
         // UI uses fixed value; MintBay auto only if explicitly requested.
-        let value_mode = match input.value_mode.as_deref().unwrap_or("fixed") {
+        let mut value_mode = match input.value_mode.as_deref().unwrap_or("fixed") {
             "auto" => ValueMode::Auto,
             _ => ValueMode::Fixed,
         };
-        let fixed_value = {
+        let mut fixed_value = {
             let s = input.value_eth.as_deref().unwrap_or("0").trim();
             if s.is_empty() || s == "0" {
                 U256::ZERO
@@ -2429,7 +2525,7 @@ impl Session {
             }
         };
         let qty = input.quantity.unwrap_or(1).max(1);
-        let function = match preset {
+        let mut function = match preset {
             SniperPreset::MintBayPublic | SniperPreset::SimpleMintUint => input
                 .function
                 .as_deref()
@@ -2445,6 +2541,7 @@ impl Session {
                 f.to_string()
             }
         };
+        let mut params = input.params.unwrap_or_default();
         let at_time = raw_sniper::parse_sniper_at_time(input.at_time.as_deref())?;
         // Timeout: with at_time default 5 min; without default 120 min unless specified
         let timeout_secs = input
@@ -2462,6 +2559,89 @@ impl Session {
             }
         }
 
+        let adapter = input
+            .adapter
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let archetype_terms = if adapter == "archetype" {
+            let phase_key = input
+                .phase_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .context("Archetype phase key missing; reload contract phases")?;
+            let expected_terms_hash = input
+                .expected_terms_hash
+                .as_deref()
+                .map(str::trim)
+                .filter(|hash| !hash.is_empty())
+                .context("Archetype terms snapshot missing; reload contract phases")?;
+            let expected_value = input
+                .expected_value_wei
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .context("Archetype exact value snapshot missing; reload contract phases")?
+                .parse::<U256>()
+                .context("invalid Archetype expected value")?;
+            let current_value_result = raw_archetype::validate_public_terms(
+                &rpc,
+                &contract,
+                phase_key,
+                qty as u64,
+                expected_terms_hash,
+                at_time,
+            )
+            .await;
+            let current_value = match current_value_result {
+                Ok(value) => value,
+                Err(error) => {
+                    if let Some(rep) = reporter.as_ref() {
+                        rep.report(MintEvent::phase(
+                            "error",
+                            format!("Archetype validation stopped run: {error:#}"),
+                        ));
+                    }
+                    return Err(error);
+                }
+            };
+            if current_value != expected_value {
+                if let Some(rep) = reporter.as_ref() {
+                    rep.report(MintEvent::phase(
+                        "error",
+                        format!(
+                            "Archetype exact value changed: selected {expected_value} wei, current {current_value} wei"
+                        ),
+                    ));
+                }
+                bail!(
+                    "Archetype exact value changed: selected {} wei, contract now {} wei; reload phases",
+                    expected_value,
+                    current_value
+                );
+            }
+            preset = SniperPreset::Custom;
+            value_mode = ValueMode::Fixed;
+            fixed_value = current_value;
+            function = raw_archetype::MINT_SIGNATURE.into();
+            params = raw_archetype::mint_params(phase_key, qty as u64)?;
+            Some(ArchetypeTermsGuard {
+                phase_key: phase_key.to_string(),
+                expected_terms_hash: expected_terms_hash.to_string(),
+            })
+        } else {
+            if matches!(preset, SniperPreset::SimpleMintUint)
+                && raw_archetype::detect(&rpc, &contract).await?.is_some()
+            {
+                bail!(
+                    "Archetype contract detected: Simple mint(uint256) is unsafe. Reload Probe and select a verified phase in Auto mode"
+                );
+            }
+            None
+        };
+
         let gas_mult = input
             .gas_multiplier
             .and_then(|s| s.trim().parse::<f64>().ok())
@@ -2478,7 +2658,7 @@ impl Session {
             contract,
             preset,
             function,
-            params: input.params.unwrap_or_default(),
+            params,
             quantity: qty as u64,
             value_mode,
             fixed_value,
@@ -2493,6 +2673,7 @@ impl Session {
             concurrency: input.concurrency.unwrap_or(64).max(1) as usize,
             gas_limit,
             fee_refresh,
+            archetype_terms,
         };
 
         cancel.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -2691,6 +2872,11 @@ pub struct MulticallStepInput {
 pub struct RawProbeRow {
     pub ok: bool,
     pub summary: String,
+    pub adapter: Option<String>,
+    pub implementation: Option<String>,
+    pub auto_supported: bool,
+    pub recommended_phase_index: Option<usize>,
+    pub phases: Vec<raw_archetype::ArchetypePhaseRow>,
     pub phase_type: Option<String>,
     pub open: bool,
     pub value_eth: Option<String>,
@@ -2711,6 +2897,14 @@ pub struct RawProbeRow {
 pub struct RawSniperInput {
     pub chain: String,
     pub contract: String,
+    /// Verified adapter selected by probe (`archetype`); absent for Custom.
+    pub adapter: Option<String>,
+    /// Exact adapter phase key selected in the UI.
+    pub phase_key: Option<String>,
+    /// Hash binding on-chain phase state + quantity + computed value.
+    pub expected_terms_hash: Option<String>,
+    /// Exact total msg.value shown to the operator.
+    pub expected_value_wei: Option<String>,
     pub preset: Option<String>,
     pub function: Option<String>,
     pub params: Option<Vec<String>>,

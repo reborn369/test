@@ -7,6 +7,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-08-24
+
+### Added
+
+- The countdown now fires by true time rather than by this machine's clock.
+
+  A run aims at a wall-clock instant, so a computer whose clock is a second slow
+  fires a second late - and its own log still shows a countdown reaching zero
+  exactly on the mark, which is why the fault is invisible from inside. This is
+  what was behind runs that arrived about a second late with nothing in the log
+  to explain it.
+
+  Before the countdown starts, three public time servers are asked at once and
+  the reply that travelled fastest is believed; every later decision about when
+  to fire reads the corrected clock, in both the OpenSea and the raw path. One
+  line goes into the operator log saying what was found, so a wrong clock is
+  visible rather than silent.
+
+  It cannot itself make a run late. The check is skipped when the fire is less
+  than five seconds away, the whole query is capped at four seconds, and a
+  network that blocks NTP simply leaves the machine's own clock in use with the
+  log saying so - as does a failed check after a good one, which keeps the
+  correction it already had. A reading further out than an hour is reported but
+  not applied: NTP answers in UTC, so a timezone cannot produce one, and
+  silently moving a countdown by an hour is worse than leaving it alone.
+
+- Raw mint can knock before the gate opens, with a new "Push early, ms" box.
+
+  A mint succeeds in the first block whose timestamp reaches the start time, so
+  a transaction that leaves at T0 has already lost the flight time. With a lead
+  set, transactions go out early and repeat, each carrying the condition that it
+  must not be included before the start time. Early attempts are refused by the
+  node itself: no gas, no nonce, no revert. The attempt that is accepted is the
+  mint.
+
+  Wallets are spread across the interval rather than stacked on one tick, so a
+  run of fifty does not queue behind itself at the node, and the loop keeps
+  knocking for a short while past the target, so a clock running fast cannot
+  fire a single volley into a mint that has not opened yet.
+
+  The box next to it, **Measure**, fills the number in from a real measurement:
+  round trips to the chain's RPC for the flight, and the time servers for the
+  clock. Leaving the box at 0 keeps the previous behaviour exactly.
+
+- Connections are opened before they are needed, not at T0.
+
+  Authentication talks to `opensea.io` while the calldata query talks to
+  `gql.opensea.io`, so a freshly authenticated session had no connection to the
+  host that actually matters and paid DNS, TCP, TLS and HTTP/2 setup at the one
+  instant where it cannot be afforded - through a proxy, a few hundred
+  milliseconds per wallet. The connection is now opened during preparation,
+  using the CORS preflight a browser sends before the same POST, so it costs
+  nothing against the request budget.
+
+- Run metrics record what the run actually did: how long authentication took,
+  how long calldata took per wallet including any re-auth, and when each
+  transaction was acknowledged and confirmed.
+
+- Ink (chain 57073) joins the network list, across raw mint, disperse, sweep and
+  the explorer links. It is an OP-stack chain, so it inherits the elevated gas
+  floor and the L1 data fee the other Superchain networks already use.
+
+### Fixed
+
+- The dismiss button on the update banner showed a stray character instead of a
+  cross: the multiplication sign had been saved in a single-byte encoding inside
+  a UTF-8 page.
+
+- Release notes now say how to update without appearing to lose everything.
+  Wallets and settings live in the folder the program runs from, so unzipping a
+  new version "anywhere" - which is what the notes suggested - produced a
+  second, empty install while the keys stayed behind in the old folder. The
+  notes now say to unzip over the existing folder, and explain that the archive
+  holds only the program and its documentation. The update banner repeats it in
+  one line, so it is read at the moment it matters.
+
+- OpenSea logins were never cached, so every run paid a full sign-in for every
+  wallet. OpenSea moved the credential from the response body to a
+  `Set-Cookie` header; the code still read the body and got an empty string,
+  and the cache refuses to store an empty credential - so `auth_cache.bin` was
+  never written and "Warm auth" bought nothing. The token is now read from
+  either place. It lives around 84 hours, which turns sign-in from a cost paid
+  every run into one paid every few days.
+
+- Authentication no longer ignores how many proxies are configured. The old
+  ceiling of six concurrent logins meant a fifty-proxy setup ran at the speed
+  of a six-proxy one - about 13s of sign-in for 100 wallets instead of about
+  2s. Concurrency now scales with the pool, roughly one login in flight per
+  exit IP, which is the ratio measured to complete without failures, and stays
+  capped so a very large list cannot open an unbounded burst. A single shared
+  IP is still held at two.
+
+- A countdown slice can no longer be scheduled past the fire time. The ladder's
+  steps already prevented it, but nothing said so; now the rule is stated in
+  the code and held by a test, so changing the steps cannot quietly reintroduce
+  an overshoot.
+
+- Operator logs go to stderr. They are progress notes for a human, and stdout
+  belongs to whatever a caller is emitting there - a single stray log line makes
+  a JSON document unparseable at its first byte.
+
 ## [0.2.2] - 2026-08-15
 
 ### Fixed
@@ -124,7 +225,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Session / vault Debug redaction
 - Wave A–D hardening (LIVE gate, fee caps, zero-address rejects, OpenSea value checks, etc.)
 
-[Unreleased]: https://github.com/MaxBetov-pdd/Minter-rs-v2/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/MaxBetov-pdd/Minter-rs-v2/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/tag/v1.0.1
 [0.2.2]: https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/tag/v0.2.2
 [0.2.1]: https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/tag/v0.2.1
 [0.2.0]: https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/tag/v0.2.0

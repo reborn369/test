@@ -114,7 +114,7 @@ MINTER is a **self-contained desktop app**: a Rust engine (`minter-core`) wrappe
 | **Tasks** | slug → phase → wallets → **Start** (LIVE; type `LIVE` to confirm by default) |
 | **Mission Control** | Live HUD on OpenSea Start — phase, stats, per-wallet rows, mirrored log |
 | **OpenSea mint** | Wall-clock phase open → **fixed-gas** send (no estimate gate on LIVE) → on-chain confirm |
-| **Raw Mint** | Multi-wallet pre-sign race · Discover (EIP-1167/1967 proxy + 4byte) · simple `mint(uint256)` |
+| **Raw Mint** | Safe adapter mode (Archetype public native fixed-price phases) + expert Custom mode · exact on-chain price/phase lock · multi-wallet pre-sign race |
 | **Advanced** | Sweep ETH/NFT, disperse, multicall helpers; Flashbots path on **Ethereum mainnet only** |
 | **RPC** | Private Alchemy multi-chain (your key only) · **per-endpoint ping** tagged by origin, so a paid node is never confused with the public fallback appended to every chain · the mint log names which endpoint leads and which one accepted each broadcast |
 | **Reliability** | A broadcast that times out is checked against the chain instead of being called a failure, the signed hash is kept, and a run ends with a reconciliation pass — a mint that landed is never reported as lost |
@@ -135,7 +135,7 @@ MINTER is a **self-contained desktop app**: a Rust engine (`minter-core`) wrappe
 **The rule:** `SENT` = broadcast only. **A mint is a win only after block confirmation.** Receipts are polled across all RBF replacement hashes, so a fee bump can't lose the result.
 
 - **OpenSea LIVE** opens on the **wall clock** (not `block.timestamp`), sends with **fixed gas** (no `eth_estimateGas` gate on live), and decodes SeaDrop `NotActive` (`0x13da22f2`) near open for clear logs.
-- **Raw sniper** resolves calldata + value, **pre-signs** every wallet at T−5s, fires on a millisecond clock, and blasts in parallel — receipts are kept off the hot path. On mainnet, fees are re-signed at fire.
+- **Raw sniper Auto** identifies a supported contract family, reads phases and exact total value on-chain, and locks reviewed terms. It validates them again at T−5s, **pre-signs** every wallet, fires on a millisecond clock, and blasts in parallel — no RPC read is added at T0. Unsupported, allowlist-proof, ERC-20, and dynamic-price phases fail closed; **Custom** remains an explicit expert path. On mainnet, fees are re-signed at fire.
 
 <br>
 

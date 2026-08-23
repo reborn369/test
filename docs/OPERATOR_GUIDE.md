@@ -88,10 +88,12 @@ Binary: `target\release\minter-desktop.exe`
 
 Sidebar **Raw Mint** (not Tasks):
 
-1. Network + contract (`0x…`; proxies EIP-1167/1967 resolved when possible)
-2. Simple mode: qty per wallet, ETH price per NFT, wallets, gas limit, optional fire timestamp
-3. Advanced → **Dry run** first
-4. **Start** / **Send now**
+1. Select the network, enter the contract (`0x…`), quantity per wallet, then use **Auto / Load phases**.
+2. For supported Archetype contracts, select a public native fixed-price phase. The app reads the exact total value and phase terms on-chain; do not enter a price manually.
+3. Select wallets, gas limit, and optional fire timestamp. **Start** validates the saved terms again at T−5s, then pre-signs without adding an RPC read at T0.
+4. A changed price, time window, payment token, or phase configuration aborts before signing and asks you to reload/review.
+5. Allowlist phases requiring proofs, ERC-20 payments, dynamic/Dutch prices, and unknown contract families are deliberately unavailable in Auto. Use **Custom** only when you have verified ABI, arguments, and total `msg.value`; **Send now** is Custom-only.
+6. Advanced → **Dry run** first when testing a new Custom call.
 
 Flashbots: Ethereum mainnet only.
 

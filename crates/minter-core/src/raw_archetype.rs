@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
+use alloy_primitives::{Address, B256, U256, keccak256};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -37,7 +37,7 @@ pub struct InviteState {
     pub unit_size: u64,
     pub token_address: Address,
     pub is_blacklist: bool,
-    raw: Bytes,
+    raw: Vec<u8>,
 }
 
 impl InviteState {
@@ -118,29 +118,30 @@ fn word_u64(data: &[u8], index: usize, label: &str) -> Result<u64> {
         .with_context(|| format!("Archetype {label} does not fit u64"))
 }
 
-fn decode_invite(data: Bytes) -> Result<InviteState> {
+fn decode_invite(data: impl AsRef<[u8]>) -> Result<InviteState> {
+    let data = data.as_ref();
     if data.len() < 11 * 32 {
         bail!(
             "Archetype invites(bytes32) returned {} bytes, expected at least 352",
             data.len()
         );
     }
-    let token_word = word(&data, 9)?;
+    let token_word = word(data, 9)?;
     let mut token = [0u8; 20];
     token.copy_from_slice(&token_word[12..]);
     Ok(InviteState {
-        price: word_u256(&data, 0)?,
-        reserve_price: word_u256(&data, 1)?,
-        delta: word_u256(&data, 2)?,
-        start: word_u64(&data, 3, "start")?,
-        end: word_u64(&data, 4, "end")?,
-        limit: word_u256(&data, 5)?,
-        max_supply: word_u256(&data, 6)?,
-        interval: word_u256(&data, 7)?,
-        unit_size: word_u64(&data, 8, "unitSize")?.max(1),
+        price: word_u256(data, 0)?,
+        reserve_price: word_u256(data, 1)?,
+        delta: word_u256(data, 2)?,
+        start: word_u64(data, 3, "start")?,
+        end: word_u64(data, 4, "end")?,
+        limit: word_u256(data, 5)?,
+        max_supply: word_u256(data, 6)?,
+        interval: word_u256(data, 7)?,
+        unit_size: word_u64(data, 8, "unitSize")?.max(1),
         token_address: Address::from(token),
-        is_blacklist: !word_u256(&data, 10)?.is_zero(),
-        raw: data,
+        is_blacklist: !word_u256(data, 10)?.is_zero(),
+        raw: data.to_vec(),
     })
 }
 

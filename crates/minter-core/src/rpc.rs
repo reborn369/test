@@ -1270,9 +1270,7 @@ impl RpcClient {
                     if known.contains("already known") || known.contains("known transaction") {
                         let winner = Self::short_url(&url);
                         if !set.is_empty() {
-                            tokio::spawn(async move {
-                                while set.join_next().await.is_some() {}
-                            });
+                            tokio::spawn(async move { while set.join_next().await.is_some() {} });
                         }
                         return Ok(SendReport {
                             hash: expected_hash,

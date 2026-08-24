@@ -1254,6 +1254,14 @@ const GQL_STAGGER_MAX_SPREAD_MS: u64 = 1_500;
 /// so a 30-second lead cannot be reaped before T0.
 const CONNECTION_WARM_LEAD_MS: i64 = 30_000;
 
+// Warming earlier than the HTTP pool retains an idle connection would pay the
+// proxy/TLS handshake twice and still put one on T0. Keep that impossible at
+// compile time when either constant is changed later.
+const _: () = assert!(
+    CONNECTION_WARM_LEAD_MS < opensea::HTTP_POOL_IDLE_TIMEOUT_MS,
+    "OpenSea connections warmed this early are reaped before the fire"
+);
+
 fn connection_warm_budget_ms(wallets: usize) -> u64 {
     const CAP_MS: u64 = (CONNECTION_WARM_LEAD_MS as u64).saturating_sub(8_000);
     (2_000 + 200 * wallets as u64).min(CAP_MS)

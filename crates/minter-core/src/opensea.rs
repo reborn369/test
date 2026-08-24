@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 const OPENSEA_ORIGIN: &str = "https://opensea.io";
 const GQL_URL: &str = "https://gql.opensea.io/graphql";
+pub(crate) const HTTP_POOL_IDLE_TIMEOUT_MS: i64 = 10 * 60 * 1_000;
 const DEFAULT_SEADROP_ADDRESS: &str = "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5";
 const DEFAULT_FEE_RECIPIENT: &str = "0x0000a26b00c1F0DF003000390027140000fAa719";
 
@@ -204,7 +205,9 @@ pub fn build_client_with_cookie_jar_and_proxy(
         // reqwest default evicts pooled sockets after 90s, which puts proxy
         // CONNECT + TLS back on the T0 calldata path.  Keep the per-wallet
         // tunnel available for the whole normal waiting window instead.
-        .pool_idle_timeout(std::time::Duration::from_secs(10 * 60))
+        .pool_idle_timeout(std::time::Duration::from_millis(
+            HTTP_POOL_IDLE_TIMEOUT_MS as u64,
+        ))
         .tcp_keepalive(std::time::Duration::from_secs(30))
         .http2_keep_alive_interval(std::time::Duration::from_secs(30))
         .http2_keep_alive_timeout(std::time::Duration::from_secs(5))

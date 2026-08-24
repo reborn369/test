@@ -1249,6 +1249,16 @@ const GQL_STAGGER_STEP_MS: u64 = 25;
 /// Ceiling on the spread within a single IP's group.
 const GQL_STAGGER_MAX_SPREAD_MS: u64 = 1_500;
 
+/// Warm the per-wallet OpenSea transport while the countdown still has enough
+/// slack for large proxy pools. Our clients keep idle sockets for ten minutes,
+/// so a 30-second lead cannot be reaped before T0.
+const CONNECTION_WARM_LEAD_MS: i64 = 30_000;
+
+fn connection_warm_budget_ms(wallets: usize) -> u64 {
+    const CAP_MS: u64 = (CONNECTION_WARM_LEAD_MS as u64).saturating_sub(8_000);
+    (2_000 + 200 * wallets as u64).min(CAP_MS)
+}
+
 /// Gap to leave between the calldata requests of wallets on the same proxy.
 ///
 /// The budget is per exit IP, so wallets on *different* proxies do not compete
@@ -2219,7 +2229,7 @@ async fn run_opensea_mint_inner(
         );
     }
 
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::timing::true_now_secs();
     let default_pick = stages
         .iter()
         .enumerate()
@@ -2274,7 +2284,7 @@ async fn run_opensea_mint_inner(
         default_pick
     };
     if opts.phase_index.is_none() {
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::timing::true_now_secs();
         let selected_has_started = stages[pick]
             .start_time
             .map(|timestamp| timestamp as i64 <= now)
@@ -2310,7 +2320,7 @@ async fn run_opensea_mint_inner(
     }
     let _ = (auto_mode, &phase_labels);
     let stage = &stages[pick];
-    if opensea::stage_is_expired_at(stage, chrono::Utc::now().timestamp()) {
+    if opensea::stage_is_expired_at(stage, crate::timing::true_now_secs()) {
         bail!(
             "Selected phase {} is closed (ended at unix {:.0}); reload phases and choose an open/upcoming phase",
             opensea::stage_label(stage),
@@ -2431,7 +2441,7 @@ async fn run_opensea_mint_inner(
                 // Safer defaults: fewer parallel OS drop calls (less 429).
                 (if direct_route_count > 0 { 2 } else { 0 })
                     + if proxied_route_count > 0 {
-                        unique_proxy_count.clamp(2, 4)
+                        crate::safety_policy::default_auth_concurrency(unique_proxy_count)
                     } else {
                         0
                     }
@@ -2645,7 +2655,7 @@ async fn run_opensea_mint_inner(
     if conditional_submit_enabled {
         let start = stage_start_ts
             .context("Conditional submit needs a phase start or explicit future At time")?;
-        if start.saturating_mul(1000) <= chrono::Utc::now().timestamp_millis() {
+        if start.saturating_mul(1000) <= crate::timing::true_now_ms() {
             bail!(
                 "Conditional submit needs a future fire time; set At time or select a future phase"
             );
@@ -2941,7 +2951,14 @@ async fn run_opensea_mint_inner(
         // lags ~1 block (~12s on L1) — that is why logs showed "opens in ~1s" then
         // "Phase is open!" only ~12s later. Fire on wall clock.
         let target_ms = start_ts.saturating_mul(1000);
-        let before_wait_ms = chrono::Utc::now().timestamp_millis();
+        // Correct the clock before any late/early decision. The bounded NTP
+        // query is skipped when T0 is already close, so it cannot delay fire.
+        if target_ms.saturating_sub(chrono::Utc::now().timestamp_millis())
+            > crate::timing::CLOCK_SYNC_MIN_LEAD_MS
+        {
+            log_always(reporter.as_ref(), crate::timing::sync_clock().await);
+        }
+        let before_wait_ms = crate::timing::true_now_ms();
         if before_wait_ms >= target_ms {
             log_always(
                 reporter.as_ref(),
@@ -3014,7 +3031,7 @@ async fn run_opensea_mint_inner(
             if cancelled(&cancel) {
                 bail!("Mint cancelled while waiting for phase open");
             }
-            let wall_ms = chrono::Utc::now().timestamp_millis();
+            let wall_ms = crate::timing::true_now_ms();
             let remaining_ms = target_ms.saturating_sub(wall_ms);
             if remaining_ms <= 0 {
                 break;
@@ -3050,9 +3067,12 @@ async fn run_opensea_mint_inner(
             // Auth/eligibility often finishes minutes before a scheduled mint.
             // Warm each wallet's exact proxy -> gql.opensea.io connection outside
             // the hot path.  Never start this close enough to threaten T0.
-            if !gql_warm_started && !local_public_prefetch && remaining_ms <= 10_000 {
+            if !gql_warm_started
+                && !local_public_prefetch
+                && remaining_ms <= CONNECTION_WARM_LEAD_MS
+            {
                 gql_warm_started = true;
-                if remaining_ms >= 6_000 {
+                if remaining_ms >= 8_000 {
                     let mut warm_jobs = tokio::task::JoinSet::new();
                     for wallet in wallets.iter().filter(|wallet| wallet.auth_ok) {
                         if let Some(session) = wallet.session.clone() {
@@ -3060,7 +3080,7 @@ async fn run_opensea_mint_inner(
                             warm_jobs.spawn(async move {
                                 let started = std::time::Instant::now();
                                 let result = tokio::time::timeout(
-                                    std::time::Duration::from_secs(3),
+                                    std::time::Duration::from_secs(20),
                                     opensea::warm_gql_connection(&session),
                                 )
                                 .await;
@@ -3069,8 +3089,10 @@ async fn run_opensea_mint_inner(
                         }
                     }
                     let total = warm_jobs.len();
+                    let budget_ms = connection_warm_budget_ms(total)
+                        .min(remaining_ms.saturating_sub(8_000) as u64);
                     let deadline =
-                        std::time::Instant::now() + std::time::Duration::from_millis(3_200);
+                        std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
                     let mut ready = 0usize;
                     let mut latencies = Vec::new();
                     while !warm_jobs.is_empty() {
@@ -3096,13 +3118,22 @@ async fn run_opensea_mint_inner(
                     log_always(
                         reporter.as_ref(),
                         format!(
-                            "OpenSea GQL transport warm: {ready}/{total} ready{latency}; mint-action budget untouched"
+                            "OpenSea GQL transport warm: {ready}/{total} ready{latency}; budget={budget_ms}ms; mint-action budget untouched"
                         ),
                     );
+                    if ready < total {
+                        log_always(
+                            reporter.as_ref(),
+                            format!(
+                                "WARN: {} wallet(s) did not warm before the safety cutoff and may pay a TLS handshake at T0",
+                                total - ready
+                            ),
+                        );
+                    }
                 } else {
                     log_always(
                         reporter.as_ref(),
-                        "OpenSea GQL transport warm skipped: less than 6s to T0".to_string(),
+                        "OpenSea GQL transport warm skipped: less than 8s to T0".to_string(),
                     );
                 }
             }
@@ -3487,7 +3518,7 @@ async fn run_opensea_mint_inner(
             .count();
         scheduled_fire_lag_ms = Some(fire_lag_ms_from_clock(
             start_ts,
-            chrono::Utc::now().timestamp_millis(),
+            crate::timing::true_now_ms(),
         ));
     }
 
@@ -3505,7 +3536,7 @@ async fn run_opensea_mint_inner(
             &state,
             expected_unit_price_wei,
             quantity,
-            chrono::Utc::now().timestamp(),
+            crate::timing::true_now_secs(),
         )?;
         let resolved_fee_recipient =
             resolve_public_fee_recipient(&state, fee_recipient.as_deref())?;
@@ -3676,7 +3707,7 @@ async fn run_opensea_mint_inner(
             let fee_ceiling = max_fee.saturating_mul(U256::from(4u64)).max(max_fee);
             // Product rule: LIVE OpenSea mint is always fixed-gas / fast.
             // No separate "sniper mode". Dry-run still estimates unless skip flags.
-            let wall_at_spawn = chrono::Utc::now().timestamp();
+            let wall_at_spawn = crate::timing::true_now_secs();
             let auto_skip_estimate = dry_run_w
                 && !skip_preflight_w
                 && !skip_estimate_on_open
@@ -3905,7 +3936,7 @@ async fn run_opensea_mint_inner(
                                             attempt = attempt.saturating_sub(1);
                                             continue;
                                         }
-                                        let now_wall = chrono::Utc::now().timestamp();
+                                        let now_wall = crate::timing::true_now_secs();
                                         if is_gql_action_not_ready(
                                             &err_str,
                                             stage_start_ts_w,
@@ -4032,7 +4063,7 @@ async fn run_opensea_mint_inner(
                                     attempt = attempt.saturating_sub(1);
                                     continue;
                                 }
-                                let now_wall = chrono::Utc::now().timestamp();
+                                let now_wall = crate::timing::true_now_secs();
                                 if is_gql_action_not_ready(
                                     &err_str,
                                     stage_start_ts_w,
@@ -4271,7 +4302,7 @@ async fn run_opensea_mint_inner(
                         }
                         Err(e) => {
                             let raw = format!("{}", e);
-                            let now_wall = chrono::Utc::now().timestamp();
+                            let now_wall = crate::timing::true_now_secs();
                             let (enriched, force_fixed, wait_override) =
                                 estimate_fail_policy(&raw, stage_start_ts_w, now_wall);
                             mint_log(reporter.as_ref(), quiet_w,
@@ -4362,7 +4393,7 @@ async fn run_opensea_mint_inner(
                             }
                             Err(e) => {
                                 let raw = format!("{}", e);
-                                let now_wall = chrono::Utc::now().timestamp();
+                                let now_wall = crate::timing::true_now_secs();
                                 let (enriched, force_fixed, wait_override) =
                                     estimate_fail_policy(&raw, stage_start_ts_w, now_wall);
                                 log_always(reporter.as_ref(), format!("[{}] estimate_gas FAIL {}ms: {}",

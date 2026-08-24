@@ -3,8 +3,8 @@
 Short first-run guide for the Windows desktop app. Full walkthrough in Russian: [`USER_GUIDE.md`](../USER_GUIDE.md).
 
 **Version:** 0.1.0  
-**Author:** [X @AndarkFomo](https://x.com/AndarkFomo) · [Telegram](https://t.me/grassfoundationn)  
-**Source:** [github.com/MaxBetov-pdd/Minter-rs-v2](https://github.com/MaxBetov-pdd/Minter-rs-v2)
+**Build:** private standalone MINTER Reactive
+**Source:** private repository `blcksquare7-png/Minter-Reactive-private`
 
 ---
 
@@ -38,7 +38,7 @@ Not affiliated with OpenSea. You are responsible for keys, funds, and compliance
 
 ### Option A — Release zip
 
-1. Download `minter-desktop-*-windows.zip` from [Releases](https://github.com/MaxBetov-pdd/Minter-rs-v2/releases)
+1. Download `minter-desktop-*-windows.zip` from private Actions/Releases
 2. Verify SHA256 if a `.sha256` file is provided
 3. Unzip to a folder (e.g. `C:\Minter\`)
 4. Run `minter-desktop.exe`  
@@ -49,7 +49,7 @@ Not affiliated with OpenSea. You are responsible for keys, funds, and compliance
 Prerequisites: Rust (stable), MSVC C++ build tools, WebView2.
 
 ```powershell
-git clone https://github.com/MaxBetov-pdd/Minter-rs-v2
+git clone https://github.com/blcksquare7-png/Minter-Reactive-private
 cd minter-rs
 cargo run -p minter-desktop --release
 ```

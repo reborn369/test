@@ -1263,6 +1263,26 @@ impl RpcClient {
                     });
                 }
                 Ok((url, Err(e), latency_ms)) => {
+                    // Re-broadcasting identical signed bytes is deliberate.
+                    // A node saying it already has them is a positive ACK, not
+                    // an all-nodes failure (especially after conditional push).
+                    let known = e.to_ascii_lowercase();
+                    if known.contains("already known") || known.contains("known transaction") {
+                        let winner = Self::short_url(&url);
+                        if !set.is_empty() {
+                            tokio::spawn(async move {
+                                while set.join_next().await.is_some() {}
+                            });
+                        }
+                        return Ok(SendReport {
+                            hash: expected_hash,
+                            winner,
+                            nodes_tried: max_attempts,
+                            winner_latency_ms: latency_ms,
+                            http_attempts,
+                            losers,
+                        });
+                    }
                     let msg = format!("{} ({}ms): {}", Self::short_url(&url), latency_ms, e);
                     crate::rlog!("RPC send failed: {}", msg);
                     losers.push(msg);

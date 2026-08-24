@@ -76,7 +76,6 @@ document.addEventListener("click", (e) => {
   e.preventDefault();
   openExternalUrl(a.href).catch(console.warn);
 });
-
 const ROW_H = 36;
 const OVERSCAN = 8;
 const TASK_WALLET_ROW_H = 40;
@@ -899,7 +898,6 @@ btnUnlock.addEventListener("click", async () => {
     $("unlock-error").textContent = String(e);
   }
 });
-
 // Sidebar nav
 document.querySelectorAll(".nav-item[data-page]").forEach((btn) => {
   btn.addEventListener("click", () => navigate(btn.dataset.page));
@@ -3870,6 +3868,9 @@ async function runRawSniperOnce() {
   if (!Number.isFinite(timeoutSecs) || timeoutSecs < 30) timeoutSecs = 1800;
   let atTime = rawAtTimeUnix();
   if ($("raw-at")) $("raw-at").value = atTime || "";
+  const pushLeadMs = atTime
+    ? Math.max(0, Math.min(3000, parseInt($("raw-push-lead")?.value || "0", 10) || 0))
+    : 0;
 
   const valueMode = "fixed";
   const valueEth = rawEffectiveValueEth();
@@ -3904,6 +3905,7 @@ async function runRawSniperOnce() {
       valueEth,
       wallets.length,
       atTime || "",
+      pushLeadMs,
       adapterPhase?.key || "",
       adapterPhase?.termsHash || "",
     ]),
@@ -3959,6 +3961,7 @@ async function runRawSniperOnce() {
         gasMult: $("raw-gas-mult")?.value || "",
         gasLimit: $("raw-gas-limit")?.value || "",
         feeRefreshL2: !!$("raw-fee-refresh-l2")?.checked,
+        pushLeadMs,
       })
     );
   } catch (_) {}
@@ -3996,6 +3999,8 @@ async function runRawSniperOnce() {
         gasMultiplier: null,
         gasLimit,
         feeRefreshAtFire,
+        pushLeadMs,
+        pushIntervalMs: 25,
       },
     });
     appendRawLog("\n" + formatSweepRows(rows));
@@ -4048,6 +4053,9 @@ try {
     if (saved.maxFee != null && $("raw-max-fee")) $("raw-max-fee").value = saved.maxFee;
     if (saved.gasMult != null && $("raw-gas-mult")) $("raw-gas-mult").value = saved.gasMult;
     if (saved.gasLimit != null && $("raw-gas-limit")) $("raw-gas-limit").value = saved.gasLimit;
+    if (saved.pushLeadMs != null && $("raw-push-lead")) {
+      $("raw-push-lead").value = saved.pushLeadMs;
+    }
     if (saved.fn && $("raw-fn") && rawPreset() === "custom") $("raw-fn").value = saved.fn;
     if (saved.params && $("raw-params")) $("raw-params").value = saved.params;
   }
@@ -4089,6 +4097,32 @@ $("raw-chain")?.addEventListener("change", () => {
   scheduleRawProbe();
 });
 $("raw-qty")?.addEventListener("change", scheduleRawProbe);
+$("btn-raw-lag")?.addEventListener("click", async () => {
+  const button = $("btn-raw-lag");
+  const output = $("raw-lag-out");
+  const chain = $("raw-chain")?.value || "";
+  if (!chain) {
+    if (output) output.textContent = t("raw.lagNoChain") || "Pick a network first";
+    return;
+  }
+  button.disabled = true;
+  if (output) output.textContent = "…";
+  try {
+    const result = await invoke("measure_fire_lag", { input: { chain } });
+    if ($("raw-push-lead")) $("raw-push-lead").value = String(result.suggestedLeadMs);
+    const clock = result.clockOffsetMs == null
+      ? (t("raw.lagClockUnknown") || "clock unknown")
+      : `${t("raw.lagClock") || "clock"} ${result.clockOffsetMs > 0 ? "+" : ""}${result.clockOffsetMs}ms`;
+    if (output) {
+      output.textContent = `${t("raw.lagFlight") || "flight"} ${result.oneWayMs}ms · ${clock} · RTT ${result.rttMinMs}/${result.rttMedianMs} → ${result.suggestedLeadMs}ms`;
+      output.title = `${result.summary}\n${result.clockSource}`;
+    }
+  } catch (error) {
+    if (output) output.textContent = String(error);
+  } finally {
+    button.disabled = false;
+  }
+});
 $("btn-raw-balances")?.addEventListener("click", async () => {
   const w = selectedRawWallets();
   const all = w.length
@@ -7256,55 +7290,3 @@ document.addEventListener("keydown", (e) => {
     }
   }
 });
-
-// —— Update check ——
-// The desktop ships as an unsigned binary people download by hand, so nothing
-// otherwise tells them a newer build exists. Ask once per launch, well after
-// startup so it can never compete with the UI coming up, and stay silent unless
-// there is genuinely something newer. A dismissed version is not shown again.
-const UPDATE_DISMISS_KEY = "minter.updateDismissed";
-
-async function checkForUpdate() {
-  let info;
-  try {
-    info = await invoke("check_for_update");
-  } catch (e) {
-    console.warn("update check failed", e);
-    return;
-  }
-  if (!info || !info.updateAvailable || !info.latest) return;
-  // Respect a dismissal, but only for that exact version — a later release
-  // must surface again.
-  try {
-    if (localStorage.getItem(UPDATE_DISMISS_KEY) === info.latest) return;
-  } catch (_) {}
-
-  const banner = $("update-banner");
-  const text = $("update-text");
-  const link = $("update-link");
-  if (!banner || !text || !link) return;
-
-  text.textContent = (
-    t("update.available") || "Version {latest} is available — you have {current}"
-  )
-    .replace("{latest}", info.latest)
-    .replace("{current}", info.current);
-  if (info.url) link.href = info.url;
-  banner.classList.remove("hidden");
-
-  $("update-dismiss")?.addEventListener(
-    "click",
-    () => {
-      banner.classList.add("hidden");
-      try {
-        localStorage.setItem(UPDATE_DISMISS_KEY, info.latest);
-      } catch (_) {}
-    },
-    { once: true }
-  );
-}
-
-// Delayed so a slow or unreachable network cannot hold up the first paint.
-setTimeout(() => {
-  checkForUpdate().catch((e) => console.warn("update check", e));
-}, 4000);

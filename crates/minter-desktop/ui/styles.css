@@ -4577,43 +4577,6 @@ textarea#add-key {
   margin-inline: auto;
 }
 
-/* Update banner — quiet, dismissible, never covers the app */
-.update-banner {
-  position: fixed;
-  top: 12px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 900;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 8px 12px 8px 16px;
-  border-radius: 999px;
-  font-size: 13px;
-  background: var(--accent-soft);
-  color: var(--accent-ink);
-  border: 1px solid var(--accent-border);
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
-}
-.update-banner a {
-  font-weight: 700;
-  color: inherit;
-  text-decoration: underline;
-}
-.update-dismiss {
-  background: none;
-  border: none;
-  color: inherit;
-  font-size: 18px;
-  line-height: 1;
-  cursor: pointer;
-  padding: 0 2px;
-  opacity: 0.7;
-}
-.update-dismiss:hover {
-  opacity: 1;
-}
-
 .raw-value-fixed input[readonly] {
   color: var(--green);
   background: color-mix(in srgb, var(--green) 8%, var(--input));
@@ -5047,12 +5010,6 @@ details.panel[open] > *:not(summary),
 .mint-phase-banner.mint-phase-done,
 .mint-phase-banner.mint-phase-fire {
   box-shadow: none;
-}
-
-.update-banner {
-  border-radius: 10px;
-  background: #171d2a;
-  box-shadow: var(--shadow-lg);
 }
 
 .unlock-view {

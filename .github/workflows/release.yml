@@ -117,15 +117,8 @@ jobs:
             ### Linux VPS — run it 24/7 near the chain
             On a fresh Linux server — Ubuntu, Debian, Fedora, RHEL or Arch, no desktop required:
 
-            ```bash
-            curl -fsSL https://raw.githubusercontent.com/MaxBetov-pdd/Minter-rs-v2/main/deploy/linux/install.sh | sudo bash
-            ```
-
-            The installer pulls `minter-desktop-*-linux-x64.tar.gz` from this
-            release, sets up the service, and prints how to connect.
-
-            Then drive the GUI from Windows with the connector:
-            <https://github.com/MaxBetov-pdd/minter-connect>
+            Use the checked-in `deploy/linux/install.sh` from this private
+            repository. Do not pipe remote installer scripts into a shell.
 
             ### Safety
             - **Burner wallets only.**

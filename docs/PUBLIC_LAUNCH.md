@@ -39,7 +39,7 @@ GitHub → **Settings → General → Danger Zone → Change visibility → Publ
 ## 4. About box
 
 - Description: `Local Windows desktop for OpenSea drop mints & raw-contract sniping. Rust + Tauri 2.`
-- Website: `https://x.com/AndarkFomo` (or your site)
+- Website: configure your own private project link if needed
 - Topics: `rust` `tauri` `opensea` `nft` `mint` `seadrop` `ethereum` `windows`
 - License: MIT OR Apache-2.0 (should auto-detect)
 

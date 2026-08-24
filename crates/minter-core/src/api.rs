@@ -2442,6 +2442,12 @@ impl Session {
         }
     }
 
+    /// Measure clock drift plus minimum one-way RPC latency for a scheduled fire.
+    pub async fn measure_fire_lag(&self, chain: &str) -> Result<crate::timing::FireLagReport> {
+        let rpc = self.rpc_client_for_chain(chain)?;
+        crate::timing::measure_fire_lag(&rpc).await
+    }
+
     /// Raw sniper: pre-sign race — clock fire at `at_time`, blast send (no estimate at T0).
     /// Live runs require typed `LIVE` when `require_live_confirm` is on (`input.confirm`).
     pub async fn raw_sniper(
@@ -2675,6 +2681,8 @@ impl Session {
             concurrency: input.concurrency.unwrap_or(64).max(1) as usize,
             gas_limit,
             fee_refresh,
+            push_lead_ms: input.push_lead_ms.unwrap_or(0),
+            push_interval_ms: input.push_interval_ms.unwrap_or(25),
             archetype_terms,
         };
 
@@ -2935,6 +2943,10 @@ pub struct RawSniperInput {
     pub gas_limit: Option<u64>,
     /// Fee refresh at fire: mainnetOnly | always | never (default settings / mainnetOnly).
     pub fee_refresh_at_fire: Option<String>,
+    /// Opt-in conditional submit lead. Zero keeps the ordinary exact-T0 blast.
+    pub push_lead_ms: Option<u64>,
+    /// Delay between conditional attempts while the provider says "not yet".
+    pub push_interval_ms: Option<u64>,
 }
 
 /// Serializable sweep/mint row for desktop UI.

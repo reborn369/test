@@ -116,12 +116,14 @@ pub fn should_refresh_fees_at_fire(chain_id: u64, mode: FeeRefreshMode) -> bool 
     }
 }
 
-/// Default auth concurrency: low without proxies, modest with proxies.
+/// Default SIWE concurrency. OpenSea rate-limits by source IP, so a proxy pool
+/// may safely run roughly one login per distinct exit while a direct route must
+/// stay conservative. The ceiling prevents an unbounded burst.
 pub fn default_auth_concurrency(proxy_count: usize) -> usize {
     if proxy_count == 0 {
         2
     } else {
-        proxy_count.clamp(2, 6)
+        proxy_count.clamp(2, 48)
     }
 }
 
@@ -188,7 +190,9 @@ mod tests {
     fn auth_concurrency_defaults() {
         assert_eq!(default_auth_concurrency(0), 2);
         assert_eq!(default_auth_concurrency(1), 2);
-        assert_eq!(default_auth_concurrency(10), 6);
+        assert_eq!(default_auth_concurrency(10), 10);
+        assert_eq!(default_auth_concurrency(50), 48);
+        assert_eq!(default_auth_concurrency(500), 48);
         assert_eq!(auth_concurrency_after_rate_limit(), 1);
     }
 }

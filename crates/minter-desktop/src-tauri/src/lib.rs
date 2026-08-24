@@ -920,6 +920,25 @@ async fn warm_rpc_latency(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct FireLagInput {
+    chain: String,
+}
+
+#[tauri::command]
+async fn measure_fire_lag(
+    state: State<'_, Arc<AppState>>,
+    input: FireLagInput,
+) -> Result<minter_core::FireLagReport, String> {
+    let _slot = net_slot(&state).await?;
+    let session = state.session.lock().clone();
+    session
+        .measure_fire_lag(&input.chain)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawProbeInput {
     chain: String,
     contract: String,
@@ -1695,18 +1714,6 @@ fn parse_at_time(raw: String) -> Result<Option<i64>, String> {
 #[tauri::command]
 fn mint_running(state: State<'_, Arc<AppState>>) -> bool {
     state.mint_running()
-}
-
-/// Is a newer release published?
-///
-/// The desktop ships as an unsigned binary people download by hand, so nothing
-/// otherwise tells them a fix exists. This only *reports* — it never downloads
-/// or installs anything, and it sends nothing about the operator. Any failure
-/// (offline, rate limited) comes back as "no update known" with a note rather
-/// than an error the operator has to dismiss.
-#[tauri::command]
-async fn check_for_update() -> Result<minter_core::update::UpdateInfo, String> {
-    Ok(minter_core::update::check_for_update(minter_core::update::DEFAULT_REPO).await)
 }
 
 #[tauri::command]
@@ -2614,6 +2621,7 @@ pub fn run() {
             wallet_balances,
             probe_networks,
             warm_rpc_latency,
+            measure_fire_lag,
             load_wallet_meta,
             save_wallet_meta,
             pick_files,
@@ -2655,7 +2663,6 @@ pub fn run() {
             read_text_file,
             cancel_mint,
             mint_running,
-            check_for_update,
             load_wl_for_slug,
         ])
         .run(tauri::generate_context!())

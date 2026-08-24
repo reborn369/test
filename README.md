@@ -5,8 +5,7 @@
 
 <!-- Badges -->
 <p align="center">
-  <a href="https://github.com/MaxBetov-pdd/Minter-rs-v2/actions/workflows/ci.yml"><img src="https://github.com/MaxBetov-pdd/Minter-rs-v2/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/latest"><img src="https://img.shields.io/github/v/release/MaxBetov-pdd/Minter-rs-v2?style=flat-square&label=release" alt="Release"></a>
+  <a href="https://github.com/blcksquare7-png/Minter-Reactive-private/actions/workflows/ci.yml"><img src="https://github.com/blcksquare7-png/Minter-Reactive-private/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/engine-Rust-000000?style=flat-square&logo=rust&logoColor=white" alt="Rust">
   <img src="https://img.shields.io/badge/desktop-Tauri%202-0a101c?style=flat-square&logo=tauri&logoColor=57c06b" alt="Tauri 2">
   <img src="https://img.shields.io/badge/platform-Windows-0a101c?style=flat-square&logo=windows&logoColor=white" alt="Windows">
@@ -47,7 +46,7 @@
 
 ### Release binary (Windows)
 
-1. Download the latest **`minter-desktop-*-windows-x64.zip`** from [Releases](https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/latest)
+1. Download the latest **`minter-desktop-*-windows-x64.zip`** from the private repository Actions/Releases page
 2. Verify the SHA256 checksum when provided
 3. Unzip → run `minter-desktop.exe`
 4. Settings → Alchemy API key → Proxies → **Check Connection**
@@ -55,21 +54,13 @@
 
 ### Headless Linux server
 
-One command on a fresh VPS — Ubuntu 22.04+, Debian 12+, Fedora 36+, RHEL 9+ or
-Arch. No desktop environment, no Rust toolchain:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/MaxBetov-pdd/Minter-rs-v2/main/deploy/linux/install.sh | sudo bash
-```
-
-Then reach the GUI from Windows with
-[minter-connect](https://github.com/MaxBetov-pdd/minter-connect) — it sets up
-the SSH tunnel and opens the browser for you.
+Use the checked-in `deploy/linux/install.sh` from this private repository. Do
+not pipe an installer from an unrelated public repository into the server.
 
 ### From source
 
 ```powershell
-git clone https://github.com/MaxBetov-pdd/Minter-rs-v2
+git clone https://github.com/blcksquare7-png/Minter-Reactive-private
 cd minter-rs
 cargo run -p minter-desktop --release
 ```
@@ -144,7 +135,7 @@ MINTER is a **self-contained desktop app**: a Rust engine (`minter-core`) wrappe
 
 | Method | When |
 |--------|------|
-| **[Windows zip](https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/latest)** | Run it on your own machine — download, unzip, launch |
+| **Windows zip from private Actions/Releases** | Run it on your own machine — download, unzip, launch |
 | **[One-command Linux install](deploy/linux/README.md)** | Run it 24/7 on a headless VPS, close to the chain |
 | **Build from source** | You develop or want a custom build |
 
@@ -260,10 +251,8 @@ scripts/package-public.ps1   # local Windows ship folder / safe zip
 .github/workflows/           # CI + tag release (Windows + Linux artifacts)
 ```
 
-Reaching the GUI on a server is a separate, deliberately small repository:
-**[minter-connect](https://github.com/MaxBetov-pdd/minter-connect)** — one
-PowerShell script that sets up the SSH key, opens the tunnel and launches the
-browser. noVNC stays bound to the server's loopback; nothing is ever exposed.
+For a server deployment, use your own SSH/Tailscale tunnel. noVNC stays bound
+to the server loopback; nothing should be exposed directly to the Internet.
 
 <br>
 
@@ -278,24 +267,9 @@ By contributing you agree to dual-license your work under **MIT OR Apache-2.0**.
 
 <br>
 
-<!-- Support -->
-<h2 id="-support">💜 Support</h2>
-
-If MINTER saved you gas — or landed you a drop — tips are welcome. They go toward RPCs, testing, and adding new chains.
-
-**EVM** — ETH and any EVM chain (Base, Arbitrum, Optimism, Polygon, …):
-
-```text
-0x500dc4648460d95929193AEbb4D8DB1546ac478F
-```
-
-<sub>Burner-friendly · send only what you like · thank you 🙏</sub>
-
 <p align="center">
   <sub>
-    <b>MINTER</b> · Rust + Tauri 2 · Windows ·
-    <a href="https://x.com/AndarkFomo">X @AndarkFomo</a> ·
-    <a href="https://t.me/grassfoundationn">Telegram</a> ·
+    <b>MINTER REACTIVE</b> · private standalone build · Rust + Tauri 2 · Windows ·
     <a href="docs/OPERATOR_GUIDE.md">EN guide</a> ·
     <a href="USER_GUIDE.md">RU guide</a><br>
     Licensed under <a href="LICENSE-MIT">MIT</a> OR <a href="LICENSE-APACHE">Apache-2.0</a>

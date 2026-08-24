@@ -72,8 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and webkit2gtk 4.1 floors before touching anything, verifies the download
   against its published SHA256, and asks the loader which libraries are
   actually missing rather than trusting a hardcoded package list.
-- [minter-connect](https://github.com/MaxBetov-pdd/minter-connect) — a Windows
-  script that sets up the SSH key, opens the tunnel and launches the GUI.
+- Documented private SSH/Tailscale tunnelling without an external connector.
 - RPC transparency: the resolved endpoint order with per-node ping now reaches
   the mint log, and every broadcast names the endpoint that accepted it. Both
   were already computed and then discarded behind `QUIET=1`.
@@ -124,8 +123,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Session / vault Debug redaction
 - Wave A–D hardening (LIVE gate, fee caps, zero-address rejects, OpenSea value checks, etc.)
 
-[Unreleased]: https://github.com/MaxBetov-pdd/Minter-rs-v2/compare/v0.2.2...HEAD
-[0.2.2]: https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/tag/v0.2.2
-[0.2.1]: https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/tag/v0.2.1
-[0.2.0]: https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/tag/v0.2.0
-[0.1.0]: https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/tag/v0.1.0
+[Unreleased]: https://github.com/blcksquare7-png/Minter-Reactive-private/commits/reactive

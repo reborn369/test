@@ -9,11 +9,10 @@ Ubuntu VPS is the expected target.
 
 ## Install (recommended)
 
-One command on a fresh server. It pulls the prebuilt binary from GitHub
-Releases — no Rust toolchain, no compile:
+Run the checked-in installer from a private repository checkout:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MaxBetov-pdd/Minter-rs-v2/main/deploy/linux/install.sh | sudo bash
+sudo bash deploy/linux/install.sh
 ```
 
 It installs runtime packages, verifies the download against the published

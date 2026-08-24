@@ -4,9 +4,9 @@ version = "0.3.4"
 description = "MINTER desktop — OpenSea drop minter & raw sniper (Tauri 2, Windows)"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/MaxBetov-pdd/Minter-rs-v2"
-homepage = "https://github.com/MaxBetov-pdd/Minter-rs-v2"
-authors = ["Andark <andarx4nok@gmail.com>"]
+repository = "https://github.com/blcksquare7-png/Minter-Reactive-private"
+homepage = "https://github.com/blcksquare7-png/Minter-Reactive-private"
+authors = ["blcksquare7-png"]
 readme = "../../../README.md"
 
 [lib]

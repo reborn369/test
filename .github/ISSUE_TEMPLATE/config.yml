@@ -1,11 +1,11 @@
 blank_issues_enabled: true
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/MaxBetov-pdd/Minter-rs-v2/security/advisories/new
+    url: https://github.com/blcksquare7-png/Minter-Reactive-private/security/advisories/new
     about: Privately report key-leak or tx-forgery issues (do not file a public bug).
   - name: User guide (RU)
-    url: https://github.com/MaxBetov-pdd/Minter-rs-v2/blob/main/USER_GUIDE.md
+    url: https://github.com/blcksquare7-png/Minter-Reactive-private/blob/reactive/USER_GUIDE.md
     about: Full operator walkthrough in Russian.
   - name: Operator guide (EN)
-    url: https://github.com/MaxBetov-pdd/Minter-rs-v2/blob/main/docs/OPERATOR_GUIDE.md
+    url: https://github.com/blcksquare7-png/Minter-Reactive-private/blob/reactive/docs/OPERATOR_GUIDE.md
     about: Shorter English first-run and mint flow.

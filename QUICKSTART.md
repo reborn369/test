@@ -20,7 +20,7 @@ MINTER — программа для массового минта NFT с бол
 
 ### 1. Скачать
 
-Откройте [страницу релизов](https://github.com/MaxBetov-pdd/Minter-rs-v2/releases/latest)
+Откройте Actions/Releases приватного репозитория `blcksquare7-png/Minter-Reactive-private`
 и скачайте файл, который заканчивается на **`windows-x64.zip`**.
 
 ### 2. Распаковать
@@ -71,7 +71,7 @@ ssh root@ВАШ_IP_СЕРВЕРА
 Скопируйте эту строку целиком и вставьте в окно (правой кнопкой мыши):
 
 ```
-curl -fsSL https://raw.githubusercontent.com/MaxBetov-pdd/Minter-rs-v2/main/deploy/linux/install.sh | sudo bash
+sudo bash deploy/linux/install.sh
 ```
 
 Установщик спросит **пароль для VNC** — придумайте любой от 8 символов и
@@ -84,8 +84,8 @@ curl -fsSL https://raw.githubusercontent.com/MaxBetov-pdd/Minter-rs-v2/main/depl
 
 ### 3. Скачать коннектор
 
-Откройте [github.com/MaxBetov-pdd/minter-connect](https://github.com/MaxBetov-pdd/minter-connect),
-нажмите зелёную кнопку **Code** → **Download ZIP**. Распакуйте.
+Используйте собственный SSH- или Tailscale-туннель. Не скачивайте коннектор из
+репозитория автора оригинальной версии.
 
 ### 4. Запустить
 
@@ -173,14 +173,9 @@ curl -fsSL https://raw.githubusercontent.com/MaxBetov-pdd/Minter-rs-v2/main/depl
 
 # Обновления
 
-Программа раз за запуск спрашивает у GitHub, не вышла ли версия новее. Если
-вышла — сверху появится полоска со ссылкой на страницу релизов. Закрыли её —
-для этой версии больше не покажется.
-
-Что при этом уходит: обычный запрос к `api.github.com`, без единого байта о
-вас — ни кошельков, ни адресов, ни идентификаторов. Ничего не скачивается и не
-устанавливается само, обновляетесь вы вручную. Нет интернета — проверка молча
-пропускается.
+Автоматической проверки чужих репозиториев и автоматической установки нет.
+Версии собираются только из приватного репозитория владельца; обновление
+устанавливается вручную.
 
 ---
 
@@ -215,4 +210,4 @@ RPC-узел принял транзакцию, сколько заняла от
 
 - [USER_GUIDE.md](USER_GUIDE.md) — подробное руководство
 - [SECURITY.md](SECURITY.md) — как сообщить о проблеме безопасности
-- [Issues](https://github.com/MaxBetov-pdd/Minter-rs-v2/issues) — вопросы и баги
+- Issues приватного репозитория — вопросы и баги

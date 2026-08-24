@@ -16,12 +16,7 @@
           </div>
           <h1>MINTER <span class="brand-edition">REACTIVE</span></h1>
           <p class="sub">Operator console · burner wallets only</p>
-          <p class="creator-line">
-            <span class="muted small" data-i18n="creator.by">Created by</span>
-            <a class="creator-link" href="https://x.com/AndarkFomo" target="_blank" rel="noopener noreferrer">X @AndarkFomo</a>
-            <span class="muted">·</span>
-            <a class="creator-link" href="https://t.me/grassfoundationn" target="_blank" rel="noopener noreferrer">Telegram</a>
-          </p>
+          <p class="creator-line muted small">Private standalone build</p>
           <div class="card warn">
             <strong>⚠ Burner wallets only</strong>
             <p>Never import wallets with long-term funds. Private keys stay on this PC in an encrypted vault.</p>
@@ -116,19 +111,10 @@
               <span class="nav-ico" aria-hidden="true"><svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M12 8a4 4 0 1 1 0 8 4 4 0 0 1 0-8zm0 2a2 2 0 1 0 0 4 2 2 0 0 0 0-4zm8.1 1.5.9 1.6-1.6 2.7 1 2.2-1.5.9-2.2-1-2.7 1.6-1.6-.9V20h-2v-2.4l-1.6.9-2.7-1.6-1 2.2-1.5-.9 1-2.2L4 13.1l.9-1.6 2.7.2 1.4-2.5L7.5 7l1.5-.9 2.2 1 .9-2.7H14l.9 2.7 2.2-1L18.5 7l-1.5 2.2 1.4 2.5 2.7-.2z"/></svg></span>
               <span data-i18n="nav.settings">Settings</span>
             </button>
-            <div class="creator-block">
-              <div class="muted small" data-i18n="creator.by">Created by</div>
-              <a class="creator-link" href="https://x.com/AndarkFomo" target="_blank" rel="noopener noreferrer" title="X / Twitter">@AndarkFomo</a>
-              <a class="creator-link" href="https://t.me/grassfoundationn" target="_blank" rel="noopener noreferrer" title="Telegram">t.me/grassfoundationn</a>
-            </div>
+            <div class="creator-block"><div class="muted small">Private standalone build</div></div>
             <div id="app-version" class="app-version muted small">v—</div>
           </div>
         </aside>
-        <div id="update-banner" class="update-banner hidden" role="status">
-          <span id="update-text"></span>
-          <a id="update-link" href="#" target="_blank" rel="noopener" data-i18n="update.open">Open Releases</a>
-          <button type="button" id="update-dismiss" class="update-dismiss" aria-label="Dismiss"></button>
-        </div>
         <div id="toast-host" class="toast-host" aria-live="polite"></div>
         <div id="confirm-badge" class="confirm-badge hidden">✓ First confirm</div>
 
@@ -408,6 +394,9 @@
                       <label class="check tight"><input type="checkbox" id="raw-wallets-all" checked /> <span data-i18n="tasks.selectAll">Select all</span></label>
                       <label class="check tight"><input type="checkbox" id="raw-filter-balance" checked /> <span data-i18n="raw.filterBalance">Funded only</span></label>
                       <label class="check tight"><input type="checkbox" id="raw-fee-refresh-l2" /> <span data-i18n="raw.feeRefreshL2">Refresh fees at fire on L2 (slower)</span></label>
+                      <label class="check tight" title="Optional provider-specific conditional submit. Unsupported providers fall back at exact T0."><span data-i18n="raw.pushLead">Push early, ms</span> <input type="number" id="raw-push-lead" class="tight-num" min="0" max="3000" step="10" value="0" /></label>
+                      <button type="button" id="btn-raw-lag" class="ghost-btn tight-btn" data-i18n="raw.lagTest">Measure</button>
+                      <span id="raw-lag-out" class="muted"></span>
                       <button type="button" id="btn-raw-balances" class="ghost-btn tight-btn" data-i18n="raw.checkBal">Balances</button>
                     </div>
                     <div id="raw-wallet-list" class="task-wallet-list muted">Unlock vault…</div>

@@ -622,13 +622,34 @@ async fn siwe_auth_once(
     let auth_data: serde_json::Value = verify_resp.json().await?;
     // Two success shapes (bearer token vs cookie-only session) — see
     // [`extract_verify_token`].
-    let access_token = extract_verify_token(&auth_data)?;
+    let mut access_token = extract_verify_token(&auth_data)?;
+
+    // OpenSea can return the reusable credential only as an access_token
+    // cookie.  Keeping an empty token made every later run repeat SIWE even
+    // though the login itself succeeded.
+    if access_token.is_empty() {
+        access_token = cookie_access_token(&cookie_jar).unwrap_or_default();
+    }
 
     Ok(AuthSession {
         access_token,
         address: addr_str,
         client,
         cookie_jar,
+    })
+}
+
+/// Read the reusable OpenSea bearer from the cookie jar after SIWE verification.
+fn cookie_access_token(jar: &Arc<reqwest::cookie::Jar>) -> Option<String> {
+    use reqwest::cookie::CookieStore;
+
+    let url: reqwest::Url = OPENSEA_ORIGIN.parse().ok()?;
+    let header = jar.cookies(&url)?;
+    let raw = header.to_str().ok()?;
+    raw.split(';').find_map(|entry| {
+        let (name, value) = entry.split_once('=')?;
+        let value = value.trim();
+        (name.trim() == "access_token" && !value.is_empty()).then(|| value.to_string())
     })
 }
 
@@ -1643,5 +1664,44 @@ mod verify_token_tests {
             "user": { "address": "0xabc" }
         });
         assert_eq!(extract_verify_token(&v).unwrap(), "");
+    }
+}
+
+#[cfg(test)]
+mod cookie_token_tests {
+    use super::cookie_access_token;
+    use std::sync::Arc;
+
+    fn jar_with(cookie: &str) -> Arc<reqwest::cookie::Jar> {
+        let jar = Arc::new(reqwest::cookie::Jar::default());
+        let url: reqwest::Url = "https://opensea.io/".parse().unwrap();
+        jar.add_cookie_str(cookie, &url);
+        jar
+    }
+
+    #[test]
+    fn reads_access_token_and_ignores_other_cookies() {
+        let jar = Arc::new(reqwest::cookie::Jar::default());
+        let url: reqwest::Url = "https://opensea.io/".parse().unwrap();
+        for cookie in [
+            "__cf_bm=cloudflare; Path=/; Domain=.opensea.io",
+            "auth_hint=1; Path=/; Domain=.opensea.io",
+            "access_token=the.real.one; Path=/; Domain=.opensea.io",
+        ] {
+            jar.add_cookie_str(cookie, &url);
+        }
+        assert_eq!(cookie_access_token(&jar).as_deref(), Some("the.real.one"));
+    }
+
+    #[test]
+    fn absent_or_empty_token_is_not_cached() {
+        assert_eq!(
+            cookie_access_token(&Arc::new(reqwest::cookie::Jar::default())),
+            None
+        );
+        assert_eq!(
+            cookie_access_token(&jar_with("access_token=; Path=/; Domain=.opensea.io")),
+            None
+        );
     }
 }

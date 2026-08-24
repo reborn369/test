@@ -1,5 +1,5 @@
 # Minimal CI for minter-core (no Windows GUI required).
-# Push only to https://github.com/MaxBetov-pdd/Minter-rs-v2
+# Private standalone CI for MINTER Reactive.
 name: CI
 
 on:

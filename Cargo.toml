@@ -8,5 +8,5 @@ default-members = ["crates/minter-desktop/src-tauri"]
 
 [workspace.package]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/MaxBetov-pdd/Minter-rs-v2"
-authors = ["Andark <andarx4nok@gmail.com>"]
+repository = "https://github.com/blcksquare7-png/Minter-Reactive-private"
+authors = ["blcksquare7-png"]

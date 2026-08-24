@@ -36,7 +36,7 @@ If you find a vulnerability that can **leak vault keys**, **exfiltrate secrets**
    (enable under *Settings → Code security* if you are the owner and the button is missing).
 2. **Email:** [andarx4nok@gmail.com](mailto:andarx4nok@gmail.com)  
    Subject line: `[SECURITY] minter-rs …`
-3. **DM:** [X @AndarkFomo](https://x.com/AndarkFomo) (for a heads-up only; still send technical detail by email or private advisory).
+3. Use the private repository security advisory channel; do not post secrets in public issues.
 
 Please include:
 

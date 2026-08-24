@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use alloy_primitives::{Address, B256, Bytes, U256};
 use anyhow::{Context, Result, bail};
@@ -31,6 +31,9 @@ use crate::types::{GasParams, MintResult, Signer, WalletStatus};
 const DEFAULT_GAS_LIMIT: u64 = 650_000;
 /// Start pre-sign this many seconds before `at_time`.
 const PREP_LEAD_SECS: i64 = 5;
+const MAX_PUSH_LEAD_MS: u64 = (PREP_LEAD_SECS as u64 - 2) * 1_000;
+const PUSH_FEE_MARGIN_MS: u64 = 400;
+const PUSH_TAIL_MS: u64 = 300;
 /// Reject a scheduled `at_time` further ahead than this (30 days).
 ///
 /// Guards against a mistyped date parking the run in the pre-fire wait forever.
@@ -88,6 +91,11 @@ pub struct RawSniperConfig {
     pub gas_limit: Option<u64>,
     /// When to re-fetch fees + re-sign at fire (default mainnet-only).
     pub fee_refresh: FeeRefreshMode,
+    /// Start conditional submission this many milliseconds before T0. Zero
+    /// keeps the plain T0 blast path.
+    pub push_lead_ms: u64,
+    /// Delay between conditional attempts while the node reports "not yet".
+    pub push_interval_ms: u64,
     /// Optional contract-specific fail-closed terms guard.
     pub archetype_terms: Option<ArchetypeTermsGuard>,
 }
@@ -115,9 +123,41 @@ impl Default for RawSniperConfig {
             concurrency: 16,
             gas_limit: None,
             fee_refresh: FeeRefreshMode::MainnetOnly,
+            push_lead_ms: 0,
+            push_interval_ms: 25,
             archetype_terms: None,
         }
     }
+}
+
+fn push_plan(lead_ms: u64, interval_ms: u64) -> (u64, u64) {
+    let lead = lead_ms.min(MAX_PUSH_LEAD_MS);
+    if lead == 0 {
+        return (0, 0);
+    }
+    (lead, interval_ms.clamp(5, 1_000))
+}
+
+fn push_stagger_ms(index: usize, wallets: usize, interval_ms: u64) -> u64 {
+    if wallets <= 1 {
+        0
+    } else {
+        (index as u64 * interval_ms) / wallets as u64
+    }
+}
+
+fn is_condition_not_met(err: &str) -> bool {
+    let error = err.to_ascii_lowercase();
+    error.contains("condition not met")
+        || error.contains("conditions not met")
+        || error.contains("condition is not met")
+        || error.contains("condition not satisfied")
+        || error.contains("condition is not satisfied")
+        || error.contains("condition not yet satisfied")
+}
+
+fn fallback_deadline_ms(accepted: usize, total: usize, now_ms: i64, open_ms: i64) -> Option<i64> {
+    (accepted < total && now_ms < open_ms).then_some(open_ms)
 }
 
 // ─── Decode helpers (MintBay status) ─────────────────────────────────────────
@@ -150,17 +190,11 @@ fn u256_to_u8_sat(v: U256) -> u8 {
 }
 
 fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    crate::timing::true_now_secs()
 }
 
 fn now_unix_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    crate::timing::true_now_ms()
 }
 
 fn cancelled(cancel: &Option<Arc<AtomicBool>>) -> bool {
@@ -203,11 +237,7 @@ async fn sleep_until_unix(target: i64, cancel: &Option<Arc<AtomicBool>>) -> Resu
 /// With `TimerResolutionGuard` active (1 ms resolution on Windows), the 5 ms
 /// sleep tier is accurate. The busy-yield window is widened to 20 ms to
 /// guarantee sub-millisecond precision in the final approach.
-async fn sleep_until_fire(
-    target_unix: i64,
-    cancel: &Option<Arc<AtomicBool>>,
-) -> Result<(), String> {
-    let target_ms = target_unix.saturating_mul(1000);
+async fn sleep_until_ms(target_ms: i64, cancel: &Option<Arc<AtomicBool>>) -> Result<(), String> {
     let mut timer_guard = None;
     loop {
         if cancelled(cancel) {
@@ -312,6 +342,8 @@ struct PreSigned {
     hash: B256,
     /// Needed to re-sign on L1 if fees rise between prep and fire.
     nonce: u64,
+    /// Hash returned when conditional submission already placed this exact tx.
+    early_hash: Option<B256>,
 }
 
 // ─── MintBay status ──────────────────────────────────────────────────────────
@@ -596,6 +628,19 @@ pub async fn run_raw_sniper(
         }
     }
 
+    // Sync before the T-5 preparation wait. Doing this after pre-signing means
+    // the normal run is already inside the minimum-lead cutoff and silently
+    // keeps using the uncorrected machine clock.
+    if let Some(at) = fire_at
+        && at.saturating_mul(1_000).saturating_sub(now_unix_ms())
+            > crate::timing::CLOCK_SYNC_MIN_LEAD_MS
+    {
+        report(
+            &reporter,
+            MintEvent::message(crate::timing::sync_clock().await),
+        );
+    }
+
     report(
         &reporter,
         MintEvent::phase(
@@ -793,6 +838,7 @@ pub async fn run_raw_sniper(
                 raw,
                 hash,
                 nonce,
+                early_hash: None,
             })
         }));
     }
@@ -868,7 +914,15 @@ pub async fn run_raw_sniper(
         return results;
     }
 
-    // ── Clock fire ──
+    // Wake before T0 only when guarded conditional submission is explicitly
+    // enabled. Otherwise this remains the existing precise T0 blast.
+    let (push_lead_ms, push_interval_ms) = push_plan(config.push_lead_ms, config.push_interval_ms);
+    let wake_offset_ms = if push_lead_ms > 0 {
+        push_lead_ms + PUSH_FEE_MARGIN_MS
+    } else {
+        0
+    };
+    // ── Clock fire / conditional wake ──
     if let Some(at) = fire_at {
         let now = now_unix();
         if now < at {
@@ -879,7 +933,10 @@ pub async fn run_raw_sniper(
                     format!("Armed — firing in {}s (clock {at})", at - now),
                 ),
             );
-            if let Err(e) = sleep_until_fire(at, &cancel).await {
+            let wake_ms = at
+                .saturating_mul(1_000)
+                .saturating_sub(wake_offset_ms as i64);
+            if let Err(e) = sleep_until_ms(wake_ms, &cancel).await {
                 return fail_all(signers, e);
             }
         } else {
@@ -998,6 +1055,129 @@ pub async fn run_raw_sniper(
         );
     }
 
+    // Guarded early submission. It is opt-in because the conditional RPC
+    // method is non-standard and provider support varies.
+    if push_lead_ms > 0
+        && let Some(at) = fire_at
+    {
+        let open_ms = at.saturating_mul(1_000);
+        let push_start_ms = open_ms.saturating_sub(push_lead_ms as i64);
+        let deadline_ms = open_ms.saturating_add(PUSH_TAIL_MS as i64);
+        let total = prepared.len();
+        // The earlier wake reserves time for the optional fee refresh. If that
+        // work finishes quickly, do not turn the reserve into extra conditional
+        // requests: honour the exact lead selected by the operator.
+        if now_unix_ms() < push_start_ms
+            && let Err(error) = sleep_until_ms(push_start_ms, &cancel).await
+        {
+            return fail_all(signers, error);
+        }
+        report(
+            &reporter,
+            MintEvent::phase(
+                "fire",
+                format!(
+                    "EARLY PUSH T-{push_lead_ms}ms · interval={push_interval_ms}ms · {total} tx(s)"
+                ),
+            ),
+        );
+
+        let started_ms = now_unix_ms();
+        let mut jobs = tokio::task::JoinSet::new();
+        for (index, signed) in prepared.iter().enumerate() {
+            let rpc = rpc.clone();
+            let raw = signed.raw.clone();
+            let expected_hash = signed.hash;
+            let cancel = cancel.clone();
+            let stagger = push_stagger_ms(index, total, push_interval_ms);
+            jobs.spawn(async move {
+                if stagger > 0 {
+                    tokio::time::sleep(Duration::from_millis(stagger)).await;
+                }
+                let mut attempts = 0u32;
+                loop {
+                    if cancelled(&cancel) || now_unix_ms() >= deadline_ms {
+                        return (index, None, None, attempts);
+                    }
+                    attempts += 1;
+                    match rpc
+                        .send_raw_transaction_conditional(&raw, at.max(0) as u64)
+                        .await
+                    {
+                        Ok(hash) => return (index, Some(hash), None, attempts),
+                        Err(error) => {
+                            let message = error.to_string();
+                            if message.to_ascii_lowercase().contains("already known") {
+                                return (index, Some(expected_hash), None, attempts);
+                            }
+                            if !is_condition_not_met(&message) {
+                                return (index, None, Some(message), attempts);
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(push_interval_ms)).await;
+                }
+            });
+        }
+
+        let mut accepted = 0usize;
+        let mut attempts = 0u32;
+        let mut unsupported: Option<String> = None;
+        while let Some(joined) = jobs.join_next().await {
+            let Ok((index, hash, error, count)) = joined else {
+                continue;
+            };
+            attempts = attempts.saturating_add(count);
+            if let Some(hash) = hash {
+                prepared[index].early_hash = Some(hash);
+                accepted += 1;
+                report(
+                    &reporter,
+                    MintEvent::wallet(
+                        prepared[index].address,
+                        Some(WalletStatus::Sent),
+                        Some(format!(
+                            "EARLY SEND OK {} (T{:+}ms, attempt {count})",
+                            shorten_hash(&hash),
+                            now_unix_ms().saturating_sub(open_ms)
+                        )),
+                        Some(hash),
+                        None,
+                    ),
+                );
+            } else if unsupported.is_none() {
+                unsupported = error;
+            }
+        }
+        if cancelled(&cancel) {
+            return fail_all(signers, "cancelled by user");
+        }
+
+        // If the provider rejects this method before T0, hold the ordinary
+        // fallback until exact T0. The upstream implementation missed this
+        // guard and could turn an early wake into an unguarded early send.
+        if let Some(fallback_at) = fallback_deadline_ms(accepted, total, now_unix_ms(), open_ms) {
+            if let Some(message) = &unsupported {
+                report(
+                    &reporter,
+                    MintEvent::message(format!(
+                        "conditional submit unavailable ({message}) · holding fallback until exact T0"
+                    )),
+                );
+            }
+            if let Err(error) = sleep_until_ms(fallback_at, &cancel).await {
+                return fail_all(signers, error);
+            }
+        }
+        report(
+            &reporter,
+            MintEvent::message(format!(
+                "early push: {accepted}/{total} accepted, {attempts} attempt(s), elapsed={}ms",
+                now_unix_ms().saturating_sub(started_ms)
+            )),
+        );
+    }
+
     report(
         &reporter,
         MintEvent::phase(
@@ -1026,8 +1206,25 @@ pub async fn run_raw_sniper(
             let addr = ps.address;
             let signed_hash = ps.hash;
 
-            // Send first — only then report Sent with real RPC hash.
-            let send_res = rpc.race_send(&ps.raw).await;
+            // Conditional acceptance is one ingress, not a reason to skip the
+            // ordinary T0 fan-out. Broadcasting the identical signed bytes is
+            // idempotent and gives every configured node/sequencer path a shot.
+            let send_res = match rpc.race_send(&ps.raw).await {
+                Ok(hash) => Ok(hash),
+                Err(error) => match ps.early_hash {
+                    Some(hash) => {
+                        report(
+                            &rep,
+                            MintEvent::message(format!(
+                                "T0 fan-out returned {error}; conditional copy {} remains armed",
+                                shorten_hash(&hash)
+                            )),
+                        );
+                        Ok(hash)
+                    }
+                    None => Err(error),
+                },
+            };
             // Release the send slot *before* polling for a receipt. Holding it
             // across `wait_for_receipt` (up to 90s) serialized the blast: with
             // more wallets than `concurrency`, wallet N+1 could not fire until
@@ -1330,6 +1527,21 @@ mod tests {
             quantity,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn conditional_fallback_can_never_fire_before_t0() {
+        assert_eq!(fallback_deadline_ms(0, 10, 9_500, 10_000), Some(10_000));
+        assert_eq!(fallback_deadline_ms(4, 10, 9_999, 10_000), Some(10_000));
+        assert_eq!(fallback_deadline_ms(10, 10, 9_500, 10_000), None);
+        assert_eq!(fallback_deadline_ms(0, 10, 10_000, 10_000), None);
+    }
+
+    #[test]
+    fn conditional_push_is_off_by_default_and_bounded_when_enabled() {
+        assert_eq!(push_plan(0, 25), (0, 0));
+        assert_eq!(push_plan(200, 1), (200, 5));
+        assert_eq!(push_plan(60_000, 5_000), (MAX_PUSH_LEAD_MS, 1_000));
     }
 
     #[test]

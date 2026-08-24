@@ -2,7 +2,7 @@
 #
 # MINTER — one-command install on a headless Linux VPS.
 #
-#   curl -fsSL https://raw.githubusercontent.com/MaxBetov-pdd/Minter-rs-v2/main/deploy/linux/install.sh | sudo bash
+# Run this checked-in script from the private MINTER Reactive repository.
 #
 # Downloads the prebuilt binary from GitHub Releases (no Rust toolchain, no
 # 10-minute compile), installs it as a systemd service behind a private noVNC
@@ -16,10 +16,10 @@
 #
 # noVNC is bound to 127.0.0.1 on purpose: classic VNC auth uses only the first
 # 8 characters of the password, which is nowhere near enough in front of a
-# wallet GUI. Reach it through an SSH tunnel — see minter-connect.
+# wallet GUI. Reach it through your own SSH or Tailscale tunnel.
 set -Eeuo pipefail
 
-REPO="${MINTER_REPO:-MaxBetov-pdd/Minter-rs-v2}"
+REPO="${MINTER_REPO:-blcksquare7-png/Minter-Reactive-private}"
 VERSION="${MINTER_VERSION:-latest}"
 INSTALL_DIR="/opt/minter"
 DATA_DIR="/var/lib/minter"
@@ -272,14 +272,6 @@ cat <<BANNER
 
   Port 3021 is bound to localhost on purpose — nothing is exposed
   to the Internet. Reach the GUI through an SSH tunnel.
-
-  EASY WAY — from Windows:
-    1. Get minter-connect:
-       https://github.com/MaxBetov-pdd/minter-connect
-    2. Run connect.ps1 and enter when asked:
-           server:  $ip
-           user:    $sshuser
-    It creates the SSH key, opens the tunnel and the browser.
 
   MANUAL WAY — any OS with an ssh client:
     ssh -N -L 3021:127.0.0.1:3021 $sshuser@$ip

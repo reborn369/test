@@ -6,10 +6,8 @@
 
 Краткий гайд на английском: [`docs/OPERATOR_GUIDE.md`](docs/OPERATOR_GUIDE.md).
 
-**Создатель:** [X @AndarkFomo](https://x.com/AndarkFomo) · [Telegram](https://t.me/grassfoundationn)
-
-**Исходники:** [github.com/MaxBetov-pdd/Minter-rs-v2](https://github.com/MaxBetov-pdd/Minter-rs-v2)  
-**Релизы (exe):** [Releases](https://github.com/MaxBetov-pdd/Minter-rs-v2/releases)
+**Версия:** приватная standalone-разработка MINTER Reactive.
+**Исходники и сборки:** приватный репозиторий `blcksquare7-png/Minter-Reactive-private`.
 
 ---
 
@@ -69,7 +67,7 @@
 
 ### Из релиза
 
-1. Скачайте zip с [Releases](https://github.com/MaxBetov-pdd/Minter-rs-v2/releases), проверьте SHA256 при наличии.  
+1. Скачайте zip из Actions/Releases приватного репозитория, проверьте SHA256 при наличии.
 2. Распакуйте, например в `C:\Minter\`.  
 3. **Двойной клик** `minter-desktop.exe`.  
 4. SmartScreen («неизвестный издатель») → **Подробнее** → **Выполнить в любом случае** (сборка может быть без code signing).  
@@ -78,7 +76,7 @@
 ### Из исходников
 
 ```powershell
-git clone https://github.com/MaxBetov-pdd/Minter-rs-v2
+git clone https://github.com/blcksquare7-png/Minter-Reactive-private
 cd minter-rs
 cargo run -p minter-desktop --release
 ```
@@ -376,7 +374,7 @@ C:\Minter\
 
 ## 10. Для разработчиков (rebuild)
 
-Исходники: https://github.com/MaxBetov-pdd/Minter-rs-v2
+Исходники: приватный репозиторий `blcksquare7-png/Minter-Reactive-private`
 
 ```powershell
 # из корня репо — локальная папка Public\ (gitignored)
@@ -406,6 +404,6 @@ powershell -ExecutionPolicy Bypass -File scripts\package-public.ps1 -MakeZip
 **Итог:**  
 папка → `minter-desktop.exe` → Unlock → Wallets → Settings/RPC → Task (фаза + кошельки) → **Start** (type **LIVE**) → wait open → fixed gas send → **CONFIRMED** → results / logs.
 
-Исходники: **https://github.com/MaxBetov-pdd/Minter-rs-v2**
+Исходники: **приватный репозиторий `blcksquare7-png/Minter-Reactive-private`**
 
 Удачи. Не миньте с main wallet.

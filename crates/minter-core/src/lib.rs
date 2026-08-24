@@ -51,8 +51,8 @@ pub mod settings;
 pub mod sign;
 pub mod sweep;
 pub mod timer_resolution;
+pub mod timing;
 pub mod types;
-pub mod update;
 pub mod vault;
 
 pub use api::{
@@ -147,6 +147,7 @@ pub use safety_policy::{
     should_warn_no_proxy,
 };
 pub use settings::Settings;
+pub use timing::FireLagReport;
 pub use types::*;
 pub use vault::Vault;
 

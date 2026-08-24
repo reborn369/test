@@ -4,11 +4,11 @@ version = "0.3.3"
 edition = "2024"
 description = "Shared mint/vault/RPC logic for MINTER desktop"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/MaxBetov-pdd/Minter-rs-v2"
-homepage = "https://github.com/MaxBetov-pdd/Minter-rs-v2"
-documentation = "https://github.com/MaxBetov-pdd/Minter-rs-v2#readme"
+repository = "https://github.com/blcksquare7-png/Minter-Reactive-private"
+homepage = "https://github.com/blcksquare7-png/Minter-Reactive-private"
+documentation = "https://github.com/blcksquare7-png/Minter-Reactive-private#readme"
 readme = "../../README.md"
-authors = ["Andark <andarx4nok@gmail.com>"]
+authors = ["blcksquare7-png"]
 keywords = ["nft", "mint", "opensea", "ethereum", "tauri"]
 categories = ["cryptography::cryptocurrencies"]
 

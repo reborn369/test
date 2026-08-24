@@ -8,7 +8,7 @@ body:
       value: |
         Thanks for filing a bug. **Never paste private keys, vault passwords, full `config.json`, or live proxy credentials.**
 
-        Security issues that can leak keys or forge transactions → see [SECURITY.md](https://github.com/MaxBetov-pdd/Minter-rs-v2/blob/main/SECURITY.md) (private report only).
+        Security issues that can leak keys or forge transactions → see SECURITY.md (private report only).
   - type: textarea
     id: what-happened
     attributes:

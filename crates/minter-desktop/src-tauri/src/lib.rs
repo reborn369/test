@@ -2722,7 +2722,7 @@ mod tests {
             .expect("task start function");
         let tail = &app[start..];
         let end = tail
-            .find("async function checkForUpdate")
+            .find("function selectedRpcChains")
             .expect("function after task runner");
         let runner = &tail[..end];
         assert!(

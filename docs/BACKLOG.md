@@ -4,6 +4,17 @@ This file contains verified follow-up work only. Historical failures from old
 binaries are not treated as current defects until reproduced on the current
 build.
 
+## Product rule
+
+There is one production mint path per supported phase/network. Do not expose
+experimental speed modes to the operator and do not add another provider or
+submission route merely because it might be faster.
+
+Changes to the mint hot path must preserve phase, price, quantity, nonce and
+recipient safety; must be measured against the current build; and must pass
+regression tests before release. The default fee policy stays economical and
+network-correct: software speed must not be simulated by raising priority fees.
+
 ## Priority 1: trustworthy hot-path metrics
 
 Structured `metrics_*.json` must be populated from the same timers used by the
@@ -23,11 +34,12 @@ Required behaviour:
 Acceptance test: a 10-wallet run can show whether the first network writes were
 issued together without manually subtracting unrelated log durations.
 
-## Priority 2: Ink broadcast A/B optimisation
+## Priority 2: verify and optimise the existing Ink broadcaster
 
 Do not replace the current rate-aware broadcaster blindly. It was introduced
 after immediate multi-wallet fanout triggered provider/IP rate limits.
 
+This is an internal engineering investigation, not a new user-selectable mode.
 After Priority 1 is complete:
 
 - compare the current rotated lanes and delayed hedges against a denser first
@@ -38,8 +50,9 @@ After Priority 1 is complete:
   lanes improves issue time without opening `wallets x endpoints` connections;
 - keep identical signed bytes for every hedge/retry so duplicate minting is
   impossible;
-- retain a conservative fallback to the current policy;
-- adopt a new policy only when repeated measurements beat the current one.
+- keep the current policy unless repeated measurements show a strictly better
+  policy with no correctness, duplicate-mint, cost or rate-limit regression;
+- ship only the winning policy as the single production path.
 
 Acceptance test: lower p90 ACK/first-block results for 10 wallets with no higher
 rate-limit or unresolved-send rate.
@@ -69,31 +82,6 @@ Acceptance test: for Ink with an Alchemy key and no custom URLs, the screen must
 show Alchemy plus all automatically added Ink endpoints and must match the roles
 written to the mint log.
 
-## Per-chain gas and ordering profiles
-
-- model Robinhood as arrival-order/FCFS and avoid pointless priority-fee
-  escalation there;
-- provide an explicit, capped competitive priority-fee profile for Ink/OP Stack;
-- keep automatic network fees as the safe default and show the estimated maximum
-  cost before enabling an aggressive profile;
-- never apply a global multiplier blindly to every network;
-- verify ordering and fee behaviour against official chain documentation and
-  live receipts before changing defaults.
-
-## OpenSea official Drops API as a secondary calldata source
-
-- add optional OpenSea API-key configuration with redaction at rest/log/UI
-  boundaries;
-- evaluate `POST /api/v2/drops/{slug}/mint` as an independent prefetched source;
-- keep deterministic local SeaDrop public calldata as first priority;
-- retain the existing authenticated GraphQL path when an exact selected phase or
-  server-issued signed-stage data requires it;
-- validate returned chain, target, calldata selector, quantity, recipient, phase
-  terms and value before signing;
-- never let the API's automatic phase selection silently override the operator's
-  saved phase or accepted price;
-- A/B availability and latency before making the REST route a default.
-
 ## Gas-mode semantics and logging cleanup
 
 - remove the misleading `SKIP_PREFLIGHT ignored because GAS_LIMIT=0` warning for
@@ -118,6 +106,9 @@ written to the mint log.
 
 ## Explicitly not planned without new evidence
 
+- no aggressive/competitive gas profile or automatic priority-fee inflation;
+- no OpenSea REST Drops API dependency in the production mint path;
+- no collection of alternative experimental modes in the UI;
 - no return to WebSocket transaction submission;
 - no persistent paid-provider `newHeads` subscription;
 - no unconditional 30-socket (`wallets x endpoints`) fanout;

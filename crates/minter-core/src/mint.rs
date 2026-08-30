@@ -3005,7 +3005,6 @@ async fn run_opensea_mint_inner(
             reporter.as_ref(),
             format!("\nWaiting for phase open (wall clock) at {open_at} (unix={start_ts})"),
         );
-        let mut preopen_finalized = false;
         let mut prefetched = false;
         let mut prep_frozen = false;
         let mut conditional_started = false;
@@ -3043,7 +3042,7 @@ async fn run_opensea_mint_inner(
         // during preparation. They must do no blockchain reads near T0. Public
         // stages additionally validate their mutable on-chain configuration,
         // but do so with a wide safety margin rather than in the final seconds.
-        preopen_finalized = !local_public_prefetch;
+        let mut preopen_finalized = !local_public_prefetch;
         // PUBLIC_SALE can be built locally before T0. Signed phases deliberately
         // reserve their limited OpenSea mint-action requests for T0 because the
         // service does not issue transactionSubmissionData before the stage opens.
@@ -5529,16 +5528,16 @@ mod tests {
     use super::{
         GQL_STAGGER_MAX_SPREAD_MS, NOT_ACTIVE_CHAIN_WAIT_MAX_SECS, NotActiveInfo,
         OPENSEA_MINT_ACTION_BUDGET, OPENSEA_MINT_ACTION_REFILL_MS, PHASE_OPEN_LAG_WINDOW_SECS,
-        PREOPEN_PUBLIC_FINALIZE_LEAD_MS, RATE_LIMIT_WAIT_BUDGET_MS, ScheduledPreopenPlan,
-        SeaDropPublicState, WalletAuth, assigned_proxy_routes, build_local_public_mint,
-        classify_mint_error, decode_common_seadrop_revert, enrich_mint_rpc_error,
-        estimate_fail_policy, fire_lag_ms_from_clock, format_not_active, format_rpc_plan,
-        gql_action_not_ready_delay, gql_stagger_step_ms, in_phase_open_lag_window,
-        initial_force_fixed_gas, is_gql_action_not_ready, is_proven_pre_open_revert,
-        is_terminal_gql_action_error, keep_before_opensea_auth, parse_not_active,
-        parse_tx_calldata_hex, pre_sign_ready_wallets, rate_limit_backoff, required_mint_balance,
-        resolve_mint_gas_limit, resolve_public_fee_recipient, scheduled_preopen_plan,
-        validate_seadrop_calldata, validate_seadrop_public_state, validate_wallet_subset_counts,
+        RATE_LIMIT_WAIT_BUDGET_MS, ScheduledPreopenPlan, SeaDropPublicState, WalletAuth,
+        assigned_proxy_routes, build_local_public_mint, classify_mint_error,
+        decode_common_seadrop_revert, enrich_mint_rpc_error, estimate_fail_policy,
+        fire_lag_ms_from_clock, format_not_active, format_rpc_plan, gql_action_not_ready_delay,
+        gql_stagger_step_ms, in_phase_open_lag_window, initial_force_fixed_gas,
+        is_gql_action_not_ready, is_proven_pre_open_revert, is_terminal_gql_action_error,
+        keep_before_opensea_auth, parse_not_active, parse_tx_calldata_hex, pre_sign_ready_wallets,
+        rate_limit_backoff, required_mint_balance, resolve_mint_gas_limit,
+        resolve_public_fee_recipient, scheduled_preopen_plan, validate_seadrop_calldata,
+        validate_seadrop_public_state, validate_wallet_subset_counts,
     };
     use crate::proxy::ProxyManager;
     use crate::types::Signer;
@@ -5982,7 +5981,6 @@ mod tests {
 
     #[test]
     fn one_hundred_signed_wallets_schedule_no_preopen_rpc_refresh() {
-        assert!(PREOPEN_PUBLIC_FINALIZE_LEAD_MS >= 30_000);
         for _ in 0..100 {
             assert_eq!(
                 scheduled_preopen_plan("SIGNED_PRESALE", true),

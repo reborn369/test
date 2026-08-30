@@ -103,10 +103,9 @@ pub(crate) const NOT_ACTIVE_CHAIN_WAIT_MAX_SECS: u64 = 20;
 /// `MAX_RETRIES=20` into twenty paid reverts.
 pub(crate) const MAX_PROVEN_EARLY_REVERT_RECOVERIES: u32 = 1;
 
-/// Starting this far after T0 is no longer latency-sensitive enough to justify
-/// skipping a contract preflight.  It is, however, exactly when sold-out state
-/// is likely, so perform a read-only estimate before spending gas.
-pub(crate) const LATE_LIVE_PREFLIGHT_MS: u64 = 2_000;
+/// Mutable public SeaDrop configuration is finalized well before the precision
+/// window. Server-signed stages need no blockchain reads in this window.
+pub(crate) const PREOPEN_PUBLIC_FINALIZE_LEAD_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NotActiveInfo {
@@ -121,14 +120,6 @@ pub(crate) fn is_proven_pre_open_revert(stage_start_ts: Option<i64>, mined_block
     };
     let start = start as u64;
     mined_block_ts < start && start.saturating_sub(mined_block_ts) <= NOT_ACTIVE_CHAIN_WAIT_MAX_SECS
-}
-
-pub(crate) fn late_preflight_proves_rejection(err: &str) -> bool {
-    let lower = err.to_ascii_lowercase();
-    classify_mint_error(err) == "fatal"
-        || parse_not_active(err).is_some()
-        || lower.contains("execution reverted")
-        || lower.contains("revert data")
 }
 
 pub(crate) fn validate_wallet_subset_counts(
@@ -349,6 +340,33 @@ fn assigned_proxy_routes(
 /// the selected phase price and exact gas requirement.
 fn keep_before_opensea_auth(balance: Option<U256>) -> bool {
     balance.map(|value| value != U256::ZERO).unwrap_or(true)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScheduledPreopenPlan {
+    CachedOnly,
+    ValidatePublicState,
+}
+
+fn scheduled_preopen_plan(stage_type: &str, use_gql: bool) -> ScheduledPreopenPlan {
+    if stage_type == "PUBLIC_SALE" && !use_gql {
+        ScheduledPreopenPlan::ValidatePublicState
+    } else {
+        ScheduledPreopenPlan::CachedOnly
+    }
+}
+
+fn required_mint_balance(mint_value: U256, gas_limit: u64, max_fee: U256) -> U256 {
+    mint_value.saturating_add(U256::from(gas_limit).saturating_mul(max_fee))
+}
+
+fn initial_force_fixed_gas(
+    dry_run: bool,
+    skip_preflight: bool,
+    skip_estimate_on_open: bool,
+    auto_skip_estimate: bool,
+) -> bool {
+    !dry_run || skip_preflight || skip_estimate_on_open || auto_skip_estimate
 }
 
 fn route_auth_summary(label: &str, wallets: &[WalletAuth], via_proxy: bool) -> String {
@@ -2771,17 +2789,29 @@ async fn run_opensea_mint_inner(
     }
 
     log_always(reporter.as_ref(), format!("\nChecking balances..."));
-    // Keep this snapshot for signing. Scheduled runs refresh it with a bounded
-    // request at T-2; immediate runs reuse it. There must be no fee RPC after T0.
+    // This is the one fee snapshot used by both the balance gate and signing.
+    // Keeping those values identical prevents a wallet from passing preparation
+    // with a cheaper fee than the transaction eventually carries.
     let fee_snapshot = rpc
         .fee_history()
         .await
         .unwrap_or((U256::from(1_000_000_000u64), U256::from(1_000_000_000u64)));
+    let (max_fee, max_priority_fee) =
+        gas::calculate_fees(&gas_params, fee_snapshot.0, fee_snapshot.1).unwrap_or((
+            fee_snapshot.0 * U256::from(2u64) + fee_snapshot.1,
+            fee_snapshot.1,
+        ));
+    // Resolve the same fixed live limit that workers sign with. A gas limit is
+    // only a ceiling (unused gas is not charged), but the account must be able
+    // to cover that ceiling for an RPC to accept the transaction.
+    let pre_sign_gas_limit = resolve_mint_gas_limit(
+        fixed_gas_limit.unwrap_or(250_000),
+        gas_params.gas_multiplier,
+        chain_id,
+        true,
+    );
     {
         let before_balance = wallets.iter().filter(|w| w.auth_ok).count();
-        let (base_fee_check, priority_check) = fee_snapshot;
-        let estimated_gas_cost =
-            U256::from(fixed_gas_limit.unwrap_or(250_000)) * (base_fee_check + priority_check);
         let mut bal_handles = Vec::new();
         for w in &wallets {
             if !w.auth_ok {
@@ -2801,7 +2831,8 @@ async fn run_opensea_mint_inner(
                 if let Some(w) = wallets.iter_mut().find(|w| w.address == addr) {
                     match bal_result {
                         Ok(bal) => {
-                            let needed = mint_value + estimated_gas_cost;
+                            let needed =
+                                required_mint_balance(mint_value, pre_sign_gas_limit, max_fee);
                             let bal_eth = format!(
                                 "{:.6}",
                                 (bal / U256::from(1e12 as u64)).to::<u128>() as f64 / 1e6
@@ -2880,20 +2911,6 @@ async fn run_opensea_mint_inner(
             );
         }
     }
-
-    let (mut max_fee, mut max_priority_fee) =
-        gas::calculate_fees(&gas_params, fee_snapshot.0, fee_snapshot.1).unwrap_or((
-            fee_snapshot.0 * U256::from(2u64) + fee_snapshot.1,
-            fee_snapshot.1,
-        ));
-    // LIVE OpenSea already uses fixed gas in the worker. Resolve the identical
-    // limit now so personalized whitelist calldata can be fully signed pre-fire.
-    let pre_sign_gas_limit = resolve_mint_gas_limit(
-        fixed_gas_limit.unwrap_or(250_000),
-        gas_params.gas_multiplier,
-        chain_id,
-        true,
-    );
 
     // Proxy probe skipped on mint hot path (use Proxies page). Soft checklist only.
     let proxy_slots = if proxied_route_count == 0 {
@@ -2988,22 +3005,21 @@ async fn run_opensea_mint_inner(
             reporter.as_ref(),
             format!("\nWaiting for phase open (wall clock) at {open_at} (unix={start_ts})"),
         );
-        let mut nonce_refreshed = false;
+        let mut preopen_finalized = false;
         let mut prefetched = false;
         let mut prep_frozen = false;
         let mut conditional_started = false;
         let mut gql_warm_started = false;
         let mut last_printed = -1i64;
-        let mut logged_chain_lag = false;
         let prefetch_lead_ms = if conditional_submit_enabled {
             5_000u64.max(conditional_lead_ms.saturating_add(3_000))
         } else {
             5_000
         } as i64;
-        let nonce_refresh_lead_ms = if conditional_submit_enabled {
-            2_000u64.max(conditional_lead_ms.saturating_add(1_500))
+        let preopen_finalize_lead_ms = if conditional_submit_enabled {
+            PREOPEN_PUBLIC_FINALIZE_LEAD_MS.max(conditional_lead_ms.saturating_add(5_000))
         } else {
-            2_000
+            PREOPEN_PUBLIC_FINALIZE_LEAD_MS
         } as i64;
 
         let configured_use_gql = opts.use_gql.unwrap_or_else(|| {
@@ -3021,7 +3037,13 @@ async fn run_opensea_mint_inner(
                 "PUBLIC_SALE: ignoring Use GraphQL; using deterministic local calldata".to_string(),
             );
         }
-        let local_public_prefetch = stage_type_owned == "PUBLIC_SALE" && !use_gql;
+        let preopen_plan = scheduled_preopen_plan(&stage_type_owned, use_gql);
+        let local_public_prefetch = preopen_plan == ScheduledPreopenPlan::ValidatePublicState;
+        // Non-public stages use the nonce and fee snapshot already collected
+        // during preparation. They must do no blockchain reads near T0. Public
+        // stages additionally validate their mutable on-chain configuration,
+        // but do so with a wide safety margin rather than in the final seconds.
+        preopen_finalized = !local_public_prefetch;
         // PUBLIC_SALE can be built locally before T0. Signed phases deliberately
         // reserve their limited OpenSea mint-action requests for T0 because the
         // service does not issue transactionSubmissionData before the stage opens.
@@ -3146,28 +3168,6 @@ async fn run_opensea_mint_inner(
                 }
             }
 
-            // One-shot diagnostic: chain block.timestamp often lags wall by ~block time.
-            if !logged_chain_lag && remaining_ms <= 5_000 {
-                logged_chain_lag = true;
-                if let Ok(Ok(chain_ts)) = tokio::time::timeout(
-                    std::time::Duration::from_millis(300),
-                    rpc.block_timestamp(),
-                )
-                .await
-                {
-                    let chain_left = start_ts - chain_ts as i64;
-                    if chain_left > 0 {
-                        log_always(
-                            reporter.as_ref(),
-                            format!(
-                                "Note: chain block.timestamp still {chain_left}s behind open — \
-                                 we fire on wall clock (not chain), so we do not wait for that lag"
-                            ),
-                        );
-                    }
-                }
-            }
-
             if !prefetched && should_prefetch && remaining_ms <= prefetch_lead_ms {
                 log_always(
                     reporter.as_ref(),
@@ -3212,10 +3212,10 @@ async fn run_opensea_mint_inner(
                 }
             }
 
-            if !nonce_refreshed && remaining_ms <= nonce_refresh_lead_ms {
+            if !preopen_finalized && remaining_ms <= preopen_finalize_lead_ms {
                 log_always(
                     reporter.as_ref(),
-                    "\n  Refreshing nonces + fees (bounded, before open)...".to_string(),
+                    "\n  Finalizing public SeaDrop state outside the T0 hot path...".to_string(),
                 );
                 if chain_id == 57073 {
                     // Ink submit ingress is especially sensitive to a cold TLS
@@ -3232,135 +3232,48 @@ async fn run_opensea_mint_inner(
                         );
                     });
                 }
-                let refresh_deadline =
-                    std::time::Instant::now() + std::time::Duration::from_millis(1_200);
-                let fee_rpc = rpc.clone();
-                let mut fee_handle = tokio::spawn(async move { fee_rpc.fee_history().await });
-                let mut public_state_handle = if local_public_prefetch {
-                    let state_rpc = rpc.clone();
-                    let state_seadrop = seadrop_address.clone();
-                    let state_nft = nft_contract.to_string();
-                    Some(tokio::spawn(async move {
-                        read_seadrop_public_state(&state_rpc, state_seadrop.as_deref(), &state_nft)
-                            .await
-                    }))
-                } else {
-                    None
-                };
-                let mut refresh_handles = tokio::task::JoinSet::new();
-                for w in &wallets {
-                    if !w.auth_ok {
-                        continue;
+                let state = tokio::time::timeout(
+                    std::time::Duration::from_millis(1_200),
+                    read_seadrop_public_state(&rpc, seadrop_address.as_deref(), nft_contract),
+                )
+                .await
+                .context("SeaDrop state check timed out outside the T0 hot path")??;
+                let verified_price = validate_seadrop_public_state(
+                    &state,
+                    expected_unit_price_wei,
+                    quantity,
+                    start_ts,
+                )?;
+                let resolved_fee_recipient =
+                    resolve_public_fee_recipient(&state, fee_recipient.as_deref())?;
+                if resolved_fee_recipient != fee_recipient {
+                    if let Some(ref recipient) = resolved_fee_recipient {
+                        log_always(
+                            reporter.as_ref(),
+                            format!("  SeaDrop fee recipient resolved on chain: {recipient}"),
+                        );
                     }
-                    let rpc = rpc.clone();
-                    let addr = w.address;
-                    refresh_handles.spawn(async move {
-                        let result = rpc.nonce(&addr).await;
-                        (addr, result)
-                    });
+                    fee_recipient = resolved_fee_recipient;
                 }
-                loop {
-                    if refresh_handles.is_empty() {
-                        break;
-                    }
-                    let remaining =
-                        refresh_deadline.saturating_duration_since(std::time::Instant::now());
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    match tokio::time::timeout(remaining, refresh_handles.join_next()).await {
-                        Ok(Some(Ok((addr, Ok(n))))) => {
-                            if let Some(w) = wallets.iter_mut().find(|w| w.address == addr) {
-                                w.nonce = n;
-                            }
-                        }
-                        Ok(Some(_)) => {}
-                        Ok(None) | Err(_) => break,
-                    }
-                }
-                refresh_handles.abort_all();
-
-                if let Some(mut handle) = public_state_handle.take() {
-                    let remaining =
-                        refresh_deadline.saturating_duration_since(std::time::Instant::now());
-                    let state = if handle.is_finished() {
-                        handle.await.context("SeaDrop state task failed")??
-                    } else if remaining.is_zero() {
-                        handle.abort();
-                        bail!("Final SeaDrop state check timed out before T0; mint not broadcast");
-                    } else {
-                        match tokio::time::timeout(remaining, &mut handle).await {
-                            Ok(joined) => joined.context("SeaDrop state task failed")??,
-                            Err(_) => {
-                                handle.abort();
-                                bail!(
-                                    "Final SeaDrop state check timed out before T0; mint not broadcast"
-                                );
-                            }
-                        }
-                    };
-                    let verified_price = validate_seadrop_public_state(
-                        &state,
-                        expected_unit_price_wei,
-                        quantity,
-                        start_ts,
-                    )?;
-                    let resolved_fee_recipient =
-                        resolve_public_fee_recipient(&state, fee_recipient.as_deref())?;
-                    if resolved_fee_recipient != fee_recipient {
-                        if let Some(ref recipient) = resolved_fee_recipient {
-                            log_always(
-                                reporter.as_ref(),
-                                format!("  SeaDrop fee recipient resolved on chain: {recipient}"),
-                            );
-                        }
-                        fee_recipient = resolved_fee_recipient;
-                    }
-                    price_wei = verified_price;
-                    let rebuilt = rebuild_local_public_wallets(
-                        &mut wallets,
-                        &wallet_quantities,
-                        quantity,
-                        nft_contract,
-                        price_wei,
-                        seadrop_address.as_deref(),
-                        fee_recipient.as_deref(),
-                    )?;
-                    public_drop_final_verified = true;
-                    log_always(
-                        reporter.as_ref(),
-                        format!(
-                            "  SeaDrop FINAL OK before T0: price={} wei, rebuilt={rebuilt}",
-                            price_wei
-                        ),
-                    );
-                }
-
-                let fee_remaining =
-                    refresh_deadline.saturating_duration_since(std::time::Instant::now());
-                let fee_result = if fee_handle.is_finished() {
-                    fee_handle.await.ok().and_then(Result::ok)
-                } else if fee_remaining.is_zero() {
-                    fee_handle.abort();
-                    None
-                } else {
-                    match tokio::time::timeout(fee_remaining, &mut fee_handle).await {
-                        Ok(Ok(Ok(fees))) => Some(fees),
-                        _ => {
-                            fee_handle.abort();
-                            None
-                        }
-                    }
-                };
-                if let Some(fees) = fee_result {
-                    if let Ok((new_max_fee, new_priority)) =
-                        gas::calculate_fees(&gas_params, fees.0, fees.1)
-                    {
-                        max_fee = new_max_fee;
-                        max_priority_fee = new_priority;
-                    }
-                }
-                nonce_refreshed = true;
+                price_wei = verified_price;
+                let rebuilt = rebuild_local_public_wallets(
+                    &mut wallets,
+                    &wallet_quantities,
+                    quantity,
+                    nft_contract,
+                    price_wei,
+                    seadrop_address.as_deref(),
+                    fee_recipient.as_deref(),
+                )?;
+                public_drop_final_verified = true;
+                preopen_finalized = true;
+                log_always(
+                    reporter.as_ref(),
+                    format!(
+                        "  SeaDrop FINAL OK with >=30s safety margin: price={} wei, rebuilt={rebuilt}",
+                        price_wei
+                    ),
+                );
 
                 collect_ready_prefetches(&mut prefetch_handles, &mut wallets);
                 if pre_sign_enabled {
@@ -3382,7 +3295,7 @@ async fn run_opensea_mint_inner(
 
             if !prep_frozen {
                 collect_ready_prefetches(&mut prefetch_handles, &mut wallets);
-                if nonce_refreshed && pre_sign_enabled {
+                if preopen_finalized && pre_sign_enabled {
                     pre_sign_ready_wallets(
                         &mut wallets,
                         chain_id,
@@ -3395,7 +3308,7 @@ async fn run_opensea_mint_inner(
 
             if conditional_submit_enabled
                 && !conditional_started
-                && nonce_refreshed
+                && preopen_finalized
                 && remaining_ms <= conditional_lead_ms as i64
             {
                 conditional_started = true;
@@ -3687,7 +3600,6 @@ async fn run_opensea_mint_inner(
         let use_flashbots_w = use_flashbots;
         let fb_pieces_w = fb_pieces.clone();
         let dry_run_w = dry_run;
-        let scheduled_fire_lag_ms_w = scheduled_fire_lag_ms;
         // Bound at auth time (signer index) — never re-derive from wallets order.
         let proxy_url_w = w.proxy_url.clone();
         let ink_broadcast = chain_id == 57073;
@@ -3720,11 +3632,12 @@ async fn run_opensea_mint_inner(
                 && !skip_preflight_w
                 && !skip_estimate_on_open
                 && in_phase_open_lag_window(stage_start_ts_w, wall_at_spawn);
-            let mut force_fixed_gas = if dry_run_w {
-                skip_preflight_w || skip_estimate_on_open || auto_skip_estimate
-            } else {
-                true
-            };
+            let mut force_fixed_gas = initial_force_fixed_gas(
+                dry_run_w,
+                skip_preflight_w,
+                skip_estimate_on_open,
+                auto_skip_estimate,
+            );
             let mut logged_auto_skip = false;
             let mut logged_reuse = false;
             let mut proven_early_recoveries = 0u32;
@@ -4138,79 +4051,6 @@ async fn run_opensea_mint_inner(
                             }
                         }
                     };
-
-                // A manual/late launch is not competing at the exact opening
-                // edge anymore.  Read the current contract state before the
-                // first paid send so a sold-out phase or exhausted wallet
-                // allowance cannot consume gas merely because LIVE normally
-                // skips estimation for speed.
-                if !dry_run_w
-                    && attempt == 1
-                    && scheduled_fire_lag_ms_w
-                        .is_some_and(|lag| lag >= LATE_LIVE_PREFLIGHT_MS)
-                {
-                    let guard_started = std::time::Instant::now();
-                    match rpc
-                        .estimate_gas(&addr, &to_addr, tx_value, &calldata)
-                        .await
-                    {
-                        Ok(estimate) => log_always(
-                            reporter.as_ref(),
-                            format!(
-                                "[{}] LATE PREFLIGHT OK {}ms est={} — live send allowed",
-                                sign::shorten_address(&addr),
-                                guard_started.elapsed().as_millis(),
-                                estimate
-                            ),
-                        ),
-                        Err(error) => {
-                            let raw = format!("{error}");
-                            if late_preflight_proves_rejection(&raw) {
-                                let reason = enrich_mint_rpc_error(&raw);
-                                let message = format!(
-                                    "late preflight blocked paid send: {reason}"
-                                );
-                                log_always(
-                                    reporter.as_ref(),
-                                    format!(
-                                        "[{}] LATE PREFLIGHT BLOCKED {}ms: {}",
-                                        sign::shorten_address(&addr),
-                                        guard_started.elapsed().as_millis(),
-                                        reason
-                                    ),
-                                );
-                                report_wallet(
-                                    reporter.as_ref(),
-                                    &addr,
-                                    Some(WalletStatus::Failed),
-                                    Some("not broadcast — contract rejected simulation".into()),
-                                    None,
-                                    Some(message.clone()),
-                                );
-                                break (
-                                    addr,
-                                    MintResult {
-                                        address: addr,
-                                        tx_hash: None,
-                                        status: WalletStatus::Failed,
-                                        gas_used: None,
-                                        block_number: None,
-                                        error: Some(message),
-                                    },
-                                );
-                            }
-                            log_always(
-                                reporter.as_ref(),
-                                format!(
-                                    "[{}] WARN: late preflight RPC unavailable ({}ms); no contract rejection proven — preserving live send: {}",
-                                    sign::shorten_address(&addr),
-                                    guard_started.elapsed().as_millis(),
-                                    raw
-                                ),
-                            );
-                        }
-                    }
-                }
 
                 let gas_limit = if force_fixed_gas {
                     let fixed_raw = fixed_gas_limit_owned.unwrap_or(250_000);
@@ -5689,15 +5529,16 @@ mod tests {
     use super::{
         GQL_STAGGER_MAX_SPREAD_MS, NOT_ACTIVE_CHAIN_WAIT_MAX_SECS, NotActiveInfo,
         OPENSEA_MINT_ACTION_BUDGET, OPENSEA_MINT_ACTION_REFILL_MS, PHASE_OPEN_LAG_WINDOW_SECS,
-        RATE_LIMIT_WAIT_BUDGET_MS, SeaDropPublicState, WalletAuth, assigned_proxy_routes,
-        build_local_public_mint, classify_mint_error, decode_common_seadrop_revert,
-        enrich_mint_rpc_error, estimate_fail_policy, fire_lag_ms_from_clock, format_not_active,
-        format_rpc_plan, gql_action_not_ready_delay, gql_stagger_step_ms, in_phase_open_lag_window,
-        is_gql_action_not_ready, is_proven_pre_open_revert, is_terminal_gql_action_error,
-        keep_before_opensea_auth, late_preflight_proves_rejection, parse_not_active,
-        parse_tx_calldata_hex, pre_sign_ready_wallets, rate_limit_backoff, resolve_mint_gas_limit,
-        resolve_public_fee_recipient, validate_seadrop_calldata, validate_seadrop_public_state,
-        validate_wallet_subset_counts,
+        PREOPEN_PUBLIC_FINALIZE_LEAD_MS, RATE_LIMIT_WAIT_BUDGET_MS, ScheduledPreopenPlan,
+        SeaDropPublicState, WalletAuth, assigned_proxy_routes, build_local_public_mint,
+        classify_mint_error, decode_common_seadrop_revert, enrich_mint_rpc_error,
+        estimate_fail_policy, fire_lag_ms_from_clock, format_not_active, format_rpc_plan,
+        gql_action_not_ready_delay, gql_stagger_step_ms, in_phase_open_lag_window,
+        initial_force_fixed_gas, is_gql_action_not_ready, is_proven_pre_open_revert,
+        is_terminal_gql_action_error, keep_before_opensea_auth, parse_not_active,
+        parse_tx_calldata_hex, pre_sign_ready_wallets, rate_limit_backoff, required_mint_balance,
+        resolve_mint_gas_limit, resolve_public_fee_recipient, scheduled_preopen_plan,
+        validate_seadrop_calldata, validate_seadrop_public_state, validate_wallet_subset_counts,
     };
     use crate::proxy::ProxyManager;
     use crate::types::Signer;
@@ -6094,19 +5935,6 @@ mod tests {
     }
 
     #[test]
-    fn late_preflight_blocks_contract_reverts_but_not_transport_noise() {
-        assert!(late_preflight_proves_rejection(
-            "execution reverted: MintQuantityExceedsMaxSupply"
-        ));
-        assert!(late_preflight_proves_rejection(WONKIES_NOT_ACTIVE));
-        assert!(late_preflight_proves_rejection(
-            "RPC error: execution reverted"
-        ));
-        assert!(!late_preflight_proves_rejection("RPC request timed out"));
-        assert!(!late_preflight_proves_rejection("connection reset"));
-    }
-
-    #[test]
     fn wallet_subset_must_match_the_requested_set_exactly() {
         assert!(validate_wallet_subset_counts(10, 10, 10).is_ok());
         let missing = validate_wallet_subset_counts(10, 10, 1).unwrap_err();
@@ -6133,6 +5961,38 @@ mod tests {
                 .filter(|balance| keep_before_opensea_auth(*balance))
                 .count(),
             10
+        );
+    }
+
+    #[test]
+    fn balance_gate_uses_the_exact_live_transaction_ceiling() {
+        let mint_value = U256::ZERO;
+        let gas_limit = 250_000u64;
+        let max_fee = U256::from(77_888_000u64);
+        assert_eq!(
+            required_mint_balance(mint_value, gas_limit, max_fee),
+            U256::from(19_472_000_000_000u64)
+        );
+        assert!(
+            U256::from(10_000_000_000_000u64)
+                < required_mint_balance(mint_value, gas_limit, max_fee),
+            "the 0.00001 ETH ROBINMAP wallets must be rejected during preparation"
+        );
+    }
+
+    #[test]
+    fn one_hundred_signed_wallets_schedule_no_preopen_rpc_refresh() {
+        assert!(PREOPEN_PUBLIC_FINALIZE_LEAD_MS >= 30_000);
+        for _ in 0..100 {
+            assert_eq!(
+                scheduled_preopen_plan("SIGNED_PRESALE", true),
+                ScheduledPreopenPlan::CachedOnly
+            );
+            assert!(initial_force_fixed_gas(false, false, true, false));
+        }
+        assert_eq!(
+            scheduled_preopen_plan("PUBLIC_SALE", false),
+            ScheduledPreopenPlan::ValidatePublicState
         );
     }
 

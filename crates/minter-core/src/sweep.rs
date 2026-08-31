@@ -618,6 +618,15 @@ pub struct AutoNftSweepConfig {
     pub alchemy_api_key: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintAutoSweepReport {
+    pub discovered: usize,
+    pub swept: usize,
+    pub failed: usize,
+    pub skipped_destination: bool,
+    pub errors: Vec<String>,
+}
+
 fn nft_sweep_result(
     address: Address,
     asset: Option<&NftAsset>,
@@ -1227,6 +1236,241 @@ fn build_erc1155_transfer_calldata(
     data.extend(encode_u256(U256::from(160u64)));
     data.extend(encode_u256(U256::ZERO));
     Bytes::from(data)
+}
+
+fn minted_assets_from_receipt(
+    receipt: &Value,
+    contract_filter: Address,
+    owner: Address,
+) -> Vec<NftAsset> {
+    let transfer = event_topic("Transfer(address,address,uint256)").to_ascii_lowercase();
+    let transfer_single =
+        event_topic("TransferSingle(address,address,address,uint256,uint256)").to_ascii_lowercase();
+    let transfer_batch = event_topic("TransferBatch(address,address,address,uint256[],uint256[])")
+        .to_ascii_lowercase();
+    let zero = Address::ZERO;
+    let mut assets = Vec::new();
+
+    for log in receipt
+        .get("logs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(contract) = log
+            .get("address")
+            .and_then(Value::as_str)
+            .and_then(|raw| raw.parse::<Address>().ok())
+        else {
+            continue;
+        };
+        if contract != contract_filter {
+            continue;
+        }
+        let Some(topics) = log.get("topics").and_then(Value::as_array) else {
+            continue;
+        };
+        let topic0 = topics
+            .first()
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        if topic0 == transfer && topics.len() == 4 {
+            let from = topics.get(1).and_then(address_from_topic);
+            let to = topics.get(2).and_then(address_from_topic);
+            let token_id = topics
+                .get(3)
+                .and_then(Value::as_str)
+                .and_then(parse_token_id_str);
+            if from == Some(zero) && to == Some(owner) {
+                if let Some(token_id) = token_id {
+                    assets.push(NftAsset {
+                        contract,
+                        token_id,
+                        kind: NftKind::Erc721,
+                        amount: U256::from(1u64),
+                    });
+                }
+            }
+            continue;
+        }
+
+        if (topic0 == transfer_single || topic0 == transfer_batch) && topics.len() == 4 {
+            let from = topics.get(2).and_then(address_from_topic);
+            let to = topics.get(3).and_then(address_from_topic);
+            if from != Some(zero) || to != Some(owner) {
+                continue;
+            }
+            let Some(raw_data) = log
+                .get("data")
+                .and_then(Value::as_str)
+                .and_then(|raw| raw.strip_prefix("0x"))
+                .and_then(|raw| hex::decode(raw).ok())
+            else {
+                continue;
+            };
+            let pairs = if topic0 == transfer_single && raw_data.len() == 64 {
+                decode_u256(&raw_data[..32])
+                    .ok()
+                    .zip(decode_u256(&raw_data[32..64]).ok())
+                    .map(|pair| vec![pair])
+            } else if topic0 == transfer_batch {
+                abi_u256_array(&raw_data, 0)
+                    .zip(abi_u256_array(&raw_data, 1))
+                    .filter(|(ids, amounts)| ids.len() == amounts.len())
+                    .map(|(ids, amounts)| ids.into_iter().zip(amounts).collect())
+            } else {
+                None
+            };
+            for (token_id, amount) in pairs.into_iter().flatten() {
+                if !amount.is_zero() {
+                    assets.push(NftAsset {
+                        contract,
+                        token_id,
+                        kind: NftKind::Erc1155,
+                        amount,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut seen = HashSet::new();
+    assets.retain(|asset| seen.insert((asset.contract, asset.token_id, asset.kind)));
+    assets
+}
+
+/// Transfer only NFTs proven to have been minted by one successful receipt.
+/// This avoids indexer lag and never sweeps unrelated inventory from the wallet.
+pub async fn sweep_mint_receipt_nfts(
+    signer: &Signer,
+    rpc: &RpcClient,
+    receipt: &Value,
+    contract: Address,
+    destination: Address,
+    gas_params: &GasParams,
+) -> Result<MintAutoSweepReport> {
+    let owner = signer.address();
+    if owner == destination {
+        return Ok(MintAutoSweepReport {
+            discovered: 0,
+            swept: 0,
+            failed: 0,
+            skipped_destination: true,
+            errors: Vec::new(),
+        });
+    }
+
+    let assets = minted_assets_from_receipt(receipt, contract, owner);
+    if assets.is_empty() {
+        bail!("mint receipt contains no standard NFT transfer to this wallet");
+    }
+    let chain_id = rpc.chain_id().await.context("auto-sweep chain id")?;
+    if chain_id == 0 {
+        bail!("auto-sweep RPC returned chain id 0");
+    }
+    let (base_fee, network_priority) = rpc
+        .fee_history()
+        .await
+        .unwrap_or((U256::from(1_000_000_000u64), U256::from(1_000_000_000u64)));
+    let (max_fee, max_priority_fee) = gas::calculate_fees(gas_params, base_fee, network_priority)?;
+    let mut nonce = rpc.nonce(&owner).await.context("auto-sweep nonce")?;
+    let mut swept = 0usize;
+    let mut errors = Vec::new();
+
+    for asset in &assets {
+        let calldata = match asset.kind {
+            NftKind::Erc721 => match nft_owner_of(rpc, asset.contract, asset.token_id).await {
+                Ok(current) if current == owner => {
+                    build_safe_transfer_calldata(&owner, &destination, asset.token_id)
+                }
+                Ok(current) => {
+                    errors.push(format!("#{} owner changed to {current:?}", asset.token_id));
+                    continue;
+                }
+                Err(error) => {
+                    errors.push(format!("#{} ownerOf: {error}", asset.token_id));
+                    continue;
+                }
+            },
+            NftKind::Erc1155 => {
+                let amount =
+                    match nft_erc1155_balance(rpc, asset.contract, owner, asset.token_id).await {
+                        Ok(amount) if !amount.is_zero() => amount.min(asset.amount),
+                        Ok(_) => {
+                            errors.push(format!("#{} ERC-1155 balance is zero", asset.token_id));
+                            continue;
+                        }
+                        Err(error) => {
+                            errors.push(format!("#{} balanceOf: {error}", asset.token_id));
+                            continue;
+                        }
+                    };
+                build_erc1155_transfer_calldata(owner, destination, asset.token_id, amount)
+            }
+        };
+        let gas_limit = match rpc
+            .estimate_gas(&owner, &asset.contract, U256::ZERO, &calldata)
+            .await
+        {
+            Ok(estimated) => {
+                gas::apply_gas_limit(estimated, gas_params.gas_multiplier, chain_id, 21_000)
+            }
+            Err(error) => {
+                errors.push(format!("#{} estimateGas: {error}", asset.token_id));
+                continue;
+            }
+        };
+        let tx = BuiltTx {
+            chain_id,
+            nonce,
+            to: asset.contract,
+            value: U256::ZERO,
+            data: calldata,
+            gas_limit,
+            max_fee,
+            max_priority_fee,
+        };
+        let (raw, signed_hash) = match sign_transaction(signer, &tx) {
+            Ok(signed) => signed,
+            Err(error) => {
+                errors.push(format!("#{} sign: {error}", asset.token_id));
+                continue;
+            }
+        };
+        let tx_hash = match rpc.race_send(&raw).await {
+            Ok(hash) => hash,
+            Err(error) if crate::errors::is_already_known(&error.to_string()) => signed_hash,
+            Err(error) => {
+                errors.push(format!("#{} send: {error}", asset.token_id));
+                continue;
+            }
+        };
+        match rpc.wait_for_receipt(&tx_hash, 120).await {
+            Ok(receipt) => {
+                nonce = nonce.saturating_add(1);
+                let info = crate::rpc::parse_receipt(&receipt);
+                if info.success {
+                    swept += 1;
+                } else {
+                    errors.push(format!("#{} transfer reverted", asset.token_id));
+                }
+            }
+            Err(error) => {
+                nonce = rpc.nonce(&owner).await.unwrap_or(nonce.saturating_add(1));
+                errors.push(format!("#{} receipt: {error}", asset.token_id));
+            }
+        }
+    }
+
+    Ok(MintAutoSweepReport {
+        discovered: assets.len(),
+        swept,
+        failed: assets.len().saturating_sub(swept),
+        skipped_destination: false,
+        errors,
+    })
 }
 
 /// Discover and sweep ERC-721/ERC-1155 assets from exactly the supplied Vault
@@ -1931,6 +2175,44 @@ mod fmt_eth_tests {
         assert_eq!(asset.contract, contract);
         assert_eq!(asset.token_id, U256::from(3780u64));
         assert_eq!(asset.kind, NftKind::Erc721);
+    }
+
+    #[test]
+    fn mint_receipt_parser_only_takes_new_tokens_for_this_wallet_and_contract() {
+        let owner: Address = "0x9398b40726ee913f047c3b7d8da91d6f811f227c"
+            .parse()
+            .unwrap();
+        let other: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let contract: Address = "0x29b5dd6dd7b79c7a8fb9f928dc11abaa5da9c02a"
+            .parse()
+            .unwrap();
+        let unrelated: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let transfer = event_topic("Transfer(address,address,uint256)");
+        let receipt = json!({"logs": [
+            {
+                "address": format!("{contract:?}"),
+                "topics": [transfer, address_topic(Address::ZERO), address_topic(owner), format!("0x{:064x}", 7)],
+                "data": "0x"
+            },
+            {
+                "address": format!("{contract:?}"),
+                "topics": [event_topic("Transfer(address,address,uint256)"), address_topic(Address::ZERO), address_topic(other), format!("0x{:064x}", 8)],
+                "data": "0x"
+            },
+            {
+                "address": format!("{unrelated:?}"),
+                "topics": [event_topic("Transfer(address,address,uint256)"), address_topic(Address::ZERO), address_topic(owner), format!("0x{:064x}", 9)],
+                "data": "0x"
+            }
+        ]});
+        let assets = minted_assets_from_receipt(&receipt, contract, owner);
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].token_id, U256::from(7u64));
+        assert_eq!(assets[0].contract, contract);
     }
 
     #[test]

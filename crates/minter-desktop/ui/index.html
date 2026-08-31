@@ -849,7 +849,7 @@
                         <th style="width:38%" data-i18n="col.address">Address</th>
                         <th style="width:52px" data-i18n="wallets.col.group">Grp</th>
                         <th style="width:22%" data-i18n="wallets.col.proxy">Proxy</th>
-                        <th style="width:110px" data-i18n="wallets.col.balance">Balance</th>
+                        <th style="width:150px" data-i18n="wallets.col.balance">Balance</th>
                       </tr>
                     </thead>
                     <tbody id="wallet-tbody"></tbody>
@@ -1182,6 +1182,13 @@
         <div id="task-qty-map-wrap" class="task-qty-map-wrap hidden">
           <p class="muted small" data-i18n="tasks.perWalletQtyHint">Set qty per checked wallet after selecting wallets (default uses task qty).</p>
           <div id="task-qty-map" class="task-qty-map"></div>
+        </div>
+        <label class="check"><input type="checkbox" id="task-auto-sweep" /> <span data-i18n="tasks.autoSweep">Auto-sweep minted NFTs</span></label>
+        <div id="task-auto-sweep-wrap" class="hidden">
+          <label><span data-i18n="tasks.autoSweepDestination">Sweep destination</span>
+            <input type="text" id="task-auto-sweep-destination" placeholder="0x..." autocomplete="off" spellcheck="false" />
+          </label>
+          <p class="muted small" data-i18n="tasks.autoSweepHint">After each confirmed mint, transfer its NFTs to this address. Sweep errors never change mint success.</p>
         </div>
         <p class="muted small" data-i18n="tasks.startHint">Start = live mint. Fixed gas, wait open, send → success after on-chain confirm.</p>
         <div class="wallet-pick-head">

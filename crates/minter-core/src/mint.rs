@@ -3,7 +3,7 @@
 
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use anyhow::{Context, Result, bail};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -974,6 +974,77 @@ fn receipt_to_result(
             Some("transaction reverted on chain".to_string())
         },
     }
+}
+
+type AutoSweepJobResult = (
+    Address,
+    std::result::Result<crate::sweep::MintAutoSweepReport, String>,
+);
+
+fn spawn_auto_sweep_for_confirmed(
+    jobs: &mut tokio::task::JoinSet<AutoSweepJobResult>,
+    started: &mut HashSet<Address>,
+    result: &MintResult,
+    signers: &HashMap<Address, Signer>,
+    rpc: &rpc::RpcClient,
+    contract: Address,
+    destination: Option<Address>,
+    gas_params: &GasParams,
+) -> bool {
+    let Some(destination) = destination else {
+        return false;
+    };
+    if result.status != WalletStatus::Confirmed || !started.insert(result.address) {
+        return false;
+    }
+    let address = result.address;
+    if address == destination {
+        jobs.spawn(async move {
+            (
+                address,
+                Ok(crate::sweep::MintAutoSweepReport {
+                    discovered: 0,
+                    swept: 0,
+                    failed: 0,
+                    skipped_destination: true,
+                    errors: Vec::new(),
+                }),
+            )
+        });
+        return true;
+    }
+    let Some(signer) = signers.get(&address).cloned() else {
+        jobs.spawn(async move { (address, Err("signer missing after mint".to_string())) });
+        return true;
+    };
+    let Some(tx_hash) = result.tx_hash else {
+        jobs.spawn(async move { (address, Err("confirmed mint has no tx hash".to_string())) });
+        return true;
+    };
+    let rpc = rpc.clone();
+    let gas_params = gas_params.clone();
+    jobs.spawn(async move {
+        let outcome = async {
+            let receipt = rpc
+                .transaction_receipt(&tx_hash)
+                .await
+                .map_err(|error| format!("mint receipt lookup: {error}"))?
+                .ok_or_else(|| "mint receipt disappeared before auto-sweep".to_string())?;
+            crate::sweep::sweep_mint_receipt_nfts(
+                &signer,
+                &rpc,
+                &receipt,
+                contract,
+                destination,
+                &gas_params,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        }
+        .await;
+        (address, outcome)
+    });
+    true
 }
 
 async fn fetch_and_parse_gql(
@@ -3488,6 +3559,40 @@ async fn run_opensea_mint_inner(
         bail!("Mint cancelled before workers started");
     }
 
+    let auto_sweep_destination = if dry_run {
+        None
+    } else {
+        opts.auto_sweep_destination
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                let destination: Address = value
+                    .parse()
+                    .context("invalid auto-sweep destination address")?;
+                if destination == Address::ZERO {
+                    bail!("auto-sweep destination is the zero address");
+                }
+                Ok(destination)
+            })
+            .transpose()?
+    };
+    let auto_sweep_contract: Address = nft_contract
+        .parse()
+        .context("invalid NFT contract for auto-sweep")?;
+    if let Some(destination) = auto_sweep_destination {
+        log_always(
+            reporter.as_ref(),
+            format!("Auto-sweep armed: confirmed mint NFTs → {destination:?}"),
+        );
+    }
+    let auto_sweep_signers: HashMap<Address, Signer> = wallets
+        .iter()
+        .map(|wallet| (wallet.address, wallet.signer.clone()))
+        .collect();
+    let mut auto_sweep_jobs: tokio::task::JoinSet<AutoSweepJobResult> = tokio::task::JoinSet::new();
+    let mut auto_sweep_started = HashSet::new();
+
     let rpc_clone = rpc.clone();
     let mint_started_at = std::time::Instant::now();
     let fb_pieces: Arc<std::sync::Mutex<Vec<BundleTx>>> =
@@ -5132,6 +5237,16 @@ async fn run_opensea_mint_inner(
                     result.tx_hash,
                     result.error.clone(),
                 );
+                spawn_auto_sweep_for_confirmed(
+                    &mut auto_sweep_jobs,
+                    &mut auto_sweep_started,
+                    &result,
+                    &auto_sweep_signers,
+                    &rpc,
+                    auto_sweep_contract,
+                    auto_sweep_destination,
+                    &gas_params,
+                );
                 results.push(result);
             }
             Err(e) => {
@@ -5382,7 +5497,77 @@ async fn run_opensea_mint_inner(
         }
     }
 
-    let elapsed = mint_started_at.elapsed().as_millis() as u64;
+    // Reconciliation and Flashbots inclusion can turn a late Sent row into a
+    // confirmed mint after its worker returned. Start those missing sweeps now;
+    // already-started wallets are deduplicated by address.
+    for result in &results {
+        spawn_auto_sweep_for_confirmed(
+            &mut auto_sweep_jobs,
+            &mut auto_sweep_started,
+            result,
+            &auto_sweep_signers,
+            &rpc,
+            auto_sweep_contract,
+            auto_sweep_destination,
+            &gas_params,
+        );
+    }
+    // Freeze mint timing before waiting for post-mint transfers. Sweep duration
+    // must never make the sniper itself look slower in performance logs.
+    let mint_elapsed = mint_started_at.elapsed().as_millis() as u64;
+    if auto_sweep_destination.is_some() && !auto_sweep_jobs.is_empty() {
+        report_phase(
+            reporter.as_ref(),
+            "sweep",
+            format!(
+                "Auto-sweeping {} confirmed wallet(s)…",
+                auto_sweep_jobs.len()
+            ),
+        );
+        while let Some(joined) = auto_sweep_jobs.join_next().await {
+            match joined {
+                Ok((address, Ok(report))) if report.skipped_destination => log_always(
+                    reporter.as_ref(),
+                    format!(
+                        "[{}] AUTO-SWEEP skipped: wallet is the destination",
+                        sign::shorten_address(&address)
+                    ),
+                ),
+                Ok((address, Ok(report))) => {
+                    let detail = report
+                        .errors
+                        .first()
+                        .map(|error| format!(" · {error}"))
+                        .unwrap_or_default();
+                    log_always(
+                        reporter.as_ref(),
+                        format!(
+                            "[{}] AUTO-SWEEP {}/{} confirmed, {} failed{}",
+                            sign::shorten_address(&address),
+                            report.swept,
+                            report.discovered,
+                            report.failed,
+                            detail
+                        ),
+                    );
+                }
+                Ok((address, Err(error))) => log_always(
+                    reporter.as_ref(),
+                    format!(
+                        "[{}] AUTO-SWEEP failed (mint remains successful): {}",
+                        sign::shorten_address(&address),
+                        error
+                    ),
+                ),
+                Err(error) => log_always(
+                    reporter.as_ref(),
+                    format!("AUTO-SWEEP worker failed: {error}"),
+                ),
+            }
+        }
+    }
+
+    let elapsed = mint_elapsed;
     // Success only after on-chain confirm (or dry-run OK). SENT is not enough.
     let confirmed = results
         .iter()

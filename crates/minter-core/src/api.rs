@@ -314,11 +314,83 @@ pub struct WalletBalanceRow {
     pub address: String,
     pub balance_eth: String,
     pub balance_wei: String,
+    pub balance_usd: Option<String>,
+    pub usd_price: Option<String>,
+    pub native_symbol: String,
     pub ok: bool,
     pub error: Option<String>,
     /// Network used for this balance (e.g. base).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<String>,
+}
+
+fn native_symbol_for_chain(chain: Option<&str>) -> &'static str {
+    match chain
+        .unwrap_or("ethereum")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "polygon" | "matic" => "POL",
+        "bsc" | "binance" => "BNB",
+        "avalanche" | "avax" => "AVAX",
+        "apechain" | "ape" => "APE",
+        "monad" => "MON",
+        _ => "ETH",
+    }
+}
+
+async fn alchemy_usd_price(api_key: &str, symbol: &str) -> Result<f64> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .context("price client")?;
+    let url = format!(
+        "https://api.g.alchemy.com/prices/v1/{}/tokens/by-symbol",
+        api_key.trim()
+    );
+    let payload: serde_json::Value = client
+        .get(url)
+        .query(&[("symbols", symbol)])
+        .send()
+        .await
+        .context("Alchemy price request")?
+        .error_for_status()
+        .context("Alchemy price response")?
+        .json()
+        .await
+        .context("Alchemy price JSON")?;
+    payload
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|row| row.get("symbol").and_then(serde_json::Value::as_str) == Some(symbol))
+        .and_then(|row| row.get("prices"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|price| {
+            price
+                .get("currency")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|currency| currency.eq_ignore_ascii_case("USD"))
+        })
+        .and_then(|price| price.get("value"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .context("Alchemy returned no USD price")
+}
+
+fn format_usd_value(value: f64) -> String {
+    if value >= 0.01 {
+        format!("{value:.2}")
+    } else if value >= 0.0001 {
+        format!("{value:.4}")
+    } else {
+        format!("{value:.6}")
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -652,6 +724,15 @@ impl Session {
             Some(c) => self.rpc_client_for_chain(c)?,
             None => self.rpc_client()?,
         };
+        let native_symbol = native_symbol_for_chain(chain).to_string();
+        // One price request per explicit balance refresh, never per wallet.
+        let usd_price = if self.settings.alchemy_api_key.trim().is_empty() {
+            None
+        } else {
+            alchemy_usd_price(&self.settings.alchemy_api_key, &native_symbol)
+                .await
+                .ok()
+        };
         let filter: Option<std::collections::HashSet<String>> = wallet_addresses.and_then(|v| {
             let set: std::collections::HashSet<String> = v
                 .into_iter()
@@ -682,6 +763,13 @@ impl Session {
                         address: addr_s,
                         balance_eth: eth,
                         balance_wei: wei.to_string(),
+                        balance_usd: usd_price.map(|price| {
+                            let native =
+                                amount::wei_to_eth_string(wei).parse::<f64>().unwrap_or(0.0);
+                            format_usd_value(native * price)
+                        }),
+                        usd_price: usd_price.map(|price| format!("{price:.2}")),
+                        native_symbol: native_symbol.clone(),
                         ok,
                         error: None,
                         chain: chain_label.clone(),
@@ -692,6 +780,9 @@ impl Session {
                         address: addr_s,
                         balance_eth: "—".into(),
                         balance_wei: "0".into(),
+                        balance_usd: None,
+                        usd_price: usd_price.map(|price| format!("{price:.2}")),
+                        native_symbol: native_symbol.clone(),
                         ok: false,
                         error: Some(e.to_string()),
                         chain: chain_label.clone(),
@@ -3148,6 +3239,15 @@ mod session_debug_tests {
     use super::*;
 
     #[test]
+    fn native_usd_symbols_follow_selected_chain() {
+        assert_eq!(native_symbol_for_chain(Some("base")), "ETH");
+        assert_eq!(native_symbol_for_chain(Some("polygon")), "POL");
+        assert_eq!(native_symbol_for_chain(Some("apechain")), "APE");
+        assert_eq!(format_usd_value(12.345), "12.35");
+        assert_eq!(format_usd_value(0.001234), "0.0012");
+    }
+
+    #[test]
     fn adopt_unlocked_moves_password_and_leaves_source_locked() {
         let mut target = Session::default_paths();
         let mut src = Session::default_paths();
@@ -3718,6 +3818,8 @@ pub struct MintOptions {
     pub conditional_submit_enabled: Option<bool>,
     /// How many milliseconds before T0 to submit the conditional transaction.
     pub conditional_lead_ms: Option<u64>,
+    /// Optional destination for post-confirmation NFT transfers. Disabled when absent.
+    pub auto_sweep_destination: Option<String>,
 }
 
 impl Default for MintOptions {
@@ -3744,6 +3846,7 @@ impl Default for MintOptions {
             use_flashbots: None,
             conditional_submit_enabled: None,
             conditional_lead_ms: None,
+            auto_sweep_destination: None,
         }
     }
 }

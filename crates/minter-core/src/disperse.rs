@@ -18,6 +18,24 @@ pub struct DisperseConfig {
     pub dry_run: bool,
 }
 
+fn disperse_totals(
+    amount: U256,
+    recipients: usize,
+    gas_limit: u64,
+    max_fee: U256,
+) -> (U256, U256, U256) {
+    let count = U256::from(recipients as u64);
+    let value_total = amount.saturating_mul(count);
+    let gas_total = max_fee
+        .saturating_mul(U256::from(gas_limit))
+        .saturating_mul(count);
+    (
+        value_total,
+        gas_total,
+        value_total.saturating_add(gas_total),
+    )
+}
+
 /// Send `amount` native coin from `from` to each `destinations` address (sequential nonces).
 /// Each result row uses the **destination** address.
 pub async fn run_disperse(
@@ -109,21 +127,15 @@ pub async fn run_disperse(
         config.gas.gas_multiplier,
     )
     .await;
-    let n = destinations.len() as u64;
     let gas_cost_one = max_fee * U256::from(gas_limit);
-    let total_need = config
-        .amount
-        .saturating_mul(U256::from(n))
-        .saturating_add(gas_cost_one.saturating_mul(U256::from(n)));
+    let (total_value, _total_gas, total_need) =
+        disperse_totals(config.amount, destinations.len(), gas_limit, max_fee);
 
     crate::rlog!("\nDisperse Summary:");
     crate::rlog!("  From:        {:?}", from_addr);
     crate::rlog!("  To:          {} wallet(s)", destinations.len());
     crate::rlog!("  Amount each: {} ETH", fmt_eth(config.amount));
-    crate::rlog!(
-        "  Total value: {} ETH",
-        fmt_eth(config.amount.saturating_mul(U256::from(n)))
-    );
+    crate::rlog!("  Total value: {} ETH", fmt_eth(total_value));
     crate::rlog!("  Chain ID:    {}", chain_id);
     crate::rlog!(
         "  Gas:         max={}gwei priority={}gwei limit={}",
@@ -468,5 +480,15 @@ mod tests {
         let out = parse_destinations(&[a.clone(), a.clone()]).unwrap();
         assert_eq!(out.len(), 1, "duplicate destinations are deduped");
         assert!(parse_destinations(&[]).is_err(), "empty list is refused");
+    }
+
+    #[test]
+    fn totals_count_each_destination_exactly_once() {
+        let amount = U256::from(1_000_000_000_000_000u64); // 0.001 ETH
+        let max_fee = U256::from(30_000_000_000u64);
+        let (value, gas, total) = disperse_totals(amount, 99, 21_000, max_fee);
+        assert_eq!(value, amount * U256::from(99u64));
+        assert_eq!(gas, max_fee * U256::from(21_000u64) * U256::from(99u64));
+        assert_eq!(total, value + gas);
     }
 }

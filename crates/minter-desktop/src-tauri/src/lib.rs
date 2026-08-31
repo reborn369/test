@@ -1402,6 +1402,7 @@ struct RunMintInput {
     use_flashbots: Option<bool>,
     conditional_submit_enabled: Option<bool>,
     conditional_lead_ms: Option<u64>,
+    auto_sweep_destination: Option<String>,
 }
 
 #[tauri::command]
@@ -1424,6 +1425,7 @@ async fn run_mint(
         wallet_count.to_string(),
         input.at_time.clone().unwrap_or_default().trim().to_string(),
         input.chain_override.clone().unwrap_or_default(),
+        input.auto_sweep_destination.clone().unwrap_or_default(),
     ]);
     confirm_live_spend(
         &state,
@@ -1485,6 +1487,7 @@ async fn run_mint(
         use_flashbots: input.use_flashbots,
         conditional_submit_enabled: input.conditional_submit_enabled,
         conditional_lead_ms: input.conditional_lead_ms,
+        auto_sweep_destination: input.auto_sweep_destination,
     };
     // Typed LIVE — enforced in core when require_live_confirm && !dry_run.
     let confirm = input.confirm.unwrap_or_default();

@@ -1108,7 +1108,7 @@ function paintWalletRow(i) {
   }
   const bal =
     w.balanceEth != null
-      ? `<span class="${w.balanceOk ? "ok" : "warn"}">${escapeHtml(w.balanceEth)}</span>`
+      ? `<span class="${w.balanceOk ? "ok" : "warn"}">${escapeHtml(w.balanceEth)} ${escapeHtml(w.nativeSymbol || "ETH")}</span><br><span class="muted small">$${escapeHtml(w.balanceUsd ?? "—")}</span>`
       : `<span class="muted">—</span>`;
   tr.innerHTML = `
     <td><input type="checkbox" class="wallet-cb" data-addr="${escapeHtml(w.address)}" ${sel ? "checked" : ""} /></td>
@@ -1178,7 +1178,13 @@ async function loadWallets() {
   const balMap = new Map(
     walletData
       .filter((w) => w.balanceEth != null)
-      .map((w) => [addrKey(w.address), { balanceEth: w.balanceEth, balanceOk: w.balanceOk }])
+      .map((w) => [addrKey(w.address), {
+        balanceEth: w.balanceEth,
+        balanceOk: w.balanceOk,
+        balanceUsd: w.balanceUsd,
+        usdPrice: w.usdPrice,
+        nativeSymbol: w.nativeSymbol,
+      }])
   );
   walletData = (list || []).map((w) => {
     const b = balMap.get(addrKey(w.address));
@@ -1187,6 +1193,9 @@ async function loadWallets() {
       group: walletGroupOf(w.address),
       balanceEth: b?.balanceEth,
       balanceOk: b?.balanceOk,
+      balanceUsd: b?.balanceUsd,
+      usdPrice: b?.usdPrice,
+      nativeSymbol: b?.nativeSymbol,
     };
   });
   // keep selection only for still-present addresses
@@ -1443,13 +1452,20 @@ $("btn-wallets-balances")?.addEventListener("click", async () => {
       if (r) {
         w.balanceEth = r.balanceEth;
         w.balanceOk = r.ok;
+        w.balanceUsd = r.balanceUsd;
+        w.usdPrice = r.usdPrice;
+        w.nativeSymbol = r.nativeSymbol || "ETH";
         w.balanceChain = r.chain || chain;
       }
     }
     renderWalletsVirtual();
     const okN = rows.filter((r) => r.ok).length;
+    const priced = rows.find((r) => r.usdPrice);
+    const priceLabel = priced
+      ? ` · ${priced.nativeSymbol || "ETH"}/USD $${priced.usdPrice}`
+      : " · USD rate unavailable";
     if ($("wallet-msg"))
-      $("wallet-msg").textContent = `Balances (${chainLabel}): ${okN}/${rows.length} funded`;
+      $("wallet-msg").textContent = `Balances (${chainLabel}): ${okN}/${rows.length} funded${priceLabel}`;
   } catch (e) {
     if ($("wallet-msg")) $("wallet-msg").textContent = String(e);
   } finally {
@@ -4648,9 +4664,14 @@ function newTaskId() {
 function normalizeTask(raw) {
   const t0 = raw || {};
   let status = t0.status || "ready";
+  let lastError = t0.lastError ? String(t0.lastError).slice(0, 1000) : null;
   // Never restore running/queued after restart
   if (status === "running" || status === "queued" || status === "blocked") {
     status = "ready";
+  }
+  if (status === "error" && lastError && /\bcancel(?:led|ed|lation)?\b/i.test(lastError)) {
+    status = "cancelled";
+    lastError = null;
   }
   const gasMode = t0.gasMode === "manual" ? "manual" : "auto";
   const proxyRoutes = t0.proxyRoutes && typeof t0.proxyRoutes === "object"
@@ -4697,7 +4718,9 @@ function normalizeTask(raw) {
       t0.phasePriceWei != null && /^\d+$/.test(String(t0.phasePriceWei))
         ? String(t0.phasePriceWei)
         : null,
-    lastError: t0.lastError ? String(t0.lastError).slice(0, 1000) : null,
+    autoSweepEnabled: !!t0.autoSweepEnabled,
+    autoSweepDestination: String(t0.autoSweepDestination || "").trim(),
+    lastError,
     // Legacy field kept on disk for compatibility. OpenSea balance validation
     // is mandatory and runs in core after Auto resolves the collection chain.
     filterBalance: true,
@@ -4735,6 +4758,8 @@ function taskToPersist(task) {
     phaseStartAt: task.phaseStartAt,
     phaseLabel: task.phaseLabel,
     phasePriceWei: task.phasePriceWei,
+    autoSweepEnabled: !!task.autoSweepEnabled,
+    autoSweepDestination: task.autoSweepDestination || "",
     lastError: task.lastError || null,
     filterBalance: true,
     priorityFeeGwei: task.priorityFeeGwei || "",
@@ -4861,6 +4886,7 @@ function taskDisplayStatus(task) {
   if (task.status === "queued") return "queued";
   if (task.status === "done") return "done";
   if (task.status === "error") return "error";
+  if (task.status === "cancelled") return "cancelled";
   const blocked = computeBlockReasons(task);
   if (blocked.length) return "blocked";
   return "ready";
@@ -4917,6 +4943,11 @@ function syncConditionalSubmitUi() {
     if (enabled) show(wrap);
     else hide(wrap);
   }
+}
+
+function syncTaskAutoSweepUi() {
+  const enabled = !!$("task-auto-sweep")?.checked;
+  $("task-auto-sweep-wrap")?.classList.toggle("hidden", !enabled);
 }
 
 function setModalTitle(mode) {
@@ -5027,6 +5058,8 @@ async function openTaskModal(opts = {}) {
     chainOverride: "auto",
     wallets: null,
     filterBalance: true,
+    autoSweepEnabled: false,
+    autoSweepDestination: "",
   };
 
   if (opts.template) {
@@ -5052,6 +5085,8 @@ async function openTaskModal(opts = {}) {
         phaseLabel: src.phaseLabel,
         phasePriceWei: src.phasePriceWei,
         filterBalance: true,
+        autoSweepEnabled: !!src.autoSweepEnabled,
+        autoSweepDestination: src.autoSweepDestination || "",
         // preserve mint fields 13/14/16 on edit (do not wipe)
         priorityFeeGwei: src.priorityFeeGwei || "",
         atTime: src.atTime || "",
@@ -5083,6 +5118,10 @@ async function openTaskModal(opts = {}) {
   if ($("task-skip-est")) $("task-skip-est").checked = pref.skipEstimateOnOpen !== false;
   if ($("task-prio")) $("task-prio").value = pref.priorityFeeGwei || "";
   if ($("task-at")) $("task-at").value = pref.atTime || "";
+  if ($("task-auto-sweep")) $("task-auto-sweep").checked = !!pref.autoSweepEnabled;
+  if ($("task-auto-sweep-destination"))
+    $("task-auto-sweep-destination").value = pref.autoSweepDestination || "";
+  syncTaskAutoSweepUi();
   if ($("task-per-wallet-qty")) {
     $("task-per-wallet-qty").checked = !!(pref.walletQuantities && Object.keys(pref.walletQuantities).length);
     syncTaskPerWalletQtyUi();
@@ -5578,6 +5617,7 @@ function statusPillClass(disp) {
   if (disp === "queued") return "sent";
   if (disp === "done") return "ok";
   if (disp === "error") return "fail";
+  if (disp === "cancelled") return "sent";
   if (disp === "blocked") return "fail";
   return "ok";
 }
@@ -5766,6 +5806,7 @@ $("task-modal")?.addEventListener("click", (e) => {
 });
 $("task-gas-mode")?.addEventListener("change", syncTaskGasUi);
 $("task-send-mode")?.addEventListener("change", syncConditionalSubmitUi);
+$("task-auto-sweep")?.addEventListener("change", syncTaskAutoSweepUi);
 $("task-wallets-all")?.addEventListener("change", (e) => {
   const on = e.target.checked;
   if (taskModalFiltered.length) {
@@ -5808,6 +5849,16 @@ $("task-modal-save")?.addEventListener("click", () => {
   }
   if (!wallets.length) {
     $("wizard-msg").textContent = "Select at least one wallet";
+    return;
+  }
+  const autoSweepEnabled = !!$("task-auto-sweep")?.checked;
+  const autoSweepDestination = ($("task-auto-sweep-destination")?.value || "").trim();
+  if (autoSweepEnabled && !/^0x[0-9a-fA-F]{40}$/.test(autoSweepDestination)) {
+    $("wizard-msg").textContent = "Enter a valid auto-sweep destination address";
+    return;
+  }
+  if (autoSweepEnabled && /^0x0{40}$/i.test(autoSweepDestination)) {
+    $("wizard-msg").textContent = "Auto-sweep destination cannot be the zero address";
     return;
   }
   const gasMode = $("task-gas-mode")?.value === "manual" ? "manual" : "auto";
@@ -5855,6 +5906,8 @@ $("task-modal-save")?.addEventListener("click", () => {
     atTime: ($("task-at")?.value || "").trim(),
     walletQuantities: collectTaskWalletQuantities(),
     proxyRoutes: collectTaskProxyRoutes(wallets),
+    autoSweepEnabled,
+    autoSweepDestination: autoSweepEnabled ? autoSweepDestination : "",
     updatedAt: nowMs(),
   };
 
@@ -6889,6 +6942,7 @@ async function startMintTaskInner(taskId, opts = {}) {
       runWallets.length,
       (task.atTime || "").trim(),
       task.chainOverride === "auto" ? "" : task.chainOverride || "",
+      task.autoSweepEnabled ? task.autoSweepDestination || "" : "",
     ]),
     title: t("tasks.liveTitle") || "LIVE mint",
     body:
@@ -6900,6 +6954,9 @@ async function startMintTaskInner(taskId, opts = {}) {
       `Wallets: ${runWallets.length}`,
       `OpenSea routes: ${effectiveDirectCount} direct / ${effectiveProxiedCount} proxy`,
       `Gas: ${gasLabel}`,
+      task.autoSweepEnabled
+        ? `Auto-sweep: ${task.autoSweepDestination}`
+        : "Auto-sweep: off",
     ],
     okLabel: t("tasks.liveOk") || "Start LIVE",
   });
@@ -6968,6 +7025,10 @@ async function startMintTaskInner(taskId, opts = {}) {
           Object.keys(proxyOverrides).length > 0 ? proxyOverrides : null,
         directWalletAddresses:
           directWalletAddresses.length > 0 ? directWalletAddresses : null,
+        autoSweepDestination:
+          task.autoSweepEnabled && task.autoSweepDestination
+            ? task.autoSweepDestination
+            : null,
       },
     });
     applyMintSummary(summary);
@@ -6987,9 +7048,19 @@ async function startMintTaskInner(taskId, opts = {}) {
     );
     appendMintLog(`Task «${task.name}» finished`);
   } catch (e) {
-    task.status = "error";
-    task.updatedAt = nowMs();
     const es = String(e);
+    const cancelled = mintStopping || /\bcancel(?:led|ed|lation)?\b/i.test(es);
+    task.updatedAt = nowMs();
+    if (cancelled) {
+      task.status = "cancelled";
+      task.lastError = null;
+      appendMintLog(`Task «${task.name}» cancelled by user`);
+      setMintPhaseBanner("wait", "Cancelled by user");
+      $("mint-summary").textContent = "Cancelled by user";
+      showToast("Mint cancelled", "warn");
+      return;
+    }
+    task.status = "error";
     task.lastError = es;
     appendMintLog("ERROR: " + es);
     setMintPhaseBanner("error", es.slice(0, 120));

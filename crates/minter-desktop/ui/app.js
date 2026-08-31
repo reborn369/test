@@ -4682,6 +4682,10 @@ function normalizeTask(raw) {
     status = "cancelled";
     lastError = null;
   }
+  const hasLaunchConsumed = Object.prototype.hasOwnProperty.call(t0, "launchConsumed");
+  const launchConsumed = hasLaunchConsumed
+    ? !!t0.launchConsumed
+    : status === "done" || status === "error" || status === "cancelled";
   const gasMode = t0.gasMode === "manual" ? "manual" : "auto";
   const proxyRoutes = t0.proxyRoutes && typeof t0.proxyRoutes === "object"
     ? Object.fromEntries(
@@ -4732,7 +4736,7 @@ function normalizeTask(raw) {
     // A task launch is one-shot. A completed/error/cancelled task must be
     // explicitly re-armed before it can spend gas again.
     launchId: String(t0.launchId || newTaskLaunchId()),
-    launchConsumed: !!t0.launchConsumed,
+    launchConsumed,
     lastError,
     // Legacy field kept on disk for compatibility. OpenSea balance validation
     // is mandatory and runs in core after Auto resolves the collection chain.

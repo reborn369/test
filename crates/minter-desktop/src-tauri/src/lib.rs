@@ -3195,5 +3195,7 @@ mod tests {
         assert!(app.contains("launchId: task.launchId"));
         assert!(app.contains("requireWord: \"RERUN\""));
         assert!(app.contains("Blocked duplicate launch"));
+        assert!(app.contains("hasLaunchConsumed"));
+        assert!(app.contains("status === \"done\" || status === \"error\""));
     }
 }

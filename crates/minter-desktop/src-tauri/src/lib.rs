@@ -452,9 +452,12 @@ fn consume_mint_launch(
     if dry_run {
         return Ok(());
     }
-    let task_id = task_id.map(str::trim).filter(|value| !value.is_empty()).ok_or_else(|| {
-        "Task launch id is missing — edit/save the task once before LIVE mint".to_string()
-    })?;
+    let task_id = task_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "Task launch id is missing — edit/save the task once before LIVE mint".to_string()
+        })?;
     let launch_id = launch_id
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -471,8 +474,7 @@ fn consume_mint_launch(
     let key = format!("{task_id}:{launch_id}");
     if !state.consumed_mint_launches.lock().insert(key) {
         return Err(
-            "Duplicate task launch blocked — use Run again and explicitly re-arm the task"
-                .into(),
+            "Duplicate task launch blocked — use Run again and explicitly re-arm the task".into(),
         );
     }
     Ok(())

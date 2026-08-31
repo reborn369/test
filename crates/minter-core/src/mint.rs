@@ -1512,6 +1512,15 @@ pub async fn run_opensea_mint(
             reporter
         }
     };
+    if let (Some(task_id), Some(launch_id)) = (&opts.task_id, &opts.launch_id) {
+        log_always(
+            reporter.as_ref(),
+            format!(
+                "Task launch: task_id={task_id} launch_id={launch_id} source={}",
+                opts.launch_source.as_deref().unwrap_or("unknown")
+            ),
+        );
+    }
 
     let result = run_opensea_mint_inner(
         signers,

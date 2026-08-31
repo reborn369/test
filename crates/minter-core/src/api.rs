@@ -3778,6 +3778,12 @@ fn stage_rows_from_at(
 #[serde(rename_all = "camelCase")]
 pub struct MintOptions {
     pub slug: String,
+    /// Desktop saved-task identity, recorded in the mint log for audit.
+    pub task_id: Option<String>,
+    /// One-shot desktop launch capability, recorded in the mint log for audit.
+    pub launch_id: Option<String>,
+    /// `manual` or `queue`; informational only.
+    pub launch_source: Option<String>,
     pub quantity: u32,
     pub dry_run: bool,
     /// Prefer recommended phase when `phase_index` is None.
@@ -3826,6 +3832,9 @@ impl Default for MintOptions {
     fn default() -> Self {
         Self {
             slug: String::new(),
+            task_id: None,
+            launch_id: None,
+            launch_source: None,
             quantity: 1,
             dry_run: true,
             auto_phase: true,

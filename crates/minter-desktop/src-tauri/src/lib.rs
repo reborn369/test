@@ -241,6 +241,10 @@ pub struct AppState {
     /// One-time confirmations used by noVNC/web UI actions. They are bound to
     /// an action and canonical context, expire quickly and are consumed once.
     confirmations: Arc<Mutex<std::collections::HashMap<String, PendingConfirmation>>>,
+    /// One-shot task launch capabilities already accepted by `run_mint`.
+    /// The webview has its own latch; this authoritative set also stops a stale
+    /// or duplicated renderer after the previous run releases the busy guard.
+    consumed_mint_launches: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Serializes UI state-file saves (tasks / wallet_meta / runs_history) so
     /// two debounced writes cannot interleave.
     pub save_lock: Arc<Mutex<()>>,
@@ -439,6 +443,41 @@ fn consume_confirmation(
     Ok(())
 }
 
+fn consume_mint_launch(
+    state: &AppState,
+    dry_run: bool,
+    task_id: Option<&str>,
+    launch_id: Option<&str>,
+) -> Result<(), String> {
+    if dry_run {
+        return Ok(());
+    }
+    let task_id = task_id.map(str::trim).filter(|value| !value.is_empty()).ok_or_else(|| {
+        "Task launch id is missing — edit/save the task once before LIVE mint".to_string()
+    })?;
+    let launch_id = launch_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "One-shot launch token is missing — re-arm the task".to_string())?;
+    let safe = |value: &str, max: usize| {
+        value.len() <= max
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':'))
+    };
+    if !safe(task_id, 128) || !safe(launch_id, 128) {
+        return Err("Invalid task launch identity".into());
+    }
+    let key = format!("{task_id}:{launch_id}");
+    if !state.consumed_mint_launches.lock().insert(key) {
+        return Err(
+            "Duplicate task launch blocked — use Run again and explicitly re-arm the task"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn begin_confirmation(
     state: State<'_, Arc<AppState>>,
@@ -462,6 +501,7 @@ impl Default for AppState {
             picked_files: Arc::new(Mutex::new(std::collections::HashMap::new())),
             token_seq: Arc::new(AtomicU64::new(0)),
             confirmations: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            consumed_mint_launches: Arc::new(Mutex::new(std::collections::HashSet::new())),
             save_lock: Arc::new(Mutex::new(())),
             net_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_NET_CMDS)),
             batch_limit: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -1371,6 +1411,9 @@ async fn sweep_nfts(
 #[serde(rename_all = "camelCase")]
 struct RunMintInput {
     slug: String,
+    task_id: Option<String>,
+    launch_id: Option<String>,
+    launch_source: Option<String>,
     quantity: Option<u32>,
     dry_run: Option<bool>,
     phase_index: Option<usize>,
@@ -1426,6 +1469,8 @@ async fn run_mint(
         input.at_time.clone().unwrap_or_default().trim().to_string(),
         input.chain_override.clone().unwrap_or_default(),
         input.auto_sweep_destination.clone().unwrap_or_default(),
+        input.task_id.clone().unwrap_or_default(),
+        input.launch_id.clone().unwrap_or_default(),
     ]);
     confirm_live_spend(
         &state,
@@ -1434,6 +1479,12 @@ async fn run_mint(
         &context,
         input.confirmation_id.as_deref(),
         input.confirm.as_deref(),
+    )?;
+    consume_mint_launch(
+        &state,
+        dry_run,
+        input.task_id.as_deref(),
+        input.launch_id.as_deref(),
     )?;
     let wallets = input.wallet_addresses.and_then(|v| {
         let v: Vec<String> = v.into_iter().filter(|s| !s.trim().is_empty()).collect();
@@ -1463,6 +1514,11 @@ async fn run_mint(
     } else {
         None
     };
+    let launch_source = match input.launch_source.as_deref() {
+        Some("manual") => Some("manual".to_string()),
+        Some("queue") => Some("queue".to_string()),
+        _ => Some("unknown".to_string()),
+    };
     let opts = MintOptions {
         slug: input.slug,
         quantity: input.quantity.unwrap_or(1).max(1),
@@ -1488,6 +1544,9 @@ async fn run_mint(
         conditional_submit_enabled: input.conditional_submit_enabled,
         conditional_lead_ms: input.conditional_lead_ms,
         auto_sweep_destination: input.auto_sweep_destination,
+        task_id: input.task_id,
+        launch_id: input.launch_id,
+        launch_source,
     };
     // Typed LIVE — enforced in core when require_live_confirm && !dry_run.
     let confirm = input.confirm.unwrap_or_default();
@@ -3101,5 +3160,38 @@ mod tests {
         let generator = create_confirmation(&state, "generate_burners", "1:6").unwrap();
         assert!(generator.require_typing);
         assert_eq!(generator.phrase, "GENERATE");
+    }
+
+    #[test]
+    fn live_task_launch_is_one_shot_until_rearmed() {
+        let state = AppState::default();
+        consume_mint_launch(&state, false, Some("task-1"), Some("launch-1")).unwrap();
+        let duplicate =
+            consume_mint_launch(&state, false, Some("task-1"), Some("launch-1")).unwrap_err();
+        assert!(duplicate.contains("Duplicate task launch"), "{duplicate}");
+
+        // An explicit re-arm changes the launch id while preserving the task.
+        consume_mint_launch(&state, false, Some("task-1"), Some("launch-2")).unwrap();
+        // Another task may independently use its own one-shot identity.
+        consume_mint_launch(&state, false, Some("task-2"), Some("launch-1")).unwrap();
+    }
+
+    #[test]
+    fn live_task_launch_identity_is_required_and_dry_run_is_exempt() {
+        let state = AppState::default();
+        assert!(consume_mint_launch(&state, false, None, Some("launch-1")).is_err());
+        assert!(consume_mint_launch(&state, false, Some("task-1"), None).is_err());
+        assert!(consume_mint_launch(&state, false, Some("bad\nid"), Some("launch-1")).is_err());
+        assert!(consume_mint_launch(&state, true, None, None).is_ok());
+    }
+
+    #[test]
+    fn task_ui_consumes_launch_and_requires_explicit_rearm() {
+        let app = include_str!("../../ui/app.js");
+        assert!(app.contains("task.launchConsumed = true;"));
+        assert!(app.contains("taskId: task.id"));
+        assert!(app.contains("launchId: task.launchId"));
+        assert!(app.contains("requireWord: \"RERUN\""));
+        assert!(app.contains("Blocked duplicate launch"));
     }
 }

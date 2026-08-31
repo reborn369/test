@@ -4661,6 +4661,15 @@ function newTaskId() {
   return `t${taskIdSeq++}_${nowMs().toString(36)}`;
 }
 
+/** One-shot capability for exactly one intentional execution of a saved task. */
+function newTaskLaunchId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  const random = globalThis.crypto?.getRandomValues
+    ? globalThis.crypto.getRandomValues(new Uint32Array(4))
+    : [Math.random() * 0xffffffff, Math.random() * 0xffffffff, nowMs(), taskIdSeq];
+  return [...random].map((n) => Math.floor(Number(n)).toString(16).padStart(8, "0")).join("-");
+}
+
 function normalizeTask(raw) {
   const t0 = raw || {};
   let status = t0.status || "ready";
@@ -4720,6 +4729,10 @@ function normalizeTask(raw) {
         : null,
     autoSweepEnabled: !!t0.autoSweepEnabled,
     autoSweepDestination: String(t0.autoSweepDestination || "").trim(),
+    // A task launch is one-shot. A completed/error/cancelled task must be
+    // explicitly re-armed before it can spend gas again.
+    launchId: String(t0.launchId || newTaskLaunchId()),
+    launchConsumed: !!t0.launchConsumed,
     lastError,
     // Legacy field kept on disk for compatibility. OpenSea balance validation
     // is mandatory and runs in core after Auto resolves the collection chain.
@@ -4760,6 +4773,8 @@ function taskToPersist(task) {
     phasePriceWei: task.phasePriceWei,
     autoSweepEnabled: !!task.autoSweepEnabled,
     autoSweepDestination: task.autoSweepDestination || "",
+    launchId: task.launchId,
+    launchConsumed: !!task.launchConsumed,
     lastError: task.lastError || null,
     filterBalance: true,
     priorityFeeGwei: task.priorityFeeGwei || "",
@@ -5665,6 +5680,7 @@ function renderTaskList() {
     const isActiveRun = task.id === activeTaskId;
     const canStart =
       !isActiveRun &&
+      !task.launchConsumed &&
       disp !== "running" &&
       disp !== "queued" &&
       disp !== "blocked" &&
@@ -5728,9 +5744,9 @@ function renderTaskList() {
         ${blockLine}
       </div>
       <div class="task-card-actions">
-        <button type="button" class="primary btn-task-start" data-id="${escapeHtml(task.id)}" ${
-          canStart ? "" : "disabled"
-        } title="${escapeHtml(reasons[0] || "")}">${escapeHtml(t("tasks.start"))}</button>
+        <button type="button" class="primary ${task.launchConsumed ? "btn-task-rearm" : "btn-task-start"}" data-id="${escapeHtml(task.id)}" ${
+          task.launchConsumed ? (busy ? "disabled" : "") : (canStart ? "" : "disabled")
+        } title="${escapeHtml(task.launchConsumed ? "This task already ran. Re-arm it before another LIVE launch." : (reasons[0] || ""))}">${escapeHtml(task.launchConsumed ? "Run again…" : t("tasks.start"))}</button>
         <button type="button" class="btn-task-edit" data-id="${escapeHtml(task.id)}" ${
           busy ? "disabled" : ""
         }>${escapeHtml(t("tasks.edit") || "Edit")}</button>
@@ -5745,6 +5761,9 @@ function renderTaskList() {
   }
   list.querySelectorAll(".btn-task-start").forEach((btn) => {
     btn.addEventListener("click", () => requestStartTask(btn.dataset.id));
+  });
+  list.querySelectorAll(".btn-task-rearm").forEach((btn) => {
+    btn.addEventListener("click", () => requestRearmTask(btn.dataset.id));
   });
   list.querySelectorAll(".btn-task-edit").forEach((btn) => {
     btn.addEventListener("click", () =>
@@ -5924,7 +5943,9 @@ $("task-modal-save")?.addEventListener("click", () => {
         ...base,
         id: prev.id,
         createdAt: prev.createdAt,
-        status: prev.status === "done" || prev.status === "error" ? "ready" : prev.status,
+        launchId: newTaskLaunchId(),
+        launchConsumed: false,
+        status: "ready",
       });
     }
   } else {
@@ -5932,6 +5953,8 @@ $("task-modal-save")?.addEventListener("click", () => {
       normalizeTask({
         ...base,
         id: newTaskId(),
+        launchId: newTaskLaunchId(),
+        launchConsumed: false,
         status: "ready",
         createdAt: nowMs(),
       })
@@ -6763,10 +6786,40 @@ $("btn-warm-auth")?.addEventListener("click", async () => {
   }
 });
 
+/**
+ * Re-arm is deliberately separate from Start. A stray/replayed click can at
+ * most open this dialog; it cannot spend gas without the operator typing the
+ * explicit word and then pressing Start again.
+ */
+async function requestRearmTask(taskId) {
+  const task = mintTasks.find((x) => x.id === taskId);
+  if (!task || !task.launchConsumed || activeTaskId || taskStartInFlight) return;
+  const ok = await openConfirmModal({
+    title: "Run this task again?",
+    body: `«${task.name}» has already been launched once. Re-arming permits another LIVE mint and another gas spend.`,
+    lines: ["This does not start the mint yet. After re-arming, press Start."],
+    requireWord: "RERUN",
+    okLabel: "Re-arm task",
+  });
+  if (!ok) return;
+  task.launchId = newTaskLaunchId();
+  task.launchConsumed = false;
+  task.status = "ready";
+  task.lastError = null;
+  task.updatedAt = nowMs();
+  schedulePersistTasks();
+  renderTaskList();
+  appendMintLog(`Task «${task.name}» explicitly re-armed; press Start to launch it again`);
+}
+
 /** Enqueue if busy, else start (LIVE path may require type-LIVE confirm). */
 function requestStartTask(taskId) {
   const task = mintTasks.find((x) => x.id === taskId);
   if (!task) return;
+  if (task.launchConsumed) {
+    showToast("This task already ran — use Run again… to re-arm it", "warn");
+    return;
+  }
   if (task.status === "running" || task.status === "queued") return;
   // A start is already being set up (pre-flight awaits) — ignore the extra click.
   if (taskStartInFlight) {
@@ -6845,6 +6898,10 @@ async function startMintTaskInner(taskId, opts = {}) {
   const fromQueue = !!opts.fromQueue;
   const task = mintTasks.find((x) => x.id === taskId);
   if (!task) return;
+  if (task.launchConsumed) {
+    appendMintLog(`Blocked duplicate launch of «${task.name}»`);
+    return;
+  }
   if (activeTaskId) {
     if (!fromQueue) requestStartTask(taskId);
     return;
@@ -6943,6 +7000,8 @@ async function startMintTaskInner(taskId, opts = {}) {
       (task.atTime || "").trim(),
       task.chainOverride === "auto" ? "" : task.chainOverride || "",
       task.autoSweepEnabled ? task.autoSweepDestination || "" : "",
+      task.id,
+      task.launchId,
     ]),
     title: t("tasks.liveTitle") || "LIVE mint",
     body:
@@ -6966,6 +7025,12 @@ async function startMintTaskInner(taskId, opts = {}) {
     if (!fromQueue) setTimeout(() => processQueue(), 0);
     return;
   }
+
+  // Consume in the UI before crossing IPC. Rust independently consumes the
+  // same launch id, so stale renderers and delayed events are also refused.
+  task.launchConsumed = true;
+  task.updatedAt = nowMs();
+  schedulePersistTasks();
 
   activeTaskId = task.id;
   task.status = "running";
@@ -7004,6 +7069,9 @@ async function startMintTaskInner(taskId, opts = {}) {
     const summary = await invoke("run_mint", {
       input: {
         slug: task.slug,
+        taskId: task.id,
+        launchId: task.launchId,
+        launchSource: fromQueue ? "queue" : "manual",
         quantity: task.quantity,
         dryRun: false,
         phaseIndex: task.phaseIndex,

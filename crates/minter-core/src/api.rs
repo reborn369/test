@@ -3363,7 +3363,6 @@ impl Session {
             }
         }
         let mint_each = price.saturating_mul(U256::from(default_quantity.max(1)));
-        let expected_each = mint_each.saturating_add(expected_fee_each);
         let required_each = mint_each.saturating_add(reserve_each);
         Ok(MintCostQuote {
             chain: chain.trim().to_ascii_lowercase(),

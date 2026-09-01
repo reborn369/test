@@ -3192,11 +3192,12 @@ async fn run_opensea_mint_inner(
             // fee ceiling before the final signing pass, not at T0. This keeps
             // the prepared 1.30x L2 cap current without putting an RPC read in
             // front of the actual broadcast.
-            let fee_refresh_lead_ms = 5_000u64.max(
-                conditional_submit_enabled
-                    .then_some(conditional_lead_ms.saturating_add(1_500))
-                    .unwrap_or_default(),
-            ) as i64;
+            let conditional_fee_lead_ms = if conditional_submit_enabled {
+                conditional_lead_ms.saturating_add(1_500)
+            } else {
+                0
+            };
+            let fee_refresh_lead_ms = 5_000u64.max(conditional_fee_lead_ms) as i64;
             if !fee_refreshed && remaining_ms <= fee_refresh_lead_ms {
                 fee_refreshed = true;
                 match tokio::time::timeout(std::time::Duration::from_millis(900), rpc.fee_history())

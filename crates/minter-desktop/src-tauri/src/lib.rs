@@ -1432,6 +1432,7 @@ struct RunMintInput {
     chain_override: Option<String>,
     /// Gas limit: omit = settings; 0 = auto estimate; n = fixed (manual).
     gas_limit: Option<u64>,
+    base_fee_multiplier: Option<f64>,
     /// Optional priority fee gwei override.
     priority_fee_gwei: Option<String>,
     /// address → proxy list index (manual mapping).
@@ -1535,6 +1536,7 @@ async fn run_mint(
         quiet: Some(false),
         priority_fee_gwei: input.priority_fee_gwei,
         gas_limit: input.gas_limit,
+        base_fee_multiplier: input.base_fee_multiplier,
         wallet_addresses: wallets,
         chain_override,
         proxy_overrides: input.proxy_overrides,
@@ -2632,6 +2634,55 @@ async fn list_drop_phases(
         .map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MintCostQuoteInput {
+    chain: String,
+    contract: String,
+    wallet_addresses: Vec<String>,
+    wallet_quantities: std::collections::HashMap<String, u32>,
+    default_quantity: u32,
+    unit_price_wei: String,
+    manual_gas_limit: Option<u64>,
+    priority_fee_gwei: Option<String>,
+}
+
+#[tauri::command]
+async fn network_fee_snapshot(
+    state: State<'_, Arc<AppState>>,
+    chain: String,
+    include_usd: bool,
+) -> Result<minter_core::NetworkFeeSnapshot, String> {
+    let _slot = net_slot(&state).await?;
+    let session = state.session.lock().clone();
+    session
+        .network_fee_snapshot(&chain, include_usd)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn mint_cost_quote(
+    state: State<'_, Arc<AppState>>,
+    input: MintCostQuoteInput,
+) -> Result<minter_core::MintCostQuote, String> {
+    let _slot = net_slot(&state).await?;
+    let session = state.session.lock().clone();
+    session
+        .mint_cost_quote(
+            &input.chain,
+            &input.contract,
+            input.wallet_addresses,
+            input.wallet_quantities,
+            input.default_quantity.max(1),
+            &input.unit_price_wei,
+            input.manual_gas_limit,
+            input.priority_fee_gwei.as_deref(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// Enforce `idle_lock_minutes` in Rust.
 ///
 /// The auto-lock used to be a `setTimeout` in the webview, i.e. a security
@@ -2725,6 +2776,8 @@ pub fn run() {
             sweep_nfts,
             run_mint,
             list_drop_phases,
+            network_fee_snapshot,
+            mint_cost_quote,
             load_tasks,
             save_tasks,
             load_runs_history,

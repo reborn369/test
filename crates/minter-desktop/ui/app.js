@@ -92,6 +92,72 @@ let mintRenderScheduled = false;
 let lastMintChain = "ethereum";
 let mintStopping = false;
 let appVersionStr = "0.1.0";
+let gasMonitorChain = localStorage.getItem("minter.gasChain") || "robinhood";
+let gasSnapshot = null;
+let gasMonitorTimer = null;
+let gasMonitorBusy = false;
+let gasUsdPrice = null;
+let gasUsdUpdatedAt = 0;
+let activeTaskCostQuote = null;
+
+function gasHeaderMarkup() {
+  if (!gasSnapshot) {
+    return `<span class="sb-v loading">${escapeHtml(gasMonitorChain)} · …</span>`;
+  }
+  const fee = `${gasSnapshot.effectiveFeeGwei} Gwei`;
+  const mintUsd = activeTaskCostQuote?.expectedFeeEachUsd;
+  const detail = mintUsd
+    ? ` · ~$${mintUsd}/mint`
+    : gasUsdPrice
+      ? ` · ${gasSnapshot.nativeSymbol} $${gasUsdPrice}`
+      : "";
+  return `<span class="sb-v">${escapeHtml(fee + detail)}</span>`;
+}
+
+function renderHeaderGas() {
+  const cell = $("header-gas-value");
+  if (cell) cell.innerHTML = gasHeaderMarkup();
+}
+
+async function refreshGasMonitor(forceUsd = false) {
+  if (gasMonitorBusy || !lastUiStatus?.unlocked) return;
+  gasMonitorBusy = true;
+  try {
+    const includeUsd = forceUsd || Date.now() - gasUsdUpdatedAt >= 60_000;
+    const snapshot = await invokeSafe(
+      "network_fee_snapshot",
+      { chain: gasMonitorChain, includeUsd },
+      { quiet: true }
+    );
+    if (snapshot) {
+      gasSnapshot = snapshot;
+      if (snapshot.usdPrice) {
+        gasUsdPrice = snapshot.usdPrice;
+        gasUsdUpdatedAt = Date.now();
+      }
+      renderHeaderGas();
+    }
+  } finally {
+    gasMonitorBusy = false;
+  }
+}
+
+function setGasMonitorChain(chain) {
+  const next = String(chain || "").trim().toLowerCase();
+  if (!next || next === "auto" || next === gasMonitorChain) return;
+  gasMonitorChain = next;
+  localStorage.setItem("minter.gasChain", next);
+  gasSnapshot = null;
+  renderHeaderGas();
+  refreshGasMonitor(true);
+}
+
+function ensureGasMonitor() {
+  if (!gasMonitorTimer) {
+    gasMonitorTimer = setInterval(() => refreshGasMonitor(false), 5_000);
+  }
+  refreshGasMonitor(!gasUsdPrice);
+}
 
 /**
  * Idle auto-lock.
@@ -657,7 +723,9 @@ async function refreshStatus() {
     <span class="sb-cell"><span class="sb-k">${escapeHtml(t("status.network") || "Network")}</span><span class="sb-v ${rpcCls}">${escapeHtml(s.network || "—")}</span></span>
     <span class="sb-cell"><span class="sb-k">RPC</span><span class="sb-v ${rpcCls}">${rpcTxt}</span></span>
     <span class="sb-cell"><span class="sb-k">${escapeHtml(t("status.proxies") || "Proxies")}</span><span class="sb-v ${proxyCls}">${proxyCount}</span></span>
+    <span class="sb-cell sb-gas"><span class="sb-k">Gas · ${escapeHtml(gasMonitorChain)}</span><span id="header-gas-value">${gasHeaderMarkup()}</span></span>
   `;
+  ensureGasMonitor();
   const hint = $("hint");
   if (hint && !hint.classList.contains("hidden")) {
     hint.innerHTML = `<strong>${escapeHtml(s.hint_title)}</strong><p>${escapeHtml(s.hint_body)}</p>`;
@@ -4663,6 +4731,90 @@ let taskModalMode = "create";
 let taskModalEditId = null;
 /** last loaded phases for startTime capture */
 let lastLoadedPhases = null;
+let taskCostQuoteTimer = null;
+let taskCostQuoteSeq = 0;
+
+function moneyPair(native, usd, symbol = "ETH") {
+  if (native == null || native === "") return "—";
+  return `${native} ${symbol}${usd != null ? ` · $${usd}` : ""}`;
+}
+
+function resetTaskCostQuote(message = null) {
+  activeTaskCostQuote = null;
+  const ids = ["task-cost-gas", "task-cost-mint", "task-cost-fee", "task-cost-total", "task-cost-required", "task-cost-required-total"];
+  ids.forEach((id) => { if ($(id)) $(id).textContent = "—"; });
+  if ($("task-cost-source")) $("task-cost-source").textContent = message || (getLang() === "ru" ? "Загрузите фазы для расчёта" : "Load phases to calculate");
+  if ($("task-cost-ready")) {
+    $("task-cost-ready").textContent = "—";
+    $("task-cost-ready").className = "task-cost-ready neutral";
+  }
+  renderHeaderGas();
+}
+
+function renderTaskCostQuote(quote) {
+  activeTaskCostQuote = quote;
+  const symbol = quote.nativeSymbol || "ETH";
+  $("task-cost-gas").textContent = `${quote.effectiveFeeGwei} Gwei`;
+  $("task-cost-mint").textContent = moneyPair(quote.mintEachEth, quote.mintEachUsd, symbol);
+  $("task-cost-fee").textContent = moneyPair(quote.expectedFeeEachEth, quote.expectedFeeEachUsd, symbol);
+  $("task-cost-total").textContent = moneyPair(quote.expectedTotalEth, quote.expectedTotalUsd, symbol);
+  $("task-cost-required").textContent = moneyPair(quote.requiredEachEth, quote.requiredEachUsd, symbol);
+  $("task-cost-required-total").textContent = moneyPair(quote.requiredTotalEth, quote.requiredTotalUsd, symbol);
+  const source = quote.gasSource === "collection_history"
+    ? (getLang() === "ru" ? `по ${quote.gasSampleCount} реальным минтам коллекции` : `${quote.gasSampleCount} real collection mints`)
+    : quote.gasSource === "manual"
+      ? (getLang() === "ru" ? "ручной gas limit" : "manual gas limit")
+      : (getLang() === "ru" ? "истории нет · показан безопасный резерв" : "no history · safe reserve shown");
+  $("task-cost-source").textContent = `${source} · limit ${quote.gasLimit.toLocaleString()} · cap ×${quote.feeCapMultiplier}`;
+  const ready = $("task-cost-ready");
+  ready.textContent = getLang() === "ru"
+    ? `${quote.readyWallets}/${quote.walletCount} готовы`
+    : `${quote.readyWallets}/${quote.walletCount} ready`;
+  ready.className = `task-cost-ready ${quote.insufficientWallets ? "bad" : "ok"}`;
+  renderHeaderGas();
+}
+
+async function refreshTaskCostQuote(force = false) {
+  if (!lastLoadedPhases?.stages?.length) {
+    resetTaskCostQuote();
+    return null;
+  }
+  const wallets = selectedTaskWallets();
+  const meta = phaseMetaFromSelection();
+  if (!wallets.length || meta.phasePriceWei == null) {
+    resetTaskCostQuote(getLang() === "ru" ? "Выберите фазу и кошельки" : "Select a phase and wallets");
+    return null;
+  }
+  const chainChoice = $("task-chain")?.value || "auto";
+  const chain = chainChoice === "auto" ? lastLoadedPhases.chain : chainChoice;
+  const gasMode = $("task-gas-mode")?.value === "manual" ? "manual" : "auto";
+  const input = {
+    chain,
+    contract: lastLoadedPhases.contract || "",
+    walletAddresses: wallets,
+    walletQuantities: collectTaskWalletQuantities() || {},
+    defaultQuantity: Math.max(1, Number($("wizard-qty")?.value) || 1),
+    unitPriceWei: meta.phasePriceWei,
+    manualGasLimit: gasMode === "manual" ? Math.max(21000, Number($("task-gas-limit")?.value) || 250000) : null,
+    priorityFeeGwei: ($("task-prio")?.value || "").trim() || null,
+  };
+  const seq = ++taskCostQuoteSeq;
+  if ($("task-cost-source")) $("task-cost-source").textContent = getLang() === "ru" ? "Считаю по сети и кошелькам…" : "Calculating network and wallets…";
+  const quote = await invokeSafe("mint_cost_quote", { input }, { quiet: !force });
+  if (seq !== taskCostQuoteSeq) return activeTaskCostQuote;
+  if (!quote) {
+    resetTaskCostQuote(getLang() === "ru" ? "Не удалось получить расчёт" : "Could not calculate quote");
+    return null;
+  }
+  setGasMonitorChain(chain);
+  renderTaskCostQuote(quote);
+  return quote;
+}
+
+function scheduleTaskCostQuote() {
+  if (taskCostQuoteTimer) clearTimeout(taskCostQuoteTimer);
+  taskCostQuoteTimer = setTimeout(() => refreshTaskCostQuote(false), 450);
+}
 /** vault addresses lowercase set for readiness */
 let vaultAddrSet = new Set();
 /** @type {any} */
@@ -4770,10 +4922,17 @@ function normalizeTask(raw) {
           : null,
     quantity: Math.max(1, Number(t0.quantity) || 1),
     gasMode,
+    // Auto tasks persist the preparation-time limit so the hot path never
+    // pauses for eth_estimateGas. Legacy tasks without a quote remain null.
     gasLimit:
-      gasMode === "manual"
-        ? Math.max(21000, Number(t0.gasLimit) || 250000)
+      t0.gasLimit == null
+        ? null
+        : Math.max(21000, Number(t0.gasLimit) || 250000),
+    baseFeeMultiplier:
+      Number.isFinite(Number(t0.baseFeeMultiplier))
+        ? Math.max(1, Math.min(5, Number(t0.baseFeeMultiplier)))
         : null,
+    gasQuoteSource: t0.gasQuoteSource || null,
     chainOverride: t0.chainOverride || "auto",
     useFlashbots: !!(t0.useFlashbots || t0.sendMode === "flashbots"),
     conditionalSubmitEnabled: !!(
@@ -4832,6 +4991,8 @@ function taskToPersist(task) {
     quantity: task.quantity,
     gasMode: task.gasMode,
     gasLimit: task.gasLimit,
+    baseFeeMultiplier: task.baseFeeMultiplier,
+    gasQuoteSource: task.gasQuoteSource,
     chainOverride: task.chainOverride,
     phaseStartAt: task.phaseStartAt,
     phaseLabel: task.phaseLabel,
@@ -5119,6 +5280,7 @@ async function openTaskModal(opts = {}) {
   setModalTitle(mode);
   $("wizard-msg").textContent = "";
   lastLoadedPhases = null;
+  resetTaskCostQuote();
   taskGroupFilter = "all";
   // WL data belongs to one slug — never carry it into the next task.
   taskWlPhases = null;
@@ -5371,6 +5533,7 @@ function applyWlForSelectedPhase() {
 // Re-narrow whenever the operator changes the target phase.
 $("wizard-phase")?.addEventListener("change", () => {
   if (taskWlPhases) applyWlForSelectedPhase();
+  scheduleTaskCostQuote();
 });
 
 /** Badge showing the WL count; clicking it toggles WL-only filtering. */
@@ -5464,6 +5627,7 @@ function renderTaskQtyMap() {
     const val = pref[k] ?? pref[a] ?? defQty;
     row.innerHTML = `<span class="mono">${escapeHtml(shortAddr(a))}</span>
       <input type="number" min="1" max="50" class="task-qty-input" data-addr="${escapeHtml(a)}" value="${val}" />`;
+    row.querySelector(".task-qty-input")?.addEventListener("input", scheduleTaskCostQuote);
     box.appendChild(row);
   }
 }
@@ -5598,6 +5762,7 @@ function renderTaskModalWalletList() {
             taskModalFiltered.every((x) => taskModalChecked.has(addrKey(x.address)));
         }
         if ($("task-per-wallet-qty")?.checked) renderTaskQtyMap();
+        scheduleTaskCostQuote();
       });
       row.querySelector(".task-wallet-address")?.addEventListener("click", () => {
         walletCheckbox.checked = !walletCheckbox.checked;
@@ -5638,7 +5803,10 @@ function renderTaskModalWalletList() {
   if ($("task-per-wallet-qty")?.checked) renderTaskQtyMap();
 }
 
-$("task-per-wallet-qty")?.addEventListener("change", syncTaskPerWalletQtyUi);
+$("task-per-wallet-qty")?.addEventListener("change", () => {
+  syncTaskPerWalletQtyUi();
+  scheduleTaskCostQuote();
+});
 
 document.addEventListener("click", (e) => {
   const btn = e.target.closest?.(".btn-group-filter");
@@ -5659,6 +5827,7 @@ document.addEventListener("click", (e) => {
       b.classList.toggle("is-active", b.dataset.groupFilter === taskGroupFilter);
     });
     renderTaskModalWalletList();
+    scheduleTaskCostQuote();
   }
 });
 
@@ -5888,7 +6057,14 @@ $("task-modal-cancel")?.addEventListener("click", closeTaskModal);
 $("task-modal")?.addEventListener("click", (e) => {
   if (e.target === $("task-modal")) closeTaskModal();
 });
-$("task-gas-mode")?.addEventListener("change", syncTaskGasUi);
+$("task-gas-mode")?.addEventListener("change", () => {
+  syncTaskGasUi();
+  scheduleTaskCostQuote();
+});
+$("task-gas-limit")?.addEventListener("input", scheduleTaskCostQuote);
+$("task-prio")?.addEventListener("input", scheduleTaskCostQuote);
+$("wizard-qty")?.addEventListener("input", scheduleTaskCostQuote);
+$("task-chain")?.addEventListener("change", scheduleTaskCostQuote);
 $("task-send-mode")?.addEventListener("change", syncConditionalSubmitUi);
 $("task-auto-sweep")?.addEventListener("change", syncTaskAutoSweepUi);
 $("task-wallets-all")?.addEventListener("change", (e) => {
@@ -5905,6 +6081,7 @@ $("task-wallets-all")?.addEventListener("change", (e) => {
       cb.checked = on;
     });
   }
+  scheduleTaskCostQuote();
 });
 $("btn-clear-queue")?.addEventListener("click", () => {
   for (const id of taskQueue) {
@@ -5923,7 +6100,7 @@ $("task-template")?.addEventListener("change", (e) => {
   openTaskModal({ mode: "create", template: { ...TASK_TEMPLATES[key] } });
 });
 
-$("task-modal-save")?.addEventListener("click", () => {
+$("task-modal-save")?.addEventListener("click", async () => {
   const slug = $("wizard-slug").value.trim();
   const name = ($("task-name").value.trim() || slug || `task-${taskIdSeq}`).slice(0, 64);
   const wallets = selectedTaskWallets();
@@ -5966,6 +6143,16 @@ $("task-modal-save")?.addEventListener("click", () => {
       "Selected phase has no exact price; task was not saved";
     return;
   }
+  const quote = await refreshTaskCostQuote(true);
+  if (!quote) {
+    $("wizard-msg").textContent = getLang() === "ru"
+      ? "Не удалось рассчитать газ и проверить балансы"
+      : "Could not calculate gas and verify balances";
+    return;
+  }
+  // Auto is resolved during preparation and saved with the task. No estimate
+  // request is inserted between T0 and transaction broadcast.
+  if (gasMode === "auto") gasLimit = quote.gasLimit;
   const base = {
     name,
     slug,
@@ -5974,6 +6161,8 @@ $("task-modal-save")?.addEventListener("click", () => {
     quantity: Math.max(1, Number($("wizard-qty").value) || 1),
     gasMode,
     gasLimit,
+    baseFeeMultiplier: quote.feeCapMultiplier,
+    gasQuoteSource: quote.gasSource,
     chainOverride: $("task-chain").value || "auto",
     useFlashbots: $("task-send-mode")?.value === "flashbots",
     conditionalSubmitEnabled: $("task-send-mode")?.value === "conditional",
@@ -6047,6 +6236,7 @@ $("btn-load-phases")?.addEventListener("click", async () => {
     }
     const r = await invoke("list_drop_phases", { slug, walletAddresses });
     lastLoadedPhases = r;
+    setGasMonitorChain(r.chain);
     const prev = $("wizard-phase")?.value;
     fillPhaseSelect(r.stages, r.recommendedIndex, prev === "" ? null : prev);
     const ended = (r.stages || []).filter((s) => s.expired).length;
@@ -6058,6 +6248,7 @@ $("btn-load-phases")?.addEventListener("click", async () => {
     $("phase-hint").textContent = `${r.name} · ${r.chain} · ${r.stages.length} phase(s) · ${checked}${failed} · ${ended} ended · ${recommendation}`;
     if (!$("task-name").value.trim()) $("task-name").value = r.slug || slug;
     $("wizard-msg").textContent = "Phases loaded";
+    await refreshTaskCostQuote(false);
   } catch (e) {
     $("phase-hint").textContent = "";
     $("wizard-msg").textContent = String(e);
@@ -6996,9 +7187,11 @@ async function startMintTaskInner(taskId, opts = {}) {
   const gasLabel =
     task.gasMode === "manual" && task.gasLimit
       ? `manual ${task.gasLimit}`
-      : "auto";
+      : task.gasLimit
+        ? `auto ${task.gasLimit} (${task.gasQuoteSource || "prepared"})`
+        : "auto legacy fallback";
   const prio = (task.priorityFeeGwei || "").trim() || "auto";
-  const gasLimit = task.gasMode === "manual" ? task.gasLimit || 250000 : 0;
+  const gasLimit = task.gasLimit || 250000;
 
   // Build explicit routes owned by this task. Legacy tasks with proxyRoutes=null
   // still inherit Wallets metadata; once edited, the task becomes self-contained.
@@ -7153,6 +7346,7 @@ async function startMintTaskInner(taskId, opts = {}) {
         expectedWalletCount: task.wallets.length,
         chainOverride: task.chainOverride === "auto" ? null : task.chainOverride,
         gasLimit,
+        baseFeeMultiplier: task.baseFeeMultiplier || null,
         priorityFeeGwei: (task.priorityFeeGwei || "").trim() || null,
         atTime: (task.atTime || "").trim() || null,
         walletQuantities: task.walletQuantities || null,

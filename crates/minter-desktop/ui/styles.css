@@ -369,6 +369,20 @@ a:focus-visible,
   min-width: 0;
 }
 
+.status-bar .sb-cell.sb-gas {
+  padding-left: 12px;
+  border-left: 1px solid var(--border);
+}
+
+.status-bar .sb-gas .sb-v {
+  color: var(--accent);
+}
+
+.status-bar .sb-gas .sb-v.loading,
+.status-bar .sb-gas .sb-v.stale {
+  color: var(--muted);
+}
+
 .status-bar .sb-k {
   font-size: 0.66rem;
   text-transform: uppercase;
@@ -404,6 +418,100 @@ a:focus-visible,
 .status-bar .bad {
   color: var(--red);
   font-weight: 600;
+}
+
+.task-cost-quote {
+  margin: 12px 0 14px;
+  padding: 13px 14px 11px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--card-2) 72%, transparent);
+}
+
+.task-cost-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 11px;
+}
+
+.task-cost-title {
+  display: block;
+  color: var(--text);
+  font-size: 0.84rem;
+  font-weight: 680;
+}
+
+.task-cost-source {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 0.69rem;
+}
+
+.task-cost-ready {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-family: var(--mono);
+  font-size: 0.71rem;
+  color: var(--muted);
+  background: var(--card);
+}
+
+.task-cost-ready.ok {
+  border-color: color-mix(in srgb, var(--green) 45%, var(--border));
+  color: var(--green);
+}
+
+.task-cost-ready.bad {
+  border-color: color-mix(in srgb, var(--red) 45%, var(--border));
+  color: var(--red);
+}
+
+.task-cost-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px 16px;
+}
+
+.task-cost-grid > div {
+  min-width: 0;
+}
+
+.task-cost-grid span {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--muted);
+  font-size: 0.66rem;
+}
+
+.task-cost-grid strong {
+  display: block;
+  overflow: hidden;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  font-weight: 580;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-cost-note {
+  margin: 10px 0 0;
+  padding-top: 9px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.4;
+}
+
+@media (max-width: 850px) {
+  .task-cost-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 .chip {

@@ -57,10 +57,10 @@ pub mod vault;
 
 pub use api::{
     AuthTestRow, DiscoveredFunction, DisperseQuote, DropPhasesResult, EligibilityResult,
-    GeneratedBurnersInfo, LatencyReport, LatencyRpcRow, MintOptions, MulticallStepInput,
-    NetworkProbeRow, ProxyHealthRow, ProxyListItem, RawProbeRow, RawSniperInput, RpcProbeResult,
-    SecurityStatus, Session, StageRow, SweepResultRow, WalletBalanceRow, WalletEligibilityReport,
-    WalletEligibilityRow, WalletInfo, WarmRpcLatencyRow,
+    GeneratedBurnersInfo, LatencyReport, LatencyRpcRow, MintCostQuote, MintOptions,
+    MulticallStepInput, NetworkFeeSnapshot, NetworkProbeRow, ProxyHealthRow, ProxyListItem,
+    RawProbeRow, RawSniperInput, RpcProbeResult, SecurityStatus, Session, StageRow, SweepResultRow,
+    WalletBalanceRow, WalletEligibilityReport, WalletEligibilityRow, WalletInfo, WarmRpcLatencyRow,
 };
 
 /// When true, suppress noisy `println!` in core (desktop sets QUIET=1 by default).

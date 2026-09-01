@@ -25,8 +25,8 @@ use crate::types::{GasMode, GasParams, Signer, max_retries_from_env};
 use crate::vault::Vault;
 use crate::{BURNER_WARNING, NO_TELEMETRY};
 use alloy_primitives::U256;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Shared session state for any UI.
 ///
@@ -351,6 +351,53 @@ pub struct DisperseQuote {
     pub sufficient: bool,
 }
 
+/// Lightweight fee ticker for the desktop header. This is deliberately kept
+/// separate from wallet balance checks, so refreshing it does not fan out one
+/// RPC request per wallet.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkFeeSnapshot {
+    pub chain: String,
+    pub native_symbol: String,
+    pub base_fee_gwei: String,
+    pub priority_fee_gwei: String,
+    pub effective_fee_gwei: String,
+    pub max_fee_gwei: String,
+    pub fee_cap_multiplier: f64,
+    pub usd_price: Option<String>,
+    pub updated_at_ms: i64,
+}
+
+/// Read-only mint budget preview. `expected_*` is the likely amount actually
+/// charged; `required_*` is the wallet balance ceiling required by the RPC.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MintCostQuote {
+    pub chain: String,
+    pub native_symbol: String,
+    pub wallet_count: usize,
+    pub ready_wallets: usize,
+    pub insufficient_wallets: usize,
+    pub gas_used_estimate: u64,
+    pub gas_limit: u64,
+    pub gas_source: String,
+    pub gas_sample_count: usize,
+    pub fee_cap_multiplier: f64,
+    pub effective_fee_gwei: String,
+    pub max_fee_gwei: String,
+    pub mint_each_eth: String,
+    pub mint_each_usd: Option<String>,
+    pub expected_fee_each_eth: String,
+    pub expected_fee_each_usd: Option<String>,
+    pub expected_total_eth: String,
+    pub expected_total_usd: Option<String>,
+    pub required_each_eth: String,
+    pub required_each_usd: Option<String>,
+    pub required_total_eth: String,
+    pub required_total_usd: Option<String>,
+    pub usd_price: Option<String>,
+}
+
 fn native_symbol_for_chain(chain: Option<&str>) -> &'static str {
     match chain
         .unwrap_or("ethereum")
@@ -424,6 +471,34 @@ fn wei_usd_value(wei: U256, usd_price: Option<f64>) -> Option<String> {
     let price = usd_price?;
     let native = wei.to_string().parse::<f64>().ok()? / 1_000_000_000_000_000_000f64;
     Some(format_usd_value(native * price))
+}
+
+fn wei_to_gwei_string(wei: U256) -> String {
+    let value = wei.to_string().parse::<f64>().unwrap_or_default() / 1_000_000_000f64;
+    if value >= 100.0 {
+        format!("{value:.1}")
+    } else if value >= 1.0 {
+        format!("{value:.3}")
+    } else {
+        format!("{value:.4}")
+    }
+}
+
+/// The cap is a safety ceiling, not the expected price. Fast L2-style chains
+/// refresh immediately before firing, so a 30% base-fee headroom is ample and
+/// avoids rejecting low-balance wallets merely because of the old global 2x
+/// Ethereum policy. Ethereum keeps the conventional 2x ceiling.
+fn mint_fee_cap_multiplier(chain: &str) -> f64 {
+    match chain.trim().to_ascii_lowercase().as_str() {
+        "robinhood" | "base" | "arbitrum" | "optimism" | "ink" | "zora" | "blast" | "shape"
+        | "apechain" | "polygon" => 1.30,
+        _ => 2.0,
+    }
+}
+
+fn parse_rpc_hex_u64(value: Option<&serde_json::Value>) -> Option<u64> {
+    let raw = value?.as_str()?;
+    u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok()
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2180,6 +2255,7 @@ impl Session {
             slug: info.slug,
             name: info.name,
             chain: info.chain,
+            contract: info.contracts.first().cloned().unwrap_or_default(),
             address,
             wallet_count,
             successful_wallets: successful_infos.len(),
@@ -3020,6 +3096,300 @@ impl Session {
         };
         let result = multicall::run_multicall(&from, &rpc, &config).await;
         Ok(vec![SweepResultRow::from(result)])
+    }
+
+    /// Current network fee for the always-visible desktop ticker. `include_usd`
+    /// lets the UI refresh RPC gas frequently while refreshing fiat price only
+    /// once per minute.
+    pub async fn network_fee_snapshot(
+        &self,
+        chain: &str,
+        include_usd: bool,
+    ) -> Result<NetworkFeeSnapshot> {
+        let rpc = self.rpc_client_for_chain(chain)?;
+        let (base_fee, network_priority) = rpc.fee_history().await?;
+        let mut params = self.gas_params();
+        params.base_fee_multiplier = mint_fee_cap_multiplier(chain);
+        let (max_fee, priority) = crate::gas::calculate_fees(&params, base_fee, network_priority)?;
+        let effective = base_fee.saturating_add(priority).min(max_fee);
+        let native_symbol = native_symbol_for_chain(Some(chain)).to_string();
+        let usd_price = if include_usd && !self.settings.alchemy_api_key.trim().is_empty() {
+            alchemy_usd_price(&self.settings.alchemy_api_key, &native_symbol)
+                .await
+                .ok()
+        } else {
+            None
+        };
+        Ok(NetworkFeeSnapshot {
+            chain: chain.trim().to_ascii_lowercase(),
+            native_symbol,
+            base_fee_gwei: wei_to_gwei_string(base_fee),
+            priority_fee_gwei: wei_to_gwei_string(priority),
+            effective_fee_gwei: wei_to_gwei_string(effective),
+            max_fee_gwei: wei_to_gwei_string(max_fee),
+            fee_cap_multiplier: params.base_fee_multiplier,
+            usd_price: usd_price.map(|price| format!("{price:.2}")),
+            updated_at_ms: chrono::Utc::now().timestamp_millis(),
+        })
+    }
+
+    /// Find recent successful SeaDrop mints for this exact collection and
+    /// quantity. This happens while configuring the task, never at T0.
+    async fn historical_mint_gas(
+        &self,
+        rpc: &RpcClient,
+        chain: &str,
+        contract: &str,
+        quantity: u32,
+    ) -> (Option<(u64, u64)>, usize) {
+        type GasHistoryCache = HashMap<String, (Instant, Option<(u64, u64)>, usize)>;
+        static CACHE: OnceLock<Mutex<GasHistoryCache>> = OnceLock::new();
+        const TRANSFER_TOPIC: &str =
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+        const ZERO_TOPIC: &str =
+            "0x0000000000000000000000000000000000000000000000000000000000000000";
+        const SEADROP: &str = "0x00005ea00ac477b1030ce78506496e8c2de24bf5";
+
+        if contract.parse::<Address>().is_err() {
+            return (None, 0);
+        }
+        let cache_key = format!(
+            "{}:{}:{}",
+            chain.trim().to_ascii_lowercase(),
+            contract.to_ascii_lowercase(),
+            quantity
+        );
+        if let Ok(cache) = CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock()
+            && let Some((saved_at, estimate, count)) = cache.get(&cache_key)
+            && saved_at.elapsed() < std::time::Duration::from_secs(600)
+        {
+            return (*estimate, *count);
+        }
+        let Ok(latest) = rpc.block_number().await else {
+            return (None, 0);
+        };
+        let mut mint_counts: HashMap<String, u32> = HashMap::new();
+        // Six bounded calls work with providers that reject very wide log
+        // ranges, while still covering roughly 60k recent blocks.
+        for offset in 0..6u64 {
+            let to = latest.saturating_sub(offset * 10_000);
+            let from = to.saturating_sub(9_999);
+            let filter = serde_json::json!({
+                "address": contract,
+                "fromBlock": format!("0x{from:x}"),
+                "toBlock": format!("0x{to:x}"),
+                "topics": [TRANSFER_TOPIC, ZERO_TOPIC]
+            });
+            let Ok(value) = rpc.call("eth_getLogs", serde_json::json!([filter])).await else {
+                continue;
+            };
+            if let Some(logs) = value.as_array() {
+                for log in logs {
+                    if let Some(hash) = log.get("transactionHash").and_then(|v| v.as_str()) {
+                        *mint_counts.entry(hash.to_ascii_lowercase()).or_default() += 1;
+                    }
+                }
+            }
+            if mint_counts
+                .values()
+                .filter(|count| **count == quantity)
+                .count()
+                >= 12
+            {
+                break;
+            }
+        }
+
+        let hashes: Vec<String> = mint_counts
+            .into_iter()
+            .filter_map(|(hash, count)| (count == quantity).then_some(hash))
+            .take(16)
+            .collect();
+        let mut jobs = tokio::task::JoinSet::new();
+        for hash in hashes {
+            let rpc = rpc.clone();
+            jobs.spawn(async move {
+                let (receipt, tx) = tokio::join!(
+                    rpc.call("eth_getTransactionReceipt", serde_json::json!([hash])),
+                    rpc.call("eth_getTransactionByHash", serde_json::json!([hash]))
+                );
+                let receipt = receipt.ok()?;
+                let tx = tx.ok()?;
+                let to = tx.get("to")?.as_str()?;
+                if !to.eq_ignore_ascii_case(SEADROP) {
+                    return None;
+                }
+                let status = parse_rpc_hex_u64(receipt.get("status"))?;
+                let gas_used = parse_rpc_hex_u64(receipt.get("gasUsed"))?;
+                (status == 1 && gas_used >= 21_000).then_some(gas_used)
+            });
+        }
+        let mut samples = Vec::new();
+        while let Some(result) = jobs.join_next().await {
+            if let Ok(Some(gas_used)) = result {
+                samples.push(gas_used);
+            }
+        }
+        if samples.is_empty() {
+            if let Ok(mut cache) = CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+                cache.insert(cache_key, (Instant::now(), None, 0));
+            }
+            return (None, 0);
+        }
+        samples.sort_unstable();
+        let median = samples[(samples.len() - 1) / 2];
+        let p90_index = samples
+            .len()
+            .saturating_mul(9)
+            .div_ceil(10)
+            .saturating_sub(1);
+        let p90 = samples[p90_index];
+        let limit =
+            (((p90 as f64 * 1.15).ceil() as u64).div_ceil(1_000) * 1_000).clamp(21_000, 15_000_000);
+        let result = (Some((median, limit)), samples.len());
+        if let Ok(mut cache) = CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+            cache.insert(cache_key, (Instant::now(), result.0, result.1));
+        }
+        result
+    }
+
+    /// Honest task budget calculated from current fees, recent on-chain gas
+    /// use for the same collection, and the exact selected wallet balances.
+    pub async fn mint_cost_quote(
+        &self,
+        chain: &str,
+        contract: &str,
+        wallet_addresses: Vec<String>,
+        wallet_quantities: HashMap<String, u32>,
+        default_quantity: u32,
+        unit_price_wei: &str,
+        manual_gas_limit: Option<u64>,
+        priority_fee_gwei: Option<&str>,
+    ) -> Result<MintCostQuote> {
+        if wallet_addresses.is_empty() {
+            bail!("Select at least one wallet");
+        }
+        let rpc = self.rpc_client_for_chain(chain)?;
+        let (base_fee, network_priority) = rpc.fee_history().await?;
+        let mut params = self.gas_params();
+        params.base_fee_multiplier = mint_fee_cap_multiplier(chain);
+        if let Some(raw) = priority_fee_gwei
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+        {
+            if !raw.eq_ignore_ascii_case("auto") {
+                let value = raw.parse::<f64>().context("invalid priority fee")?;
+                params = params.with_priority_gwei(value);
+            }
+        }
+        let (max_fee, priority) = crate::gas::calculate_fees(&params, base_fee, network_priority)?;
+        let effective_fee = base_fee.saturating_add(priority).min(max_fee);
+        let price =
+            U256::from_str_radix(unit_price_wei.trim(), 10).context("invalid phase price")?;
+        let requested_qty = wallet_addresses
+            .iter()
+            .filter_map(|address| wallet_quantities.get(&normalize_address(address)).copied())
+            .max()
+            .unwrap_or(default_quantity.max(1));
+        let (historical, sample_count) = if manual_gas_limit.is_none() {
+            self.historical_mint_gas(&rpc, chain, contract, requested_qty)
+                .await
+        } else {
+            (None, 0)
+        };
+        let (gas_used, gas_limit, gas_source) = if let Some(limit) = manual_gas_limit {
+            (limit, limit, "manual".to_string())
+        } else if let Some((used, limit)) = historical {
+            (used, limit, "collection_history".to_string())
+        } else {
+            // A visible conservative fallback is safer than pretending an
+            // exact estimate exists before OpenSea supplies calldata.
+            (200_000, 250_000, "safe_fallback".to_string())
+        };
+
+        let native_symbol = native_symbol_for_chain(Some(chain)).to_string();
+        let price_future = async {
+            if self.settings.alchemy_api_key.trim().is_empty() {
+                None
+            } else {
+                alchemy_usd_price(&self.settings.alchemy_api_key, &native_symbol)
+                    .await
+                    .ok()
+            }
+        };
+        let mut jobs = tokio::task::JoinSet::new();
+        let balance_slots = Arc::new(tokio::sync::Semaphore::new(32));
+        for address in &wallet_addresses {
+            let Ok(address_parsed) = address.parse::<Address>() else {
+                continue;
+            };
+            let rpc = rpc.clone();
+            let balance_slots = balance_slots.clone();
+            let normalized = normalize_address(address);
+            jobs.spawn(async move {
+                let _permit = balance_slots.acquire_owned().await.ok();
+                (normalized, rpc.balance(&address_parsed).await)
+            });
+        }
+        let mut balances = HashMap::new();
+        let usd_price = price_future.await;
+        while let Some(result) = jobs.join_next().await {
+            if let Ok((address, Ok(balance))) = result {
+                balances.insert(address, balance);
+            }
+        }
+
+        let expected_fee_each = U256::from(gas_used).saturating_mul(effective_fee);
+        let reserve_each = U256::from(gas_limit).saturating_mul(max_fee);
+        let mut expected_total = U256::ZERO;
+        let mut required_total = U256::ZERO;
+        let mut ready = 0usize;
+        for address in &wallet_addresses {
+            let normalized = normalize_address(address);
+            let quantity = wallet_quantities
+                .get(&normalized)
+                .copied()
+                .unwrap_or(default_quantity.max(1));
+            let mint_value = price.saturating_mul(U256::from(quantity));
+            let expected = mint_value.saturating_add(expected_fee_each);
+            let required = mint_value.saturating_add(reserve_each);
+            expected_total = expected_total.saturating_add(expected);
+            required_total = required_total.saturating_add(required);
+            if balances
+                .get(&normalized)
+                .is_some_and(|balance| *balance >= required)
+            {
+                ready += 1;
+            }
+        }
+        let mint_each = price.saturating_mul(U256::from(default_quantity.max(1)));
+        let expected_each = mint_each.saturating_add(expected_fee_each);
+        let required_each = mint_each.saturating_add(reserve_each);
+        Ok(MintCostQuote {
+            chain: chain.trim().to_ascii_lowercase(),
+            native_symbol,
+            wallet_count: wallet_addresses.len(),
+            ready_wallets: ready,
+            insufficient_wallets: wallet_addresses.len().saturating_sub(ready),
+            gas_used_estimate: gas_used,
+            gas_limit,
+            gas_source,
+            gas_sample_count: sample_count,
+            fee_cap_multiplier: params.base_fee_multiplier,
+            effective_fee_gwei: wei_to_gwei_string(effective_fee),
+            max_fee_gwei: wei_to_gwei_string(max_fee),
+            mint_each_eth: amount::wei_to_eth_precise_string(mint_each),
+            mint_each_usd: wei_usd_value(mint_each, usd_price),
+            expected_fee_each_eth: amount::wei_to_eth_precise_string(expected_fee_each),
+            expected_fee_each_usd: wei_usd_value(expected_fee_each, usd_price),
+            expected_total_eth: amount::wei_to_eth_precise_string(expected_total),
+            expected_total_usd: wei_usd_value(expected_total, usd_price),
+            required_each_eth: amount::wei_to_eth_precise_string(required_each),
+            required_each_usd: wei_usd_value(required_each, usd_price),
+            required_total_eth: amount::wei_to_eth_precise_string(required_total),
+            required_total_usd: wei_usd_value(required_total, usd_price),
+            usd_price: usd_price.map(|value| format!("{value:.2}")),
+        })
     }
 
     /// Read-only live quote for Disperse. Uses the same destination parser,
@@ -3938,6 +4308,7 @@ pub struct DropPhasesResult {
     pub slug: String,
     pub name: String,
     pub chain: String,
+    pub contract: String,
     pub address: String,
     pub wallet_count: usize,
     pub successful_wallets: usize,
@@ -4192,6 +4563,9 @@ pub struct MintOptions {
     pub priority_fee_gwei: Option<String>,
     /// Gas limit override. `None` = settings/env; `Some(0)` = auto estimate; `Some(n)` = fixed.
     pub gas_limit: Option<u64>,
+    /// Task quote fee ceiling. Expected fee remains current base + priority;
+    /// this multiplier only controls the RPC balance ceiling and maxFeePerGas.
+    pub base_fee_multiplier: Option<f64>,
     /// If set (non-empty), only these vault addresses mint (case-insensitive).
     pub wallet_addresses: Option<Vec<String>>,
     /// RPC chain override (e.g. "ethereum", "base"). None = use collection chain.
@@ -4234,6 +4608,7 @@ impl Default for MintOptions {
             quiet: None,
             priority_fee_gwei: None,
             gas_limit: None,
+            base_fee_multiplier: None,
             wallet_addresses: None,
             chain_override: None,
             proxy_overrides: None,

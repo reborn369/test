@@ -1165,7 +1165,7 @@
           <p class="muted small" data-i18n="tasks.fbHint">Flashbots: multi-wallet private bundle — Ethereum mainnet only.</p>
           <label><span data-i18n="tasks.gasMode">Gas</span>
             <select id="task-gas-mode">
-              <option value="auto" data-i18n="tasks.gasAuto">Auto (estimate)</option>
+              <option value="auto" data-i18n="tasks.gasAuto">Auto</option>
               <option value="manual" data-i18n="tasks.gasManual">Manual</option>
             </select>
           </label>
@@ -1179,6 +1179,24 @@
             <input type="text" id="task-at" placeholder="optional 1700000000 or 2024-01-01T12:00:00Z" autocomplete="off" />
           </label>
         </div>
+        <section id="task-cost-quote" class="task-cost-quote" aria-live="polite">
+          <div class="task-cost-head">
+            <div>
+              <span class="task-cost-title" data-i18n="tasks.costTitle">Mint cost</span>
+              <span id="task-cost-source" class="task-cost-source">Load phases to calculate</span>
+            </div>
+            <span id="task-cost-ready" class="task-cost-ready neutral">—</span>
+          </div>
+          <div class="task-cost-grid">
+            <div><span data-i18n="tasks.currentGas">Current gas</span><strong id="task-cost-gas">—</strong></div>
+            <div><span data-i18n="tasks.mintPrice">Mint price / wallet</span><strong id="task-cost-mint">—</strong></div>
+            <div><span data-i18n="tasks.expectedFee">Expected fee / wallet</span><strong id="task-cost-fee">—</strong></div>
+            <div><span data-i18n="tasks.expectedTotal">Expected total</span><strong id="task-cost-total">—</strong></div>
+            <div><span data-i18n="tasks.requiredBalance">Required balance / wallet</span><strong id="task-cost-required">—</strong></div>
+            <div><span data-i18n="tasks.requiredTotal">Required reserve total</span><strong id="task-cost-required-total">—</strong></div>
+          </div>
+          <p id="task-cost-note" class="task-cost-note" data-i18n="tasks.costNote">Expected fee is the likely charge. Required reserve is a ceiling; unused gas is not charged.</p>
+        </section>
         <label class="check"><input type="checkbox" id="task-per-wallet-qty" /> <span data-i18n="tasks.perWalletQty">Per-wallet quantity (default = qty above)</span></label>
         <div id="task-qty-map-wrap" class="task-qty-map-wrap hidden">
           <p class="muted small" data-i18n="tasks.perWalletQtyHint">Set qty per checked wallet after selecting wallets (default uses task qty).</p>
@@ -1191,7 +1209,7 @@
           </label>
           <p class="muted small" data-i18n="tasks.autoSweepHint">After each confirmed mint, transfer its NFTs to this address. Sweep errors never change mint success.</p>
         </div>
-        <p class="muted small" data-i18n="tasks.startHint">Start = live mint. Fixed gas, wait open, send → success after on-chain confirm.</p>
+        <p class="muted small" data-i18n="tasks.startHint">Auto gas is prepared now; at phase open the transaction sends without an estimate delay.</p>
         <div class="wallet-pick-head">
           <span data-i18n="tasks.pickWallets">Wallets</span>
           <div class="task-group-filter">
@@ -1202,7 +1220,7 @@
         </div>
         <div id="task-wallet-list" class="task-wallet-list muted">Unlock vault to load wallets…</div>
         <p class="muted small" data-i18n="tasks.proxyPerWalletHint">Route is saved in this task: Auto, Direct, or a specific proxy.</p>
-        <label class="check"><input type="checkbox" id="task-filter-balance" checked disabled /> <span data-i18n="tasks.filterBalance">Verify funds on the detected mint network (required)</span></label>
+        <label class="check"><input type="checkbox" id="task-filter-balance" checked disabled /> <span data-i18n="tasks.filterBalance">Verify exact mint price and gas reserve (required)</span></label>
         <input type="checkbox" id="task-skip-est" class="hidden" checked aria-hidden="true" />
         <p id="wizard-msg" class="msg"></p>
         <div class="row actions modal-actions">

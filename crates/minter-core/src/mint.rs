@@ -2691,6 +2691,12 @@ async fn run_opensea_mint_inner(
 
     // Settings / .env → gas + retries + sniper flags.
     let mut gas_params = GasParams::from_env(env);
+    if let Some(multiplier) = opts
+        .base_fee_multiplier
+        .filter(|value| *value >= 1.0 && *value <= 5.0)
+    {
+        gas_params.base_fee_multiplier = multiplier;
+    }
     let max_attempts = max_retries_from_env(env);
     let quiet = opts.quiet.unwrap_or_else(|| quiet_from_env(env));
     let skip_preflight_flag = opts
@@ -2907,7 +2913,7 @@ async fn run_opensea_mint_inner(
         .fee_history()
         .await
         .unwrap_or((U256::from(1_000_000_000u64), U256::from(1_000_000_000u64)));
-    let (max_fee, max_priority_fee) =
+    let (mut max_fee, mut max_priority_fee) =
         gas::calculate_fees(&gas_params, fee_snapshot.0, fee_snapshot.1).unwrap_or((
             fee_snapshot.0 * U256::from(2u64) + fee_snapshot.1,
             fee_snapshot.1,
@@ -3121,6 +3127,7 @@ async fn run_opensea_mint_inner(
         let mut conditional_started = false;
         let mut short_probe_started = false;
         let mut gql_warm_started = false;
+        let mut fee_refreshed = false;
         let mut last_printed = -1i64;
         let prefetch_lead_ms = if conditional_submit_enabled {
             5_000u64.max(conditional_lead_ms.saturating_add(3_000))
@@ -3179,6 +3186,52 @@ async fn run_opensea_mint_inner(
             }
             if timer_guard.is_none() && remaining_ms <= 5_000 {
                 timer_guard = Some(crate::timer_resolution::TimerResolutionGuard::activate());
+            }
+
+            // The task may have been armed minutes or hours ago. Refresh the
+            // fee ceiling before the final signing pass, not at T0. This keeps
+            // the prepared 1.30x L2 cap current without putting an RPC read in
+            // front of the actual broadcast.
+            let fee_refresh_lead_ms = 5_000u64.max(
+                conditional_submit_enabled
+                    .then_some(conditional_lead_ms.saturating_add(1_500))
+                    .unwrap_or_default(),
+            ) as i64;
+            if !fee_refreshed && remaining_ms <= fee_refresh_lead_ms {
+                fee_refreshed = true;
+                match tokio::time::timeout(std::time::Duration::from_millis(900), rpc.fee_history())
+                    .await
+                {
+                    Ok(Ok((base_fee, network_priority))) => {
+                        if let Ok((fresh_max, fresh_priority)) =
+                            gas::calculate_fees(&gas_params, base_fee, network_priority)
+                        {
+                            max_fee = fresh_max;
+                            max_priority_fee = fresh_priority;
+                            for wallet in wallets.iter_mut() {
+                                wallet.pre_signed_tx = None;
+                            }
+                            log_always(
+                                reporter.as_ref(),
+                                format!(
+                                    "  Gas refreshed before fire: max={} gwei, priority={} gwei",
+                                    max_fee / U256::from(1_000_000_000u64),
+                                    max_priority_fee / U256::from(1_000_000_000u64)
+                                ),
+                            );
+                        }
+                    }
+                    Ok(Err(error)) => log_always(
+                        reporter.as_ref(),
+                        format!(
+                            "WARN: pre-fire gas refresh failed; keeping prepared fees: {error}"
+                        ),
+                    ),
+                    Err(_) => log_always(
+                        reporter.as_ref(),
+                        "WARN: pre-fire gas refresh timed out; keeping prepared fees".to_string(),
+                    ),
+                }
             }
 
             let left = remaining_ms.saturating_add(999) / 1000;

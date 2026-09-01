@@ -2,7 +2,10 @@ use alloy::signers::SignerSync;
 use alloy_primitives::{Address, U256, keccak256};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 const OPENSEA_ORIGIN: &str = "https://opensea.io";
 const GQL_URL: &str = "https://gql.opensea.io/graphql";
@@ -11,9 +14,11 @@ const DEFAULT_SEADROP_ADDRESS: &str = "0x00005EA00Ac477B1030CE78506496e8C2dE24bf
 const DEFAULT_FEE_RECIPIENT: &str = "0x0000a26b00c1F0DF003000390027140000fAa719";
 
 const MINT_ACTION_TIMELINE_QUERY: &str = r#"query MintActionTimelineQuery($address: Address!, $fromAssets: [AssetQuantityInput!]!, $toAssets: [AssetQuantityInput!]!, $recipient: Address, $capabilities: WalletCapabilities) { swap(address: $address, fromAssets: $fromAssets, toAssets: $toAssets, recipient: $recipient, action: MINT, capabilities: $capabilities) { actions { __typename ... on TransactionAction { transactionSubmissionData { to data value chain { networkId identifier gasLimitBufferMultiplier } } } ... on MintAction { __typename collection { imageUrl } } ... on RelayerFulfillableAction { relayerFulfillment { requestId sameChain crossChain } } ... on UserOpAction { actionBundleToken chain { networkId identifier } } } errors { __typename } } }"#;
-const MINT_ACTION_TIMELINE_HASH: &str =
-    "d8454b30426e34f3d5acec5f012d1bdedf31bb44199a83c9b6d05ff52fff8302";
-
+/// Current persisted-query id captured from OpenSea's own web client on
+/// 2026-09-01. It identifies the GraphQL document, not a collection or wallet.
+pub const MINT_ACTION_TIMELINE_HASH: &str =
+    "a840638535e76c8be93a29fc58cbf7c85a520f9f34e67012fe61249394d2c6d3";
+static MINT_ACTION_SHORT_ENABLED: AtomicBool = AtomicBool::new(true);
 const COLLECTION_DROP_QUERY: &str = r#"
 query CollectionDropQuery($collectionSlug: String!, $address: Address!) {
   collectionBySlug(slug: $collectionSlug) {
@@ -1057,6 +1062,199 @@ fn parse_stages(drop: &serde_json::Value) -> Result<Vec<StageInfo>> {
     Ok(stages)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MintActionRoute {
+    Short,
+    FullFallbackExpired,
+    FullHashDisabled,
+}
+
+#[derive(Debug)]
+pub struct MintActionFetch {
+    pub data: serde_json::Value,
+    pub route: MintActionRoute,
+    pub short_ms: Option<u128>,
+    pub full_ms: Option<u128>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MintActionShortProbe {
+    Available { elapsed_ms: u128 },
+    Expired { elapsed_ms: u128 },
+}
+
+fn mint_action_variables(
+    address: &Address,
+    nft_contract: &str,
+    chain: &str,
+    token_id: &str,
+    quantity: u32,
+    payment_asset: &serde_json::Value,
+) -> serde_json::Value {
+    json!({
+        "address": format!("{:?}", address),
+        // Our vault contains EOAs and signs normal EIP-1559 transactions. The
+        // website advertises eip7702 when its connected wallet supports user
+        // operations; copying `true` here could make OpenSea return a UserOp
+        // instead of transactionSubmissionData.
+        "capabilities": {"eip7702": false},
+        "fromAssets": [{"asset": payment_asset}],
+        "toAssets": [{
+            "asset": {
+                "chain": chain,
+                "contractAddress": nft_contract,
+                "tokenId": token_id,
+            },
+            "quantity": quantity.to_string(),
+        }],
+    })
+}
+
+fn persisted_query_missing(text: &str) -> bool {
+    let normalized = text.to_ascii_lowercase().replace(['_', ' '], "");
+    normalized.contains("persistedquerynotfound")
+        || normalized.contains("persistedquerynotsupported")
+}
+
+fn mint_action_short_request(
+    session: &AuthSession,
+    variables: &serde_json::Value,
+) -> Result<reqwest::RequestBuilder> {
+    let variables = serde_json::to_string(variables).context("mint variables JSON")?;
+    let extensions = serde_json::to_string(&json!({
+        "persistedQuery": {
+            "sha256Hash": MINT_ACTION_TIMELINE_HASH,
+            "version": 1,
+        }
+    }))
+    .context("mint persisted-query JSON")?;
+    let mut request = session
+        .client
+        .get(GQL_URL)
+        .query(&[
+            ("app_id", "os2-web"),
+            ("operationName", "MintActionTimelineQuery"),
+            ("variables", variables.as_str()),
+            ("extensions", extensions.as_str()),
+        ])
+        .header(
+            "accept",
+            "application/graphql-response+json, application/graphql+json, application/json",
+        )
+        .header("origin", OPENSEA_ORIGIN)
+        .header("referer", format!("{}/", OPENSEA_ORIGIN))
+        .header("x-app-id", "os2-web")
+        .header("x-graphql-operation-type", "query");
+    if !session.access_token.is_empty() {
+        request = request.header("authorization", format!("Bearer {}", session.access_token));
+    }
+    Ok(request)
+}
+
+fn mint_action_rate_limit(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    text: &str,
+    route: &str,
+) -> Result<()> {
+    if is_rate_limit_status(status.as_u16()) {
+        let retry_after = retry_after_ms(headers, text);
+        bail!(
+            "OpenSea {route} failed: HTTP {} Too Many Requests retry-after={}ms {}",
+            status,
+            if retry_after > 0 { retry_after } else { 1000 },
+            crate::safe_truncate(text, 200)
+        );
+    }
+    Ok(())
+}
+
+async fn fetch_mint_calldata_full(
+    session: &AuthSession,
+    variables: &serde_json::Value,
+) -> Result<(serde_json::Value, u128)> {
+    let payload = json!({
+        "operationName": "MintActionTimelineQuery",
+        "query": MINT_ACTION_TIMELINE_QUERY,
+        "variables": variables,
+    });
+    let started = std::time::Instant::now();
+    let mut request = gql_request(&session.client);
+    if !session.access_token.is_empty() {
+        request = request.header("authorization", format!("Bearer {}", session.access_token));
+    }
+    let response = request
+        .json(&payload)
+        .send()
+        .await
+        .context("OpenSea FULL fallback request failed")?;
+    let elapsed_ms = started.elapsed().as_millis();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let text = response.text().await.unwrap_or_default();
+    mint_action_rate_limit(status, &headers, &text, "FULL fallback")?;
+    if status.as_u16() >= 400 {
+        bail!(
+            "OpenSea FULL fallback failed: HTTP {} {}",
+            status,
+            crate::safe_truncate(&text, 500)
+        );
+    }
+    let data: serde_json::Value =
+        serde_json::from_str(&text).context("OpenSea FULL fallback JSON")?;
+    if let Some(errors) = data.get("errors") {
+        bail!("OpenSea FULL fallback GraphQL errors: {errors}");
+    }
+    Ok((data, elapsed_ms))
+}
+
+/// Read-only preflight for the current persisted-query id. It is intended to
+/// run well before T0; any normal GraphQL/action response proves registration.
+pub async fn probe_mint_action_short(
+    session: &AuthSession,
+    address: &Address,
+    nft_contract: &str,
+    chain: &str,
+    token_id: &str,
+    quantity: u32,
+    payment_asset: &serde_json::Value,
+) -> Result<MintActionShortProbe> {
+    set_connected_account_cookie(session, address)?;
+    let variables = mint_action_variables(
+        address,
+        nft_contract,
+        chain,
+        token_id,
+        quantity,
+        payment_asset,
+    );
+    let started = std::time::Instant::now();
+    let response = mint_action_short_request(session, &variables)?
+        .send()
+        .await
+        .context("OpenSea SHORT precheck request failed")?;
+    let elapsed_ms = started.elapsed().as_millis();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let text = response.text().await.unwrap_or_default();
+    mint_action_rate_limit(status, &headers, &text, "SHORT precheck")?;
+    if persisted_query_missing(&text) {
+        MINT_ACTION_SHORT_ENABLED.store(false, Ordering::SeqCst);
+        return Ok(MintActionShortProbe::Expired { elapsed_ms });
+    }
+    if status.as_u16() >= 400 {
+        bail!(
+            "OpenSea SHORT precheck failed: HTTP {} {}",
+            status,
+            crate::safe_truncate(&text, 500)
+        );
+    }
+    let _: serde_json::Value =
+        serde_json::from_str(&text).context("OpenSea SHORT precheck JSON")?;
+    MINT_ACTION_SHORT_ENABLED.store(true, Ordering::SeqCst);
+    Ok(MintActionShortProbe::Available { elapsed_ms })
+}
+
 pub async fn fetch_mint_calldata(
     session: &AuthSession,
     _collection_slug: &str,
@@ -1066,106 +1264,70 @@ pub async fn fetch_mint_calldata(
     token_id: &str,
     quantity: u32,
     payment_asset: &serde_json::Value,
-) -> Result<serde_json::Value> {
-    let client = &session.client;
-    let addr_str = format!("{:?}", address);
+) -> Result<MintActionFetch> {
     set_connected_account_cookie(session, address)?;
+    let variables = mint_action_variables(
+        address,
+        nft_contract,
+        chain,
+        token_id,
+        quantity,
+        payment_asset,
+    );
 
-    let payload = json!({
-        "operationName": "MintActionTimelineQuery",
-        "query": MINT_ACTION_TIMELINE_QUERY,
-        "variables": {
-            "address": addr_str,
-            "capabilities": {"eip7702": false},
-            "fromAssets": [{"asset": payment_asset}],
-            "toAssets": [{
-                "asset": {
-                    "chain": chain,
-                    "contractAddress": nft_contract,
-                    "tokenId": token_id,
-                },
-                "quantity": quantity.to_string(),
-            }],
-        }
-    });
-
-    let persisted_payload = json!({
-        "operationName": "MintActionTimelineQuery",
-        "variables": payload.get("variables").cloned().unwrap_or_else(|| json!({})),
-        "extensions": {
-            "persistedQuery": {
-                "version": 1,
-                "sha256Hash": MINT_ACTION_TIMELINE_HASH,
-            }
-        }
-    });
-
-    let mut req = gql_request(client);
-    if !session.access_token.is_empty() {
-        req = req.header("authorization", format!("Bearer {}", session.access_token));
+    if !MINT_ACTION_SHORT_ENABLED.load(Ordering::SeqCst) {
+        let (data, full_ms) = fetch_mint_calldata_full(session, &variables).await?;
+        return Ok(MintActionFetch {
+            data,
+            route: MintActionRoute::FullHashDisabled,
+            short_ms: None,
+            full_ms: Some(full_ms),
+        });
     }
-    let resp = req
-        .json(&persisted_payload)
+
+    let short_started = std::time::Instant::now();
+    let response = mint_action_short_request(session, &variables)?
         .send()
         .await
-        .context("mint action request failed")?;
+        .context("OpenSea SHORT request failed")?;
+    let short_ms = short_started.elapsed().as_millis();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let text = response.text().await.unwrap_or_default();
+    mint_action_rate_limit(status, &headers, &text, "SHORT")?;
 
-    if resp.status().as_u16() >= 400 {
-        let status = resp.status();
-        let headers = resp.headers().clone();
-        let text = resp.text().await.unwrap_or_default();
-        // A rate limit here is the expensive one: it lands on the query that
-        // produces the calldata, at the moment the stage opens. OpenSea tells
-        // us how long to wait, so carry that into the error instead of
-        // discarding it and letting the caller retry blindly into the limit.
-        if is_rate_limit_status(status.as_u16()) {
-            let ra = retry_after_ms(&headers, &text);
-            bail!(
-                "Mint action failed: HTTP {} Too Many Requests retry-after={}ms {}",
-                status,
-                if ra > 0 { ra } else { 1000 },
-                crate::safe_truncate(&text, 200)
-            );
-        }
-        if text.contains("PERSISTED_QUERY_NOT_FOUND") {
-            let mut fallback_req = gql_request(client);
-            if !session.access_token.is_empty() {
-                fallback_req = fallback_req
-                    .header("authorization", format!("Bearer {}", session.access_token));
-            }
-            let fallback_resp = fallback_req
-                .json(&payload)
-                .send()
-                .await
-                .context("mint action inline query fallback failed")?;
-            if fallback_resp.status().as_u16() < 400 {
-                let data: serde_json::Value = fallback_resp.json().await?;
-                if let Some(errors) = data.get("errors") {
-                    bail!("Mint action GraphQL errors: {}", errors);
-                }
-                return Ok(data);
-            }
-            let fallback_status = fallback_resp.status();
-            let fallback_text = fallback_resp.text().await.unwrap_or_default();
-            bail!(
-                "Mint action failed: OpenSea persisted query hash expired and inline fallback failed: HTTP {} {}",
-                fallback_status,
-                crate::safe_truncate(&fallback_text, 500)
-            );
-        }
+    if persisted_query_missing(&text) {
+        MINT_ACTION_SHORT_ENABLED.store(false, Ordering::SeqCst);
+        let (data, full_ms) = fetch_mint_calldata_full(session, &variables)
+            .await
+            .with_context(|| {
+                format!("OpenSea SHORT HASH EXPIRED after {short_ms}ms; FULL FALLBACK failed")
+            })?;
+        return Ok(MintActionFetch {
+            data,
+            route: MintActionRoute::FullFallbackExpired,
+            short_ms: Some(short_ms),
+            full_ms: Some(full_ms),
+        });
+    }
+    if status.as_u16() >= 400 {
         bail!(
-            "Mint action failed: HTTP {} {}",
+            "OpenSea SHORT failed: HTTP {} {}",
             status,
             crate::safe_truncate(&text, 500)
         );
     }
-
-    let data: serde_json::Value = resp.json().await?;
+    let data: serde_json::Value =
+        serde_json::from_str(&text).context("OpenSea SHORT response JSON")?;
     if let Some(errors) = data.get("errors") {
-        bail!("Mint action GraphQL errors: {}", errors);
+        bail!("OpenSea SHORT GraphQL errors: {errors}");
     }
-
-    Ok(data)
+    Ok(MintActionFetch {
+        data,
+        route: MintActionRoute::Short,
+        short_ms: Some(short_ms),
+        full_ms: None,
+    })
 }
 
 fn find_transaction_submission_data(value: &serde_json::Value) -> Option<&serde_json::Value> {
@@ -1488,6 +1650,54 @@ mod retry_after_tests {
             4000
         );
         assert_eq!(retry_after_ms(&empty, "not json"), 0);
+    }
+}
+
+#[cfg(test)]
+mod mint_short_query_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_old_and_new_persisted_query_errors() {
+        for body in [
+            r#"{"errors":[{"message":"PERSISTED_QUERY_NOT_FOUND"}]}"#,
+            r#"{"errors":[{"message":"PersistedQueryNotFound"}]}"#,
+            r#"{"errors":[{"message":"PERSISTED QUERY NOT SUPPORTED"}]}"#,
+        ] {
+            assert!(persisted_query_missing(body), "{body}");
+        }
+        assert!(!persisted_query_missing(
+            r#"{"data":{"swap":{"actions":[],"errors":[]}}}"#
+        ));
+    }
+
+    #[test]
+    fn short_hash_is_current_capture_and_not_collection_specific() {
+        assert_eq!(MINT_ACTION_TIMELINE_HASH.len(), 64);
+        assert_eq!(
+            MINT_ACTION_TIMELINE_HASH,
+            "a840638535e76c8be93a29fc58cbf7c85a520f9f34e67012fe61249394d2c6d3"
+        );
+        let payment = json!({
+            "chain": "robinhood",
+            "contractAddress": "0x0000000000000000000000000000000000000000"
+        });
+        let variables = mint_action_variables(
+            &"0x000000000000000000000000000000000000dead"
+                .parse()
+                .unwrap(),
+            "0x000000000000000000000000000000000000beef",
+            "robinhood",
+            "0",
+            2,
+            &payment,
+        );
+        assert_eq!(variables["capabilities"]["eip7702"], false);
+        assert_eq!(variables["toAssets"][0]["quantity"], "2");
+        assert_eq!(
+            variables["toAssets"][0]["asset"]["contractAddress"],
+            "0x000000000000000000000000000000000000beef"
+        );
     }
 }
 

@@ -1064,7 +1064,7 @@ async fn fetch_and_parse_gql(
     quiet: bool,
 ) -> anyhow::Result<(alloy_primitives::Address, U256, Bytes)> {
     let gql_start = std::time::Instant::now();
-    let resp = opensea::fetch_mint_calldata(
+    let fetch = opensea::fetch_mint_calldata(
         session,
         slug,
         addr,
@@ -1077,6 +1077,37 @@ async fn fetch_and_parse_gql(
     .await?;
 
     let gql_ms = gql_start.elapsed().as_millis();
+    match fetch.route {
+        opensea::MintActionRoute::Short => log_always(
+            reporter,
+            format!(
+                "[{}] OpenSea SHORT OK {}ms hash={}вЂ¦{}",
+                sign::shorten_address(addr),
+                fetch.short_ms.unwrap_or(gql_ms),
+                &opensea::MINT_ACTION_TIMELINE_HASH[..8],
+                &opensea::MINT_ACTION_TIMELINE_HASH[60..]
+            ),
+        ),
+        opensea::MintActionRoute::FullFallbackExpired => log_always(
+            reporter,
+            format!(
+                "[{}] OpenSea SHORT HASH EXPIRED {}ms -> FULL FALLBACK OK {}ms (total={}ms)",
+                sign::shorten_address(addr),
+                fetch.short_ms.unwrap_or_default(),
+                fetch.full_ms.unwrap_or_default(),
+                gql_ms
+            ),
+        ),
+        opensea::MintActionRoute::FullHashDisabled => log_always(
+            reporter,
+            format!(
+                "[{}] OpenSea SHORT DISABLED (expired precheck) -> FULL FALLBACK OK {}ms",
+                sign::shorten_address(addr),
+                fetch.full_ms.unwrap_or(gql_ms)
+            ),
+        ),
+    }
+    let resp = fetch.data;
     if std::env::var("DEBUG").ok().as_deref() == Some("1") {
         let _ = std::fs::create_dir_all("logs");
         let debug_file = format!(
@@ -3088,6 +3119,7 @@ async fn run_opensea_mint_inner(
         let mut prefetched = false;
         let mut prep_frozen = false;
         let mut conditional_started = false;
+        let mut short_probe_started = false;
         let mut gql_warm_started = false;
         let mut last_printed = -1i64;
         let prefetch_lead_ms = if conditional_submit_enabled {
@@ -3171,6 +3203,74 @@ async fn run_opensea_mint_inner(
                     );
                 }
                 last_printed = left;
+            }
+
+            // Validate OpenSea's persisted-query id a full minute before T0.
+            // This is separate from the 30s transport warm so even a slow
+            // precheck has ample time to refill its one request-budget token.
+            if !short_probe_started && !local_public_prefetch && remaining_ms <= 60_000 {
+                short_probe_started = true;
+                if remaining_ms >= 15_000 {
+                    if let Some(wallet) = wallets
+                        .iter()
+                        .find(|wallet| wallet.auth_ok && wallet.session.is_some())
+                    {
+                        let session = wallet.session.clone().expect("checked above");
+                        let address = wallet.address;
+                        let probe_quantity =
+                            wallet_quantities.get(&address).copied().unwrap_or(quantity);
+                        let probe = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            opensea::probe_mint_action_short(
+                                &session,
+                                &address,
+                                nft_contract,
+                                &info.chain,
+                                &stage_token_id,
+                                probe_quantity,
+                                &payment_asset,
+                            ),
+                        )
+                        .await;
+                        match probe {
+                            Ok(Ok(opensea::MintActionShortProbe::Available { elapsed_ms })) => {
+                                log_always(
+                                    reporter.as_ref(),
+                                    format!(
+                                        "OpenSea SHORT PRECHECK OK {elapsed_ms}ms hash={}…{}; T0 short path armed",
+                                        &opensea::MINT_ACTION_TIMELINE_HASH[..8],
+                                        &opensea::MINT_ACTION_TIMELINE_HASH[60..]
+                                    ),
+                                );
+                            }
+                            Ok(Ok(opensea::MintActionShortProbe::Expired { elapsed_ms })) => {
+                                log_always(
+                                    reporter.as_ref(),
+                                    format!(
+                                        "WARN OpenSea SHORT HASH EXPIRED in precheck after {elapsed_ms}ms; FULL FALLBACK armed for all wallets"
+                                    ),
+                                );
+                            }
+                            Ok(Err(error)) => log_always(
+                                reporter.as_ref(),
+                                format!(
+                                    "WARN OpenSea SHORT PRECHECK INCONCLUSIVE: {error}; T0 will try SHORT once"
+                                ),
+                            ),
+                            Err(_) => log_always(
+                                reporter.as_ref(),
+                                "WARN OpenSea SHORT PRECHECK TIMEOUT 5000ms; T0 will try SHORT once"
+                                    .to_string(),
+                            ),
+                        }
+                    }
+                } else {
+                    log_always(
+                        reporter.as_ref(),
+                        "OpenSea SHORT PRECHECK skipped: less than 15s to T0; T0 will try SHORT once"
+                            .to_string(),
+                    );
+                }
             }
 
             // Auth/eligibility often finishes minutes before a scheduled mint.

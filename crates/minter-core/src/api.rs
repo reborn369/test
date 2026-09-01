@@ -324,6 +324,33 @@ pub struct WalletBalanceRow {
     pub chain: Option<String>,
 }
 
+/// Live, read-only Disperse cost preview using the same RPC/gas policy as the
+/// eventual dry/live run. All monetary strings are display values; transaction
+/// amounts remain integer wei inside core.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisperseQuote {
+    pub recipient_count: usize,
+    pub amount_each_eth: String,
+    pub amount_each_usd: Option<String>,
+    pub total_value_eth: String,
+    pub total_value_usd: Option<String>,
+    pub gas_estimate_eth: String,
+    pub gas_estimate_usd: Option<String>,
+    pub total_estimate_eth: String,
+    pub total_estimate_usd: Option<String>,
+    pub gas_reserve_eth: String,
+    pub gas_reserve_usd: Option<String>,
+    pub total_need_eth: String,
+    pub total_need_usd: Option<String>,
+    pub balance_eth: String,
+    pub balance_usd: Option<String>,
+    pub usd_price: Option<String>,
+    pub native_symbol: String,
+    pub gas_limit_each: u64,
+    pub sufficient: bool,
+}
+
 fn native_symbol_for_chain(chain: Option<&str>) -> &'static str {
     match chain
         .unwrap_or("ethereum")
@@ -391,6 +418,12 @@ fn format_usd_value(value: f64) -> String {
     } else {
         format!("{value:.6}")
     }
+}
+
+fn wei_usd_value(wei: U256, usd_price: Option<f64>) -> Option<String> {
+    let price = usd_price?;
+    let native = wei.to_string().parse::<f64>().ok()? / 1_000_000_000_000_000_000f64;
+    Some(format_usd_value(native * price))
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1974,12 +2007,14 @@ impl Session {
         })
     }
 
-    /// List drop stages for mint phase picker (collection_drop_info + recommended).
-    ///
-    /// Same OpenSea access path as WL Check: first-wallet proxy + auth cache.
-    /// Previously used `siwe_auth(..., None)` (direct IP only) while WL/mint used
-    /// proxies — so WL could succeed and Tasks → Load phases fail on the same machine.
-    pub async fn list_drop_phases(&self, slug: &str) -> Result<DropPhasesResult> {
+    /// List drop stages for the phase picker and aggregate eligibility for the
+    /// exact wallet set selected in the task modal. This is preparation work;
+    /// it never runs on the hot path when the phase opens.
+    pub async fn list_drop_phases(
+        &self,
+        slug: &str,
+        wallet_addresses: Option<Vec<String>>,
+    ) -> Result<DropPhasesResult> {
         if self.signers.is_empty() {
             bail!("No wallets unlocked");
         }
@@ -1987,65 +2022,168 @@ impl Session {
         if slug.is_empty() {
             bail!("Collection slug required");
         }
-        let signer = &self.signers[0];
-        let addr = signer.address();
-        let addr_str = format!("{:?}", addr);
+        let requested = select_vault_signers(&self.signers, wallet_addresses)?;
+        let requested_addresses: std::collections::HashSet<Address> =
+            requested.iter().map(|signer| signer.address()).collect();
+        let selected: Vec<(usize, Signer)> = self
+            .signers
+            .iter()
+            .enumerate()
+            .filter(|(_, signer)| requested_addresses.contains(&signer.address()))
+            .map(|(index, signer)| (index, signer.clone()))
+            .collect();
+        let wallet_count = selected.len();
+        if wallet_count == 0 {
+            bail!("Select at least one wallet before loading phases");
+        }
+
         let chain_id = self.resolve_chain_id(None).await;
         let proxies = self.proxy_manager();
-        // Wallet 0 sticky proxy — same mapping as WL Check / mint for vault index 0.
-        let proxy = proxies.get(0).map(|s| s.to_string());
         let pw = self.password.as_ref().map(|z| z.as_str());
-        let mut cache = AuthCache::load(pw);
+        let cache = Arc::new(tokio::sync::Mutex::new(AuthCache::load(pw)));
+        let concurrency = crate::batch::resolve_concurrency(None, proxies.len());
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let mut workers = tokio::task::JoinSet::new();
 
-        let cached_token = cache.get(&addr_str, chain_id).map(|t| t.to_string());
-        let auth = if let Some(token) = cached_token {
-            let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
-            match opensea::build_client_with_cookie_jar_and_proxy(
-                cookie_jar.clone(),
-                proxy.as_deref(),
-            ) {
-                Ok(client) => opensea::AuthSession {
-                    access_token: token,
-                    address: addr_str.clone(),
-                    client,
-                    cookie_jar,
-                },
-                Err(_) => {
-                    let session = opensea::siwe_auth(&addr, signer, chain_id, proxy.as_deref())
+        for (order, (vault_index, signer)) in selected.into_iter().enumerate() {
+            let slug = slug.clone();
+            let proxy = proxies.get(vault_index).map(str::to_string);
+            let cache = cache.clone();
+            let semaphore = semaphore.clone();
+            workers.spawn(async move {
+                let _permit = semaphore
+                    .acquire()
+                    .await
+                    .context("phase-load semaphore closed")?;
+                let addr = signer.address();
+                let addr_str = format!("{:?}", addr);
+                let cached_token = {
+                    let guard = cache.lock().await;
+                    guard.get(&addr_str, chain_id).map(str::to_string)
+                };
+                let mut used_cached_token = false;
+                let mut auth = if let Some(token) = cached_token {
+                    let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
+                    match opensea::build_client_with_cookie_jar_and_proxy(
+                        cookie_jar.clone(),
+                        proxy.as_deref(),
+                    ) {
+                        Ok(client) => {
+                            used_cached_token = true;
+                            opensea::AuthSession {
+                                access_token: token,
+                                address: addr_str.clone(),
+                                client,
+                                cookie_jar,
+                            }
+                        }
+                        Err(_) => opensea::siwe_auth_with_retries(
+                            &addr,
+                            &signer,
+                            chain_id,
+                            proxy.as_deref(),
+                            3,
+                        )
                         .await
-                        .context("OpenSea SIWE auth failed")?;
-                    cache.save(&addr_str, chain_id, &session.access_token);
-                    if let Err(e) = cache.flush() {
-                        crate::rlog!("auth cache flush after list_drop_phases: {e}");
+                        .context("OpenSea SIWE auth failed")?,
                     }
-                    session
-                }
-            }
-        } else {
-            let session = opensea::siwe_auth(&addr, signer, chain_id, proxy.as_deref())
-                .await
-                .context("OpenSea SIWE auth failed")?;
-            cache.save(&addr_str, chain_id, &session.access_token);
-            if let Err(e) = cache.flush() {
-                crate::rlog!("auth cache flush after list_drop_phases: {e}");
-            }
-            session
-        };
+                } else {
+                    opensea::siwe_auth_with_retries(&addr, &signer, chain_id, proxy.as_deref(), 3)
+                        .await
+                        .context("OpenSea SIWE auth failed")?
+                };
 
-        let info = opensea::collection_drop_info(&auth, &slug, &addr)
-            .await
-            .context("collection drop info failed")?;
+                if !used_cached_token {
+                    let mut guard = cache.lock().await;
+                    guard.save(&addr_str, chain_id, &auth.access_token);
+                }
+
+                let mut info = opensea::collection_drop_info(&auth, &slug, &addr)
+                    .await
+                    .context("collection drop info failed")?;
+
+                let personalised_missing = used_cached_token
+                    && info
+                        .stages
+                        .iter()
+                        .any(|stage| !is_public_sale_stage_type(&stage.stage_type))
+                    && info
+                        .stages
+                        .iter()
+                        .filter(|stage| !is_public_sale_stage_type(&stage.stage_type))
+                        .all(|stage| stage.is_eligible.is_none());
+                if personalised_missing {
+                    auth = opensea::siwe_auth_with_retries(
+                        &addr,
+                        &signer,
+                        chain_id,
+                        proxy.as_deref(),
+                        3,
+                    )
+                    .await
+                    .context("OpenSea SIWE refresh failed")?;
+                    {
+                        let mut guard = cache.lock().await;
+                        guard.save(&addr_str, chain_id, &auth.access_token);
+                    }
+                    info = opensea::collection_drop_info(&auth, &slug, &addr)
+                        .await
+                        .context("collection drop info after auth refresh failed")?;
+                }
+
+                Ok::<_, anyhow::Error>((order, addr_str, info))
+            });
+        }
+
+        let mut completed = Vec::with_capacity(wallet_count);
+        let mut errors = Vec::new();
+        while let Some(joined) = workers.join_next().await {
+            match joined {
+                Ok(Ok(row)) => completed.push(row),
+                Ok(Err(error)) => errors.push(error.to_string()),
+                Err(error) => errors.push(format!("phase worker: {error}")),
+            }
+        }
+        completed.sort_by_key(|(order, _, _)| *order);
+        {
+            let mut guard = cache.lock().await;
+            if let Err(error) = guard.flush() {
+                crate::rlog!("auth cache flush after list_drop_phases: {error}");
+            }
+        }
+
+        let (address, mut info) = completed
+            .first()
+            .map(|(_, address, info)| (address.clone(), info.clone()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Could not load phases for any of {wallet_count} selected wallet(s): {}",
+                    errors
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "unknown error".into())
+                )
+            })?;
         if info.stages.is_empty() {
             bail!("No drop stages found for '{}'", slug);
         }
+        let successful_infos: Vec<opensea::CollectionInfo> =
+            completed.into_iter().map(|(_, _, info)| info).collect();
+        let aggregates = aggregate_stage_eligibility(&mut info, &successful_infos, wallet_count);
         let now = chrono::Utc::now().timestamp();
         let recommended = recommended_phase_index(&info);
-        let stage_rows = stage_rows_from_at(&info.stages, recommended, now);
+        let mut stage_rows = stage_rows_from_at(&info.stages, recommended, now);
+        for (row, aggregate) in stage_rows.iter_mut().zip(aggregates.iter()) {
+            row.eligible = aggregate.label(&row.stage_type);
+        }
         Ok(DropPhasesResult {
             slug: info.slug,
             name: info.name,
             chain: info.chain,
-            address: addr_str,
+            address,
+            wallet_count,
+            successful_wallets: successful_infos.len(),
+            failed_wallets: errors.len(),
             recommended_index: recommended,
             stages: stage_rows,
         })
@@ -2884,6 +3022,114 @@ impl Session {
         Ok(vec![SweepResultRow::from(result)])
     }
 
+    /// Read-only live quote for Disperse. Uses the same destination parser,
+    /// fee calculation and native-transfer gas resolver as the actual run.
+    pub async fn disperse_quote(
+        &self,
+        chain: &str,
+        from_address: &str,
+        to_addresses: Vec<String>,
+        amount_eth: &str,
+    ) -> Result<DisperseQuote> {
+        if self.signers.is_empty() {
+            bail!("No wallets unlocked");
+        }
+        if chain.trim().is_empty() {
+            bail!("Network required — select a chain for Disperse");
+        }
+        let from_norm = normalize_address(from_address);
+        let from = self
+            .signers
+            .iter()
+            .find(|signer| normalize_address(&format!("{:?}", signer.address())) == from_norm)
+            .cloned()
+            .context("Source wallet not found in vault")?;
+        let from_addr = from.address();
+        let destinations: Vec<_> = disperse::parse_destinations(&to_addresses)?
+            .into_iter()
+            .filter(|destination| *destination != from_addr)
+            .collect();
+        if destinations.is_empty() {
+            bail!("Select at least one destination wallet (not the source)");
+        }
+        let amount = amount::eth_to_wei(amount_eth.trim()).context("invalid amount ETH")?;
+        if amount.is_zero() {
+            bail!("Amount must be greater than 0");
+        }
+
+        let rpc = self.rpc_client_for_chain(chain)?;
+        let chain_id = rpc.chain_id().await.context("Disperse quote chainId")?;
+        if let Some(expected) = Self::expected_chain_id(chain)
+            && chain_id != expected
+        {
+            bail!(
+                "RPC chainId {chain_id} does not match selected network {} (expected {expected})",
+                chain.trim()
+            );
+        }
+
+        let native_symbol = native_symbol_for_chain(Some(chain)).to_string();
+        let price_future = async {
+            if self.settings.alchemy_api_key.trim().is_empty() {
+                None
+            } else {
+                alchemy_usd_price(&self.settings.alchemy_api_key, &native_symbol)
+                    .await
+                    .ok()
+            }
+        };
+        let (fees, balance, usd_price) =
+            tokio::join!(rpc.fee_history(), rpc.balance(&from_addr), price_future);
+        let (base_fee, network_priority) =
+            fees.unwrap_or_else(|_| (U256::from(1_000_000_000u64), U256::from(1_000_000_000u64)));
+        let (max_fee, max_priority_fee) =
+            crate::gas::calculate_fees(&self.gas_params(), base_fee, network_priority)?;
+        let balance = balance.context("Disperse quote balance")?;
+        let sample_to = destinations
+            .iter()
+            .copied()
+            .find(|destination| *destination != from_addr)
+            .unwrap_or(destinations[0]);
+        let gas_limit = crate::gas::resolve_native_transfer_gas(
+            &rpc,
+            &from_addr,
+            &sample_to,
+            amount,
+            chain_id,
+            self.gas_params().gas_multiplier,
+        )
+        .await;
+        let (total_value, gas_reserve, total_need) =
+            disperse::disperse_totals(amount, destinations.len(), gas_limit, max_fee);
+        let effective_fee = base_fee.saturating_add(max_priority_fee).min(max_fee);
+        let gas_estimate = effective_fee
+            .saturating_mul(U256::from(gas_limit))
+            .saturating_mul(U256::from(destinations.len() as u64));
+        let total_estimate = total_value.saturating_add(gas_estimate);
+
+        Ok(DisperseQuote {
+            recipient_count: destinations.len(),
+            amount_each_eth: amount::wei_to_eth_precise_string(amount),
+            amount_each_usd: wei_usd_value(amount, usd_price),
+            total_value_eth: amount::wei_to_eth_precise_string(total_value),
+            total_value_usd: wei_usd_value(total_value, usd_price),
+            gas_estimate_eth: amount::wei_to_eth_precise_string(gas_estimate),
+            gas_estimate_usd: wei_usd_value(gas_estimate, usd_price),
+            total_estimate_eth: amount::wei_to_eth_precise_string(total_estimate),
+            total_estimate_usd: wei_usd_value(total_estimate, usd_price),
+            gas_reserve_eth: amount::wei_to_eth_precise_string(gas_reserve),
+            gas_reserve_usd: wei_usd_value(gas_reserve, usd_price),
+            total_need_eth: amount::wei_to_eth_precise_string(total_need),
+            total_need_usd: wei_usd_value(total_need, usd_price),
+            balance_eth: amount::wei_to_eth_precise_string(balance),
+            balance_usd: wei_usd_value(balance, usd_price),
+            usd_price: usd_price.map(|price| format!("{price:.2}")),
+            native_symbol,
+            gas_limit_each: gas_limit,
+            sufficient: balance >= total_need,
+        })
+    }
+
     /// Disperse native coin from one vault wallet to many destinations (fixed amount each).
     /// Live runs require typed `LIVE` when `require_live_confirm` is on.
     pub async fn disperse(
@@ -3427,6 +3673,42 @@ mod recommended_phase_tests {
         assert!(!rows[1].expired);
         assert!(rows[1].recommended);
     }
+
+    #[test]
+    fn aggregate_eligibility_uses_every_selected_wallet_and_recommends_wl() {
+        let now = chrono::Utc::now().timestamp() as f64;
+        let mut presale = stage("SIGNED_PRESALE", 2, Some(now + 60.0));
+        presale.is_eligible = Some(false);
+        let public = stage("PUBLIC_SALE", 3, Some(now + 120.0));
+        let mut base = info(vec![presale.clone(), public]);
+
+        let mut eligible_presale = presale.clone();
+        eligible_presale.is_eligible = Some(true);
+        let eligible_wallet = info(vec![eligible_presale, stage("PUBLIC_SALE", 3, None)]);
+        let ineligible_wallet = info(vec![presale, stage("PUBLIC_SALE", 3, None)]);
+
+        // Three selected wallets: one eligible, one explicitly ineligible and
+        // one unavailable request. The unavailable wallet remains visible as
+        // unknown but must not hide the valid WL phase from Auto.
+        let aggregates =
+            aggregate_stage_eligibility(&mut base, &[eligible_wallet, ineligible_wallet], 3);
+
+        assert_eq!(
+            aggregates[0],
+            StageEligibilityAggregate {
+                eligible: 1,
+                ineligible: 1,
+                unknown: 1,
+                total: 3,
+            }
+        );
+        assert_eq!(
+            aggregates[0].label("SIGNED_PRESALE"),
+            "eligible 1/3 (1 unknown)"
+        );
+        assert_eq!(base.stages[0].is_eligible, Some(true));
+        assert_eq!(recommended_phase_index(&base), Some(0));
+    }
 }
 
 #[cfg(test)]
@@ -3657,6 +3939,9 @@ pub struct DropPhasesResult {
     pub name: String,
     pub chain: String,
     pub address: String,
+    pub wallet_count: usize,
+    pub successful_wallets: usize,
+    pub failed_wallets: usize,
     pub recommended_index: Option<usize>,
     pub stages: Vec<StageRow>,
 }
@@ -3699,6 +3984,109 @@ pub struct LatencyReport {
 pub struct DiscoveredFunction {
     pub signature: String,
     pub source: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StageEligibilityAggregate {
+    eligible: usize,
+    ineligible: usize,
+    unknown: usize,
+    total: usize,
+}
+
+impl StageEligibilityAggregate {
+    fn label(self, stage_type: &str) -> String {
+        if is_public_sale_stage_type(stage_type) {
+            return "eligible (public)".into();
+        }
+        if self.eligible > 0 {
+            if self.unknown > 0 {
+                format!(
+                    "eligible {}/{} ({} unknown)",
+                    self.eligible, self.total, self.unknown
+                )
+            } else {
+                format!("eligible {}/{}", self.eligible, self.total)
+            }
+        } else if self.unknown > 0 {
+            format!("unknown 0/{} ({} unavailable)", self.total, self.unknown)
+        } else {
+            format!("not eligible 0/{}", self.total)
+        }
+    }
+}
+
+fn matching_stage<'a>(
+    info: &'a opensea::CollectionInfo,
+    expected: &opensea::StageInfo,
+    fallback_index: usize,
+) -> Option<&'a opensea::StageInfo> {
+    info.stages
+        .iter()
+        .find(|stage| {
+            stage.stage_index == expected.stage_index && stage.stage_type == expected.stage_type
+        })
+        .or_else(|| {
+            info.stages.iter().find(|stage| {
+                expected.stage_index.is_some() && stage.stage_index == expected.stage_index
+            })
+        })
+        .or_else(|| info.stages.get(fallback_index))
+}
+
+fn aggregate_stage_eligibility(
+    base: &mut opensea::CollectionInfo,
+    infos: &[opensea::CollectionInfo],
+    total_wallets: usize,
+) -> Vec<StageEligibilityAggregate> {
+    let originals = base.stages.clone();
+    let mut aggregates = Vec::with_capacity(originals.len());
+
+    for (index, expected) in originals.iter().enumerate() {
+        let mut eligible = 0usize;
+        let mut ineligible = 0usize;
+        let mut eligible_terms = None;
+        for info in infos {
+            match matching_stage(info, expected, index) {
+                Some(stage) if stage.is_eligible == Some(true) => {
+                    eligible += 1;
+                    if eligible_terms.is_none() {
+                        eligible_terms = Some(stage.clone());
+                    }
+                }
+                Some(stage) if stage.is_eligible == Some(false) => ineligible += 1,
+                Some(stage) if is_public_sale_stage_type(&stage.stage_type) => eligible += 1,
+                Some(_) | None => {}
+            }
+        }
+        let unknown = total_wallets.saturating_sub(eligible + ineligible);
+        let aggregate = StageEligibilityAggregate {
+            eligible,
+            ineligible,
+            unknown,
+            total: total_wallets,
+        };
+
+        let stage = &mut base.stages[index];
+        if let Some(terms) = eligible_terms {
+            stage.max_mintable = terms.max_mintable;
+            stage.price_eth = terms.price_eth;
+            stage.price_wei = terms.price_wei;
+            stage.payment_token_contract = terms.payment_token_contract;
+            stage.payment_token_chain = terms.payment_token_chain;
+            stage.raw = terms.raw;
+        }
+        stage.is_eligible = if is_public_sale_stage_type(&stage.stage_type) || eligible > 0 {
+            Some(true)
+        } else if unknown == 0 {
+            Some(false)
+        } else {
+            None
+        };
+        aggregates.push(aggregate);
+    }
+
+    aggregates
 }
 
 fn recommended_phase_index(info: &opensea::CollectionInfo) -> Option<usize> {

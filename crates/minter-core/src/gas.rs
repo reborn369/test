@@ -127,6 +127,19 @@ pub async fn resolve_call_gas(
 }
 
 /// Empty-data native transfer gas (Disperse / Sweep ETH).
+pub fn apply_native_transfer_gas_limit(estimated: u64, gas_multiplier: f64, chain_id: u64) -> u64 {
+    // Robinhood's RPC returns the canonical 21k estimate for an EOA-to-EOA
+    // native transfer. Do not replace that verified estimate with the generic
+    // 150k L2 contract-call floor: disperse multiplies the limit by every
+    // recipient during its balance pre-check, so the floor made a batch reserve
+    // more than seven times the gas it can consume.
+    if chain_id == 4663 && estimated == 21_000 {
+        21_000
+    } else {
+        apply_gas_limit(estimated, gas_multiplier, chain_id, 21_000)
+    }
+}
+
 pub async fn resolve_native_transfer_gas(
     rpc: &RpcClient,
     from: &Address,
@@ -135,16 +148,18 @@ pub async fn resolve_native_transfer_gas(
     chain_id: u64,
     gas_multiplier: f64,
 ) -> u64 {
-    resolve_call_gas(
-        rpc,
-        from,
-        to,
-        value,
-        &Bytes::new(),
-        chain_id,
-        gas_multiplier,
-    )
-    .await
+    const FALLBACK: u64 = 250_000;
+    let estimated = match rpc.estimate_gas(from, to, value, &Bytes::new()).await {
+        Ok(g) => {
+            crate::rlog!("  eth_estimateGas = {}", g);
+            g
+        }
+        Err(e) => {
+            crate::rlog!("  eth_estimateGas failed ({e}) — fallback {}", FALLBACK);
+            FALLBACK
+        }
+    };
+    apply_native_transfer_gas_limit(estimated, gas_multiplier, chain_id)
 }
 
 /// OP-stack chains that charge a separate L1 data fee on top of L2 gas.
@@ -353,6 +368,14 @@ mod tests {
         assert!(chain_needs_elevated_gas(4663));
         let lim = apply_gas_limit(21_000, 1.15, 4663, 21_000);
         assert!(lim >= 150_000);
+    }
+
+    #[test]
+    fn robinhood_native_transfer_keeps_verified_21k_estimate() {
+        assert_eq!(apply_native_transfer_gas_limit(21_000, 1.15, 4663), 21_000);
+        // A non-trivial recipient estimate still keeps the generic L2 safety
+        // policy; only the exact EOA transfer case is exempted.
+        assert!(apply_native_transfer_gas_limit(45_000, 1.15, 4663) >= 150_000);
     }
 
     #[test]

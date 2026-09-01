@@ -2053,6 +2053,32 @@ struct DisperseInput {
     confirmation_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DisperseQuoteInput {
+    chain: String,
+    from_address: String,
+    to_addresses: Vec<String>,
+    amount_eth: String,
+}
+
+#[tauri::command]
+async fn disperse_quote(
+    state: State<'_, Arc<AppState>>,
+    input: DisperseQuoteInput,
+) -> Result<minter_core::DisperseQuote, String> {
+    let session = state.session.lock().clone();
+    session
+        .disperse_quote(
+            &input.chain,
+            &input.from_address,
+            input.to_addresses,
+            &input.amount_eth,
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 async fn disperse(
     state: State<'_, Arc<AppState>>,
@@ -2596,11 +2622,12 @@ fn save_runs_history(state: State<'_, Arc<AppState>>, file: RunsHistoryFile) -> 
 async fn list_drop_phases(
     state: State<'_, Arc<AppState>>,
     slug: String,
+    wallet_addresses: Option<Vec<String>>,
 ) -> Result<minter_core::DropPhasesResult, String> {
     let _slot = net_slot(&state).await?;
     let session = state.session.lock().clone();
     session
-        .list_drop_phases(&slug)
+        .list_drop_phases(&slug, wallet_addresses)
         .await
         .map_err(|e| e.to_string())
 }
@@ -2718,6 +2745,7 @@ pub fn run() {
             raw_mint,
             raw_sniper,
             probe_raw,
+            disperse_quote,
             disperse,
             multicall,
             clear_auth_cache,

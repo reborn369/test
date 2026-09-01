@@ -18,7 +18,7 @@ pub struct DisperseConfig {
     pub dry_run: bool,
 }
 
-fn disperse_totals(
+pub(crate) fn disperse_totals(
     amount: U256,
     recipients: usize,
     gas_limit: u64,

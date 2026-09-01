@@ -80,6 +80,20 @@ pub fn wei_to_eth_string(wei: U256) -> String {
         .to_string()
 }
 
+/// Exact ETH/native display with up to 18 fractional digits. Intended for cost
+/// previews where truncating 0.00006091 to six decimals would visibly change a
+/// per-wallet amount and its USD conversion.
+pub fn wei_to_eth_precise_string(wei: U256) -> String {
+    let scale = U256::from(1_000_000_000_000_000_000u64);
+    let whole = wei / scale;
+    let frac = (wei % scale).to::<u128>();
+    if frac == 0 {
+        return whole.to_string();
+    }
+    let fraction = format!("{frac:018}").trim_end_matches('0').to_string();
+    format!("{whole}.{fraction}")
+}
+
 /// Extract a decimal amount string from a JSON value (string or number).
 /// Prefers the original string form; for numbers uses `Number::to_string()`.
 pub fn json_decimal_string(v: &serde_json::Value) -> Option<String> {
@@ -147,6 +161,16 @@ mod tests {
         assert_eq!(
             eth_to_wei("0.000000000000000001").unwrap(),
             U256::from(1u64)
+        );
+    }
+
+    #[test]
+    fn precise_display_preserves_small_disperse_amount() {
+        let wei = eth_to_wei("0.00006091").unwrap();
+        assert_eq!(wei_to_eth_precise_string(wei), "0.00006091");
+        assert_eq!(
+            wei_to_eth_precise_string(U256::from(1u64)),
+            "0.000000000000000001"
         );
     }
 

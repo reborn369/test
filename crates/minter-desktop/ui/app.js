@@ -4172,6 +4172,63 @@ setTimeout(() => {
 // —— Disperse (1 wallet → many, fixed amount each) ——
 /** @type {Array<{address:string,index:number}>} */
 let disperseWalletCache = [];
+let disperseQuoteTimer = null;
+let disperseQuoteSeq = 0;
+
+function disperseMoney(eth, usd) {
+  if (eth == null) return "—";
+  return `${eth} ETH${usd != null ? ` · $${usd}` : ""}`;
+}
+
+function scheduleDisperseQuote({ chain, from, to, amountEth }) {
+  if (disperseQuoteTimer) clearTimeout(disperseQuoteTimer);
+  const seq = ++disperseQuoteSeq;
+  disperseQuoteTimer = setTimeout(async () => {
+    try {
+      const quote = await invoke("disperse_quote", {
+        input: { chain, fromAddress: from, toAddresses: to, amountEth },
+      });
+      if (seq !== disperseQuoteSeq) return;
+      const line = $("disp-total-line");
+      if (line) {
+        line.textContent = `${quote.recipientCount} × ${disperseMoney(
+          quote.amountEachEth,
+          quote.amountEachUsd
+        )}`;
+      }
+      const amount = $("disp-total-amt");
+      if (amount) amount.textContent = disperseMoney(quote.totalValueEth, quote.totalValueUsd);
+      const gas = $("disp-total-gas");
+      if (gas) gas.textContent = disperseMoney(quote.gasEstimateEth, quote.gasEstimateUsd);
+      const total = $("disp-total-sum");
+      if (total) total.textContent = disperseMoney(quote.totalEstimateEth, quote.totalEstimateUsd);
+      const required = $("disp-total-required");
+      if (required) required.textContent = disperseMoney(quote.totalNeedEth, quote.totalNeedUsd);
+      const row = required?.closest(".cost-row");
+      if (row) {
+        row.classList.remove("is-ok", "is-short");
+        row.classList.add(quote.sufficient ? "is-ok" : "is-short");
+      }
+      const summary = $("disp-summary");
+      if (summary) {
+        summary.textContent =
+          `Live RPC · gas limit ${quote.gasLimitEach} each · ` +
+          `max gas reserve ${disperseMoney(quote.gasReserveEth, quote.gasReserveUsd)} · ` +
+          `balance ${disperseMoney(quote.balanceEth, quote.balanceUsd)}`;
+      }
+    } catch (error) {
+      if (seq !== disperseQuoteSeq) return;
+      const summary = $("disp-summary");
+      if (summary) summary.textContent = `Live quote unavailable: ${String(error)}`;
+      const gas = $("disp-total-gas");
+      const total = $("disp-total-sum");
+      const required = $("disp-total-required");
+      if (gas) gas.textContent = "—";
+      if (total) total.textContent = "—";
+      if (required) required.textContent = "—";
+    }
+  }, 300);
+}
 
 function updateDisperseSummary() {
   const el = $("disp-summary");
@@ -4195,14 +4252,16 @@ function updateDisperseSummary() {
     wei = 0n;
   }
   if (!to.length || wei <= 0n) {
+    ++disperseQuoteSeq;
+    if (disperseQuoteTimer) clearTimeout(disperseQuoteTimer);
     if (card) card.classList.add("hidden");
     if (el) el.textContent = "";
     return;
   }
   const n = BigInt(to.length);
   const total = wei * n;
-  // Rough per-tx gas allowance for the estimate line (21k × 30 gwei).
-  const gas = 21000n * 30000000000n * n;
+  const chain = ($("disp-chain")?.value || "").trim();
+  const from = ($("disp-from")?.value || "").trim();
   if (card) {
     card.classList.remove("hidden");
     const line = $("disp-total-line");
@@ -4210,18 +4269,20 @@ function updateDisperseSummary() {
     const amtEl = $("disp-total-amt");
     if (amtEl) amtEl.textContent = `${weiToEthStr(total)} ETH`;
     const gasEl = $("disp-total-gas");
-    if (gasEl) gasEl.textContent = `~${weiToEthStr(gas)} ETH`;
+    if (gasEl) gasEl.textContent = "calculating from live RPC…";
     const sumEl = $("disp-total-sum");
-    if (sumEl) sumEl.textContent = `${weiToEthStr(total + gas)} ETH`;
-    // Colour the total against the source wallet's cached balance when known.
-    const row = sumEl?.closest(".cost-row");
+    if (sumEl) sumEl.textContent = "calculating…";
+    const requiredEl = $("disp-total-required");
+    if (requiredEl) requiredEl.textContent = "calculating…";
+    const row = requiredEl?.closest(".cost-row");
     if (row) {
       row.classList.remove("is-ok", "is-short");
-      const bal = disperseFromBalanceWei();
-      if (bal != null) row.classList.add(bal >= total + gas ? "is-ok" : "is-short");
     }
   }
-  if (el) el.textContent = "";
+  if (el) el.textContent = chain && from ? "Loading current gas and USD price…" : "";
+  if (chain && from) {
+    scheduleDisperseQuote({ chain, from, to, amountEth: raw });
+  }
 }
 
 /** Cached balance of the selected source wallet, in wei, or null if unknown. */
@@ -5980,7 +6041,11 @@ $("btn-load-phases")?.addEventListener("click", async () => {
   $("btn-load-phases").disabled = true;
   $("phase-hint").textContent = "Loading phases…";
   try {
-    const r = await invoke("list_drop_phases", { slug });
+    const walletAddresses = selectedTaskWallets();
+    if (!walletAddresses.length) {
+      throw new Error("Select at least one wallet before loading phases");
+    }
+    const r = await invoke("list_drop_phases", { slug, walletAddresses });
     lastLoadedPhases = r;
     const prev = $("wizard-phase")?.value;
     fillPhaseSelect(r.stages, r.recommendedIndex, prev === "" ? null : prev);
@@ -5988,7 +6053,9 @@ $("btn-load-phases")?.addEventListener("click", async () => {
     const recommendation = Number.isInteger(r.recommendedIndex)
       ? `recommended #${r.recommendedIndex + 1}`
       : "no open/upcoming phase";
-    $("phase-hint").textContent = `${r.name} · ${r.chain} · ${r.stages.length} phase(s) · ${ended} ended · ${recommendation}`;
+    const checked = `${r.successfulWallets}/${r.walletCount} wallet(s) checked`;
+    const failed = r.failedWallets ? ` · ${r.failedWallets} unavailable` : "";
+    $("phase-hint").textContent = `${r.name} · ${r.chain} · ${r.stages.length} phase(s) · ${checked}${failed} · ${ended} ended · ${recommendation}`;
     if (!$("task-name").value.trim()) $("task-name").value = r.slug || slug;
     $("wizard-msg").textContent = "Phases loaded";
   } catch (e) {

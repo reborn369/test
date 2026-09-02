@@ -4008,6 +4008,17 @@ mod recommended_phase_tests {
     }
 
     #[test]
+    fn newest_active_eligible_presale_is_recommended() {
+        let now = chrono::Utc::now().timestamp() as f64;
+        let i = info(vec![
+            stage("SIGNED_PRESALE", 1, Some(now - 7200.0)),
+            stage("SIGNED_PRESALE", 3, Some(now - 60.0)),
+            stage("PUBLIC_SALE", 4, Some(now - 30.0)),
+        ]);
+        assert_eq!(recommended_phase_index(&i), Some(1));
+    }
+
+    #[test]
     fn presale_still_beats_public() {
         let now = chrono::Utc::now().timestamp() as f64;
         let i = info(vec![
@@ -4465,27 +4476,39 @@ fn recommended_phase_index(info: &opensea::CollectionInfo) -> Option<usize> {
 
 fn recommended_phase_index_at(info: &opensea::CollectionInfo, now: i64) -> Option<usize> {
     let stages = &info.stages;
+    let selectable = |stage: &opensea::StageInfo| {
+        opensea::stage_is_selectable_at(stage, now)
+            && opensea::available_mint_quantity(info, stage).unwrap_or(1) > 0
+    };
+    // If several eligible phases overlap, OpenSea presents the later stage as
+    // the current one. Prefer the newest non-public active phase; otherwise
+    // choose the nearest upcoming eligible phase. Public remains the fallback
+    // when an eligible WL phase exists.
     stages
         .iter()
         .enumerate()
-        .filter(|(_, s)| opensea::stage_is_selectable_at(s, now))
-        .filter(|(_, s)| opensea::available_mint_quantity(info, s).unwrap_or(1) > 0)
-        .min_by_key(|(_, s)| {
-            let is_public = s.stage_type == "PUBLIC_SALE";
-            // Started = start_time <= wall clock now (missing start_time counts as started).
-            // Comparing against 0 marked every real (past) timestamp as "not started".
-            let has_started = s.start_time.map(|t| t as i64 <= now).unwrap_or(true);
+        .filter(|(_, stage)| selectable(stage))
+        .filter(|(_, stage)| stage.start_time.map(|t| t as i64 <= now).unwrap_or(true))
+        .min_by_key(|(_, stage)| {
             (
-                is_public as usize,
-                !has_started as usize,
-                s.stage_index.unwrap_or(0),
+                stage.stage_type == "PUBLIC_SALE",
+                std::cmp::Reverse(stage.stage_index.unwrap_or(0)),
             )
         })
         .map(|(i, _)| i)
         .or_else(|| {
             stages
                 .iter()
-                .position(|stage| !opensea::stage_is_expired_at(stage, now))
+                .enumerate()
+                .filter(|(_, stage)| selectable(stage))
+                .min_by_key(|(_, stage)| {
+                    (
+                        stage.stage_type == "PUBLIC_SALE",
+                        stage.start_time.map(|t| t as i64).unwrap_or(i64::MAX),
+                        stage.stage_index.unwrap_or(0),
+                    )
+                })
+                .map(|(i, _)| i)
         })
 }
 

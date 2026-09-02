@@ -4917,6 +4917,420 @@ body {
   background: #343e4d;
 }
 
+/* Task editor: same surfaces and controls as the rest of the app, but sized
+   as a real workspace instead of a narrow confirmation dialog. */
+.task-modal-card {
+  width: min(1040px, calc(100vw - 32px));
+  max-width: 1040px;
+  height: min(880px, calc(100vh - 32px));
+  max-height: none;
+  padding: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.task-modal-header,
+.task-modal-footer {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 16px 20px;
+  background: var(--card);
+}
+
+.task-modal-header {
+  border-bottom: 1px solid var(--border);
+}
+
+.task-modal-header h3 {
+  margin: 0;
+  font-size: 1.08rem;
+}
+
+.task-modal-header p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.task-modal-x {
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 1.45rem;
+  line-height: 1;
+}
+
+.task-modal-x:hover {
+  background: var(--card-2);
+  color: var(--text);
+}
+
+.task-modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 18px 20px;
+  scrollbar-width: none;
+}
+
+.task-modal-body::-webkit-scrollbar,
+.task-wallet-list::-webkit-scrollbar,
+.task-qty-map::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.task-section {
+  margin: 0;
+  padding: 15px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card-2);
+}
+
+.task-section-title {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-bottom: 13px;
+}
+
+.task-section-title > span {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.task-section-title strong,
+.task-section-title small {
+  display: block;
+}
+
+.task-section-title strong {
+  color: var(--text);
+  font-size: 0.83rem;
+}
+
+.task-section-title small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 0.67rem;
+  font-weight: 400;
+  line-height: 1.35;
+}
+
+.task-collection-section {
+  margin-bottom: 14px;
+}
+
+.task-collection-grid {
+  display: grid;
+  grid-template-columns: minmax(150px, .7fr) minmax(320px, 1.5fr) minmax(230px, 1fr);
+  gap: 12px;
+  align-items: end;
+}
+
+.task-collection-grid label,
+.task-primary-grid label,
+.task-advanced-grid label,
+.task-sweep-destination label {
+  margin: 0;
+}
+
+.task-inline-control {
+  display: flex;
+  align-items: stretch;
+  gap: 7px;
+}
+
+.task-inline-control input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.task-inline-control button {
+  flex: 0 0 auto;
+  margin: 0;
+  white-space: nowrap;
+}
+
+.task-phase-hint {
+  min-height: 16px;
+  margin: 8px 0 0;
+}
+
+.task-modal-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(330px, .9fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.task-modal-main {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.task-primary-grid,
+.task-advanced-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 11px;
+}
+
+.task-auto-note,
+.task-advanced-help {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.42;
+}
+
+.task-cost-quote {
+  margin: 0;
+  padding: 14px 15px;
+  background: var(--card-2);
+}
+
+.task-cost-head {
+  margin-bottom: 10px;
+}
+
+.task-cost-primary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.task-cost-primary > div {
+  padding: 10px 11px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+}
+
+.task-cost-primary span,
+.task-cost-grid span {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--muted);
+  font-size: 0.66rem;
+}
+
+.task-cost-primary strong,
+.task-cost-grid strong {
+  display: block;
+  overflow: visible;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.task-cost-details {
+  margin-top: 9px;
+}
+
+.task-cost-details summary,
+.task-advanced > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.7rem;
+  user-select: none;
+}
+
+.task-cost-details[open] summary {
+  margin-bottom: 10px;
+}
+
+.task-cost-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 16px;
+}
+
+.task-option-check {
+  align-items: flex-start;
+  margin: 0;
+}
+
+.task-option-check > span,
+.task-option-check > span strong,
+.task-option-check > span small {
+  display: block;
+}
+
+.task-option-check > span strong {
+  color: var(--text);
+  font-size: 0.78rem;
+}
+
+.task-option-check > span small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 0.66rem;
+  font-weight: 400;
+}
+
+.task-sweep-destination {
+  margin-top: 11px;
+}
+
+.task-advanced {
+  padding: 13px 15px;
+}
+
+.task-advanced > summary span,
+.task-advanced > summary small {
+  display: block;
+}
+
+.task-advanced > summary span {
+  color: var(--text);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.task-advanced > summary small {
+  margin-top: 2px;
+  font-size: 0.65rem;
+}
+
+.task-advanced[open] > summary {
+  margin-bottom: 12px;
+}
+
+.task-wallet-section {
+  position: sticky;
+  top: 0;
+  min-width: 0;
+}
+
+.task-wallet-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.task-wallet-title .check {
+  flex: 0 0 auto;
+  margin: 2px 0 0;
+}
+
+.task-group-filter {
+  margin-bottom: 8px;
+}
+
+.task-wallet-list,
+.task-wallet-list.virtual {
+  height: 330px;
+  max-height: 330px;
+  margin: 0;
+  overflow: auto;
+  scrollbar-width: none;
+}
+
+.task-wallet-route-hint {
+  margin: 7px 0 12px;
+}
+
+.task-qty-map {
+  max-height: 170px;
+  overflow: auto;
+  scrollbar-width: none;
+}
+
+.task-balance-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 13px;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--green) 24%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--green) 6%, transparent);
+}
+
+.task-balance-icon {
+  color: var(--green);
+  font-weight: 700;
+}
+
+.task-balance-check strong,
+.task-balance-check small {
+  display: block;
+}
+
+.task-balance-check strong {
+  color: var(--text);
+  font-size: 0.72rem;
+}
+
+.task-balance-check small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 0.64rem;
+  line-height: 1.35;
+}
+
+.task-modal-footer {
+  min-height: 66px;
+  padding-block: 11px;
+  border-top: 1px solid var(--border);
+}
+
+.task-modal-footer .msg {
+  flex: 1 1 auto;
+  margin: 0;
+}
+
+.task-modal-footer .modal-actions {
+  flex: 0 0 auto;
+  margin: 0;
+}
+
+@media (max-width: 820px) {
+  .task-modal-card {
+    width: min(680px, calc(100vw - 20px));
+    height: calc(100vh - 20px);
+  }
+  .task-collection-grid,
+  .task-modal-columns {
+    grid-template-columns: 1fr;
+  }
+  .task-modal-columns {
+    align-items: stretch;
+  }
+  .task-wallet-section {
+    position: static;
+  }
+  .task-primary-grid,
+  .task-advanced-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 .page {
   width: 100%;
   max-width: 1180px;

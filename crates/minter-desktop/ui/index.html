@@ -1112,121 +1112,63 @@
     <!-- Create mint task modal -->
     <div id="task-modal" class="modal-overlay hidden" role="dialog" aria-modal="true">
       <div class="modal-card task-modal-card">
-        <h3 id="task-modal-title" data-i18n="tasks.create">Create task</h3>
-        <label><span data-i18n="tasks.taskName">Name</span>
-          <input type="text" id="task-name" placeholder="my-drop" autocomplete="off" />
-        </label>
-        <label><span data-i18n="tasks.slug">Collection slug or OpenSea URL</span>
-          <input type="text" id="wizard-slug" placeholder="my-collection" autocomplete="off" />
-        </label>
-        <div class="row actions">
-          <button type="button" id="btn-load-phases" class="primary" data-i18n="tasks.loadPhases">Load phases</button>
-        </div>
-        <label><span data-i18n="tasks.phase">Phase</span>
-          <select id="wizard-phase">
-            <option value="">— auto (recommended) —</option>
-          </select>
-        </label>
-        <p id="phase-hint" class="muted small"></p>
-        <div class="settings-grid">
-          <label><span data-i18n="tasks.qty">Quantity</span>
-            <input type="number" id="wizard-qty" min="1" max="50" value="1" />
-          </label>
-          <label><span data-i18n="tasks.chain">Network</span>
-            <select id="task-chain">
-              <option value="auto">Auto (from collection)</option>
-              <option value="ethereum">Ethereum</option>
-              <option value="base">Base</option>
-              <option value="polygon">Polygon</option>
-              <option value="arbitrum">Arbitrum</option>
-              <option value="optimism">Optimism</option>
-              <option value="ink">Ink</option>
-              <option value="bsc">BSC</option>
-              <option value="avalanche">Avalanche</option>
-              <option value="blast">Blast</option>
-              <option value="zora">Zora</option>
-              <option value="apechain">ApeChain</option>
-              <option value="shape">Shape</option>
-              <option value="monad">Monad</option>
-              <option value="megaeth">MegaETH</option>
-              <option value="robinhood">Robinhood Chain</option>
-            </select>
-          </label>
-          <label><span data-i18n="tasks.sendMode">Send mode</span>
-            <select id="task-send-mode">
-              <option value="public" data-i18n="tasks.sendPublic">Public mempool</option>
-              <option value="conditional" data-i18n="tasks.sendConditional">Conditional test (Robinhood)</option>
-              <option value="flashbots" data-i18n="tasks.sendFlashbots">Flashbots bundle</option>
-            </select>
-          </label>
-          <label id="task-conditional-lead-wrap" class="hidden"><span data-i18n="tasks.conditionalLead">Conditional lead (ms)</span>
-            <input type="number" id="task-conditional-lead" min="100" max="10000" step="50" value="1000" />
-          </label>
-          <p class="muted small" data-i18n="tasks.fbHint">Flashbots: multi-wallet private bundle — Ethereum mainnet only.</p>
-          <label><span data-i18n="tasks.gasMode">Gas</span>
-            <select id="task-gas-mode">
-              <option value="auto" data-i18n="tasks.gasAuto">Auto</option>
-              <option value="manual" data-i18n="tasks.gasManual">Manual</option>
-            </select>
-          </label>
-          <label id="task-gas-limit-wrap" class="hidden"><span data-i18n="tasks.gasLimit">Gas limit</span>
-            <input type="number" id="task-gas-limit" min="21000" step="1000" value="250000" />
-          </label>
-          <label><span data-i18n="tasks.prio">Priority fee (gwei)</span>
-            <input type="text" id="task-prio" placeholder="auto / e.g. 1.5" autocomplete="off" />
-          </label>
-          <label><span data-i18n="tasks.atTime">At time (unix / ISO)</span>
-            <input type="text" id="task-at" placeholder="optional 1700000000 or 2024-01-01T12:00:00Z" autocomplete="off" />
-          </label>
-        </div>
-        <section id="task-cost-quote" class="task-cost-quote" aria-live="polite">
-          <div class="task-cost-head">
-            <div>
-              <span class="task-cost-title" data-i18n="tasks.costTitle">Mint cost</span>
-              <span id="task-cost-source" class="task-cost-source">Load phases to calculate</span>
+        <header class="task-modal-header">
+          <div><h3 id="task-modal-title" data-i18n="tasks.create">Create task</h3><p data-i18n="tasks.modalSubtitle">OpenSea mint setup</p></div>
+          <button type="button" id="task-modal-x" class="task-modal-x" aria-label="Close">×</button>
+        </header>
+        <div class="task-modal-body">
+          <section class="task-section task-collection-section">
+            <div class="task-section-title"><span>1</span><div><strong data-i18n="tasks.collectionTitle">Collection and phase</strong><small data-i18n="tasks.collectionHint">Paste the OpenSea link — network and the relevant eligible phase are selected automatically.</small></div></div>
+            <div class="task-collection-grid">
+              <label><span data-i18n="tasks.taskName">Name</span><input type="text" id="task-name" placeholder="my-drop" autocomplete="off" /></label>
+              <label class="task-slug-field"><span data-i18n="tasks.slug">Collection slug or OpenSea URL</span><span class="task-inline-control"><input type="text" id="wizard-slug" placeholder="https://opensea.io/collection/..." autocomplete="off" /><button type="button" id="btn-load-phases" class="primary" data-i18n="tasks.loadPhases">Load phases</button></span></label>
+              <label class="task-phase-field"><span data-i18n="tasks.phase">Phase</span><select id="wizard-phase"><option value="">— load collection first —</option></select></label>
             </div>
-            <span id="task-cost-ready" class="task-cost-ready neutral">—</span>
+            <p id="phase-hint" class="task-phase-hint muted small"></p>
+          </section>
+          <div class="task-modal-columns">
+            <main class="task-modal-main">
+              <section class="task-section">
+                <div class="task-section-title"><span>2</span><div><strong data-i18n="tasks.mintSettingsTitle">Mint settings</strong><small data-i18n="tasks.mintSettingsHint">The defaults are suitable for a normal fast mint.</small></div></div>
+                <div class="task-primary-grid">
+                  <label><span data-i18n="tasks.qty">Quantity per wallet</span><input type="number" id="wizard-qty" min="1" max="50" value="1" /></label>
+                  <label><span data-i18n="tasks.chain">Network</span><select id="task-chain"><option value="auto">Auto — after loading</option><option value="ethereum">Ethereum</option><option value="base">Base</option><option value="polygon">Polygon</option><option value="arbitrum">Arbitrum</option><option value="optimism">Optimism</option><option value="ink">Ink</option><option value="bsc">BSC</option><option value="avalanche">Avalanche</option><option value="blast">Blast</option><option value="zora">Zora</option><option value="apechain">ApeChain</option><option value="shape">Shape</option><option value="monad">Monad</option><option value="megaeth">MegaETH</option><option value="robinhood">Robinhood Chain</option></select></label>
+                  <label><span data-i18n="tasks.gasMode">Gas</span><select id="task-gas-mode"><option value="auto" data-i18n="tasks.gasAuto">Auto</option><option value="manual" data-i18n="tasks.gasManual">Manual</option></select></label>
+                  <label id="task-gas-limit-wrap" class="hidden"><span data-i18n="tasks.gasLimit">Gas limit</span><input type="number" id="task-gas-limit" min="21000" step="1000" value="250000" /></label>
+                </div>
+                <p class="task-auto-note" data-i18n="tasks.autoResolvedHint">Network, gas and phase are locked while preparing the task — no calculation is added at phase open.</p>
+              </section>
+              <section id="task-cost-quote" class="task-cost-quote" aria-live="polite">
+                <div class="task-cost-head"><div><span class="task-cost-title" data-i18n="tasks.costTitle">Cost now</span><span id="task-cost-source" class="task-cost-source">Load phases to calculate</span></div><span id="task-cost-ready" class="task-cost-ready neutral">—</span></div>
+                <div class="task-cost-primary"><div><span data-i18n="tasks.expectedFee">Gas / wallet</span><strong id="task-cost-fee">—</strong></div><div><span data-i18n="tasks.expectedTotal">Total for selected wallets</span><strong id="task-cost-total">—</strong></div></div>
+                <details class="task-cost-details"><summary data-i18n="tasks.costDetails">Calculation details</summary><div class="task-cost-grid"><div><span data-i18n="tasks.currentGas">Current network gas</span><strong id="task-cost-gas">—</strong></div><div><span data-i18n="tasks.mintPrice">NFT price / wallet</span><strong id="task-cost-mint">—</strong></div><div><span data-i18n="tasks.requiredBalance">Required on each wallet</span><strong id="task-cost-required">—</strong></div><div><span data-i18n="tasks.requiredTotal">Maximum reserve total</span><strong id="task-cost-required-total">—</strong></div></div><p id="task-cost-note" class="task-cost-note" data-i18n="tasks.costNote">Expected fee is the likely charge. Required reserve is a ceiling; unused gas is not charged.</p></details>
+              </section>
+              <section class="task-section task-options-section">
+                <div class="task-section-title"><span>3</span><div><strong data-i18n="tasks.optionsTitle">After mint</strong><small data-i18n="tasks.optionsHint">Optional actions do not delay or change mint success.</small></div></div>
+                <label class="check task-option-check"><input type="checkbox" id="task-auto-sweep" /><span><strong data-i18n="tasks.autoSweep">Auto-sweep minted NFTs</strong><small data-i18n="tasks.autoSweepShortHint">Transfer confirmed NFTs to the main wallet in the background.</small></span></label>
+                <div id="task-auto-sweep-wrap" class="hidden task-sweep-destination"><label><span data-i18n="tasks.autoSweepDestination">Sweep destination</span><input type="text" id="task-auto-sweep-destination" placeholder="0x..." autocomplete="off" spellcheck="false" /></label><p class="muted small" data-i18n="tasks.autoSweepHint">After each confirmed mint, transfer its NFTs to this address. Sweep errors never change mint success.</p></div>
+              </section>
+              <details class="task-section task-advanced"><summary><span data-i18n="tasks.advancedTitle">Advanced settings</span><small data-i18n="tasks.advancedHint">Usually you do not need to change these.</small></summary><div class="task-advanced-grid">
+                <label><span data-i18n="tasks.sendMode">Send mode</span><select id="task-send-mode"><option value="public" data-i18n="tasks.sendPublic">Standard — recommended</option><option value="conditional" data-i18n="tasks.sendConditional">Experimental pre-send — Robinhood only</option><option value="flashbots" data-i18n="tasks.sendFlashbots">Private Flashbots — Ethereum only</option></select></label>
+                <label id="task-conditional-lead-wrap" class="hidden"><span data-i18n="tasks.conditionalLead">Pre-send lead (ms)</span><input type="number" id="task-conditional-lead" min="100" max="10000" step="50" value="1000" /></label>
+                <label><span data-i18n="tasks.prio">Priority fee override (Gwei)</span><input type="text" id="task-prio" placeholder="Auto — leave empty" data-i18n-placeholder="tasks.prioPlaceholder" autocomplete="off" /></label>
+                <label><span data-i18n="tasks.atTime">Start time override</span><input type="text" id="task-at" placeholder="Leave empty — phase time is used" data-i18n-placeholder="tasks.timePlaceholder" autocomplete="off" /></label>
+              </div><p class="task-advanced-help" data-i18n="tasks.sendModeHint">Standard sends to the public network at phase open. Experimental pre-send is only for Robinhood conditional transactions. Flashbots is private and only works on Ethereum.</p></details>
+            </main>
+            <aside class="task-section task-wallet-section">
+              <div class="task-wallet-title"><div class="task-section-title"><span>4</span><div><strong data-i18n="tasks.pickWallets">Wallets</strong><small id="task-wallet-count">Select wallets for this task.</small></div></div><label class="check tight"><input type="checkbox" id="task-wallets-all" /><span data-i18n="tasks.selectAll">Select all</span></label></div>
+              <div class="task-group-filter"><span id="task-group-chips"></span><button type="button" id="task-wl-badge" class="task-wl-badge hidden"></button></div>
+              <div id="task-wallet-list" class="task-wallet-list muted">Unlock vault to load wallets…</div>
+              <p class="task-wallet-route-hint muted small" data-i18n="tasks.proxyPerWalletHint">Each wallet keeps its own Auto, Direct or proxy route.</p>
+              <label class="check task-option-check"><input type="checkbox" id="task-per-wallet-qty" /><span><strong data-i18n="tasks.perWalletQty">Different quantity for individual wallets</strong><small data-i18n="tasks.perWalletQtyHint">Leave off when every wallet should mint the quantity specified above.</small></span></label>
+              <div id="task-qty-map-wrap" class="task-qty-map-wrap hidden"><div id="task-qty-map" class="task-qty-map"></div></div>
+              <div class="task-balance-check"><span class="task-balance-icon">✓</span><span><strong data-i18n="tasks.balanceAutomatic">Balance check is automatic</strong><small data-i18n="tasks.balanceAutomaticHint">Only wallets covering the exact NFT price and gas reserve can mint.</small></span></div>
+              <input type="checkbox" id="task-filter-balance" class="hidden" checked disabled aria-hidden="true" />
+            </aside>
           </div>
-          <div class="task-cost-grid">
-            <div><span data-i18n="tasks.currentGas">Current gas</span><strong id="task-cost-gas">—</strong></div>
-            <div><span data-i18n="tasks.mintPrice">Mint price / wallet</span><strong id="task-cost-mint">—</strong></div>
-            <div><span data-i18n="tasks.expectedFee">Expected fee / wallet</span><strong id="task-cost-fee">—</strong></div>
-            <div><span data-i18n="tasks.expectedTotal">Expected total</span><strong id="task-cost-total">—</strong></div>
-            <div><span data-i18n="tasks.requiredBalance">Required balance / wallet</span><strong id="task-cost-required">—</strong></div>
-            <div><span data-i18n="tasks.requiredTotal">Required reserve total</span><strong id="task-cost-required-total">—</strong></div>
-          </div>
-          <p id="task-cost-note" class="task-cost-note" data-i18n="tasks.costNote">Expected fee is the likely charge. Required reserve is a ceiling; unused gas is not charged.</p>
-        </section>
-        <label class="check"><input type="checkbox" id="task-per-wallet-qty" /> <span data-i18n="tasks.perWalletQty">Per-wallet quantity (default = qty above)</span></label>
-        <div id="task-qty-map-wrap" class="task-qty-map-wrap hidden">
-          <p class="muted small" data-i18n="tasks.perWalletQtyHint">Set qty per checked wallet after selecting wallets (default uses task qty).</p>
-          <div id="task-qty-map" class="task-qty-map"></div>
+          <input type="checkbox" id="task-skip-est" class="hidden" checked aria-hidden="true" />
         </div>
-        <label class="check"><input type="checkbox" id="task-auto-sweep" /> <span data-i18n="tasks.autoSweep">Auto-sweep minted NFTs</span></label>
-        <div id="task-auto-sweep-wrap" class="hidden">
-          <label><span data-i18n="tasks.autoSweepDestination">Sweep destination</span>
-            <input type="text" id="task-auto-sweep-destination" placeholder="0x..." autocomplete="off" spellcheck="false" />
-          </label>
-          <p class="muted small" data-i18n="tasks.autoSweepHint">After each confirmed mint, transfer its NFTs to this address. Sweep errors never change mint success.</p>
-        </div>
-        <p class="muted small" data-i18n="tasks.startHint">Auto gas is prepared now; at phase open the transaction sends without an estimate delay.</p>
-        <div class="wallet-pick-head">
-          <span data-i18n="tasks.pickWallets">Wallets</span>
-          <div class="task-group-filter">
-            <span id="task-group-chips"></span>
-            <label class="check tight"><input type="checkbox" id="task-wallets-all" /> <span data-i18n="tasks.selectAll">Select all</span></label>
-            <button type="button" id="task-wl-badge" class="task-wl-badge hidden"></button>
-          </div>
-        </div>
-        <div id="task-wallet-list" class="task-wallet-list muted">Unlock vault to load wallets…</div>
-        <p class="muted small" data-i18n="tasks.proxyPerWalletHint">Route is saved in this task: Auto, Direct, or a specific proxy.</p>
-        <label class="check"><input type="checkbox" id="task-filter-balance" checked disabled /> <span data-i18n="tasks.filterBalance">Verify exact mint price and gas reserve (required)</span></label>
-        <input type="checkbox" id="task-skip-est" class="hidden" checked aria-hidden="true" />
-        <p id="wizard-msg" class="msg"></p>
-        <div class="row actions modal-actions">
-          <button type="button" id="task-modal-cancel" data-i18n="modal.cancel">Cancel</button>
-          <button type="button" id="task-modal-save" class="primary" data-i18n="tasks.save">Save task</button>
-        </div>
+        <footer class="task-modal-footer"><p id="wizard-msg" class="msg"></p><div class="row actions modal-actions"><button type="button" id="task-modal-cancel" data-i18n="modal.cancel">Cancel</button><button type="button" id="task-modal-save" class="primary" data-i18n="tasks.save">Save task</button></div></footer>
       </div>
     </div>
 

@@ -410,11 +410,26 @@ fn native_symbol_for_chain(chain: Option<&str>) -> &'static str {
         "avalanche" | "avax" => "AVAX",
         "apechain" | "ape" => "APE",
         "monad" => "MON",
+        "arc_testnet" | "arc-testnet" => "USDC",
         _ => "ETH",
     }
 }
 
 async fn alchemy_usd_price(api_key: &str, symbol: &str) -> Result<f64> {
+    // Shared by header, balances, task quotes and disperse. Cache misses are
+    // coalesced; failed lookups are cached too, preventing retry storms.
+    static CACHE: OnceLock<crate::preview_cache::PreviewCache<f64>> = OnceLock::new();
+    CACHE
+        .get_or_init(Default::default)
+        .get(
+            format!("{}:{symbol}", api_key.trim()),
+            std::time::Duration::from_secs(300),
+            || fetch_alchemy_usd_price(api_key, symbol),
+        )
+        .await
+}
+
+async fn fetch_alchemy_usd_price(api_key: &str, symbol: &str) -> Result<f64> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
@@ -2242,6 +2257,7 @@ impl Session {
         if info.stages.is_empty() {
             bail!("No drop stages found for '{}'", slug);
         }
+        let wallet_eligibility = phase_wallet_eligibility(&info, &completed);
         let successful_infos: Vec<opensea::CollectionInfo> =
             completed.into_iter().map(|(_, _, info)| info).collect();
         let aggregates = aggregate_stage_eligibility(&mut info, &successful_infos, wallet_count);
@@ -2259,6 +2275,7 @@ impl Session {
             address,
             wallet_count,
             successful_wallets: successful_infos.len(),
+            wallet_eligibility,
             failed_wallets: errors.len(),
             recommended_index: recommended,
             stages: stage_rows,
@@ -3101,13 +3118,25 @@ impl Session {
     /// Current network fee for the always-visible desktop ticker. `include_usd`
     /// lets the UI refresh RPC gas frequently while refreshing fiat price only
     /// once per minute.
+    async fn preview_fees(&self, chain: &str) -> Result<(U256, U256)> {
+        static CACHE: OnceLock<crate::preview_cache::PreviewCache<(U256, U256)>> = OnceLock::new();
+        let urls = collect_rpc_urls_for_chain(&self.env, Some(chain), &[]);
+        let key = format!("{chain}:{urls:?}");
+        let rpc = self.rpc_client_for_chain(chain)?;
+        CACHE
+            .get_or_init(Default::default)
+            .get(key, std::time::Duration::from_secs(15), || {
+                rpc.fee_history()
+            })
+            .await
+    }
+
     pub async fn network_fee_snapshot(
         &self,
         chain: &str,
         include_usd: bool,
     ) -> Result<NetworkFeeSnapshot> {
-        let rpc = self.rpc_client_for_chain(chain)?;
-        let (base_fee, network_priority) = rpc.fee_history().await?;
+        let (base_fee, network_priority) = self.preview_fees(chain).await?;
         let mut params = self.gas_params();
         params.base_fee_multiplier = mint_fee_cap_multiplier(chain);
         let (max_fee, priority) = crate::gas::calculate_fees(&params, base_fee, network_priority)?;
@@ -3141,6 +3170,43 @@ impl Session {
         chain: &str,
         contract: &str,
         quantity: u32,
+        stage_type: Option<&str>,
+    ) -> (Option<(u64, u64)>, usize) {
+        let signature = match stage_type {
+            Some("PUBLIC_SALE" | "PUBLIC") => "mintPublic(address,address,address,uint256)",
+            Some("SIGNED_PRESALE") => {
+                "mintSigned(address,address,address,uint256,(uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool),uint256,bytes)"
+            }
+            _ => return (None, 0),
+        };
+        let selector = format!(
+            "0x{}",
+            hex::encode(&alloy_primitives::keccak256(signature.as_bytes())[..4])
+        );
+        type GasHistory = (Option<(u64, u64)>, usize);
+        static CACHE: OnceLock<crate::preview_cache::PreviewCache<GasHistory>> = OnceLock::new();
+        let key = format!(
+            "{chain}:{}:{quantity}:{selector}",
+            contract.to_ascii_lowercase()
+        );
+        CACHE
+            .get_or_init(Default::default)
+            .get(key, std::time::Duration::from_secs(600), || async {
+                Ok(self
+                    .fetch_historical_mint_gas(rpc, chain, contract, quantity, &selector)
+                    .await)
+            })
+            .await
+            .unwrap_or((None, 0))
+    }
+
+    async fn fetch_historical_mint_gas(
+        &self,
+        rpc: &RpcClient,
+        chain: &str,
+        contract: &str,
+        quantity: u32,
+        selector: &str,
     ) -> (Option<(u64, u64)>, usize) {
         type GasHistoryCache = HashMap<String, (Instant, Option<(u64, u64)>, usize)>;
         static CACHE: OnceLock<Mutex<GasHistoryCache>> = OnceLock::new();
@@ -3154,7 +3220,7 @@ impl Session {
             return (None, 0);
         }
         let cache_key = format!(
-            "{}:{}:{}",
+            "{}:{}:{}:{selector}",
             chain.trim().to_ascii_lowercase(),
             contract.to_ascii_lowercase(),
             quantity
@@ -3208,6 +3274,7 @@ impl Session {
         let mut jobs = tokio::task::JoinSet::new();
         for hash in hashes {
             let rpc = rpc.clone();
+            let selector = selector.to_string();
             jobs.spawn(async move {
                 let (receipt, tx) = tokio::join!(
                     rpc.call("eth_getTransactionReceipt", serde_json::json!([hash])),
@@ -3216,6 +3283,14 @@ impl Session {
                 let receipt = receipt.ok()?;
                 let tx = tx.ok()?;
                 let to = tx.get("to")?.as_str()?;
+                if !tx
+                    .get("input")?
+                    .as_str()?
+                    .to_ascii_lowercase()
+                    .starts_with(&selector)
+                {
+                    return None;
+                }
                 if !to.eq_ignore_ascii_case(SEADROP) {
                     return None;
                 }
@@ -3265,12 +3340,13 @@ impl Session {
         unit_price_wei: &str,
         manual_gas_limit: Option<u64>,
         priority_fee_gwei: Option<&str>,
+        stage_type: Option<&str>,
     ) -> Result<MintCostQuote> {
         if wallet_addresses.is_empty() {
             bail!("Select at least one wallet");
         }
         let rpc = self.rpc_client_for_chain(chain)?;
-        let (base_fee, network_priority) = rpc.fee_history().await?;
+        let (base_fee, network_priority) = self.preview_fees(chain).await?;
         let mut params = self.gas_params();
         params.base_fee_multiplier = mint_fee_cap_multiplier(chain);
         if let Some(raw) = priority_fee_gwei
@@ -3288,11 +3364,16 @@ impl Session {
             U256::from_str_radix(unit_price_wei.trim(), 10).context("invalid phase price")?;
         let requested_qty = wallet_addresses
             .iter()
-            .filter_map(|address| wallet_quantities.get(&normalize_address(address)).copied())
+            .map(|address| {
+                wallet_quantities
+                    .get(&normalize_address(address))
+                    .copied()
+                    .unwrap_or(default_quantity.max(1))
+            })
             .max()
             .unwrap_or(default_quantity.max(1));
         let (historical, sample_count) = if manual_gas_limit.is_none() {
-            self.historical_mint_gas(&rpc, chain, contract, requested_qty)
+            self.historical_mint_gas(&rpc, chain, contract, requested_qty, stage_type)
                 .await
         } else {
             (None, 0)
@@ -3319,6 +3400,11 @@ impl Session {
         };
         let mut jobs = tokio::task::JoinSet::new();
         let balance_slots = Arc::new(tokio::sync::Semaphore::new(32));
+        static BALANCES: OnceLock<crate::preview_cache::PreviewCache<U256>> = OnceLock::new();
+        let network_key = format!(
+            "{chain}:{:?}",
+            collect_rpc_urls_for_chain(&self.env, Some(chain), &[])
+        );
         for address in &wallet_addresses {
             let Ok(address_parsed) = address.parse::<Address>() else {
                 continue;
@@ -3326,9 +3412,16 @@ impl Session {
             let rpc = rpc.clone();
             let balance_slots = balance_slots.clone();
             let normalized = normalize_address(address);
+            let balance_key = format!("{network_key}:{normalized}");
             jobs.spawn(async move {
                 let _permit = balance_slots.acquire_owned().await.ok();
-                (normalized, rpc.balance(&address_parsed).await)
+                let balance = BALANCES
+                    .get_or_init(Default::default)
+                    .get(balance_key, std::time::Duration::from_secs(15), || {
+                        rpc.balance(&address_parsed)
+                    })
+                    .await;
+                (normalized, balance)
             });
         }
         let mut balances = HashMap::new();
@@ -3856,6 +3949,11 @@ mod session_debug_tests {
     #[test]
     fn native_usd_symbols_follow_selected_chain() {
         assert_eq!(native_symbol_for_chain(Some("base")), "ETH");
+        assert_eq!(native_symbol_for_chain(Some("arc_testnet")), "USDC");
+        assert_eq!(
+            public_rpc_fallback("arc_testnet"),
+            vec!["https://rpc.testnet.arc.network"]
+        );
         assert_eq!(native_symbol_for_chain(Some("polygon")), "POL");
         assert_eq!(native_symbol_for_chain(Some("apechain")), "APE");
         assert_eq!(format_usd_value(12.345), "12.35");
@@ -4005,6 +4103,52 @@ mod recommended_phase_tests {
             stage("SIGNED_PRESALE", 1, Some(now - 3600.0)),
         ]);
         assert_eq!(recommended_phase_index(&i), Some(1));
+    }
+
+    #[test]
+    fn nearest_future_phase_wins_over_later_presale() {
+        let now = 1_000;
+        let i = info(vec![
+            stage("PUBLIC_SALE", 0, Some(1_100.0)),
+            stage("SIGNED_PRESALE", 1, Some(1_200.0)),
+        ]);
+        assert_eq!(recommended_phase_index_at(&i, now), Some(0));
+    }
+
+    #[test]
+    fn wallet_phase_answers_preserve_false_unknown_and_missing() {
+        let reference = info(vec![
+            stage("SIGNED_PRESALE", 1, Some(100.0)),
+            stage("PUBLIC_SALE", 2, Some(200.0)),
+        ]);
+        let mut yes = reference.clone();
+        yes.stages[0].is_eligible = Some(true);
+        let mut no = reference.clone();
+        no.stages[0].is_eligible = Some(false);
+        no.stages[0].max_mintable = Some(10);
+        assert_eq!(
+            opensea::admitted_mint_quantity(&no, Some(&no.stages[0]), 2),
+            0
+        );
+        assert_eq!(
+            opensea::admitted_mint_quantity(&yes, Some(&yes.stages[0]), 1),
+            1
+        );
+        let mut unknown = reference.clone();
+        unknown.stages[0].is_eligible = None;
+        let result = phase_wallet_eligibility(
+            &reference,
+            &[
+                (0, "0xAA".into(), yes),
+                (1, "0xBB".into(), no),
+                (2, "0xCC".into(), unknown),
+            ],
+        );
+        assert_eq!(result[&0]["0xaa"], Some(true));
+        assert_eq!(result[&0]["0xbb"], Some(false));
+        assert_eq!(result[&0]["0xcc"], None);
+        assert!(!result[&0].contains_key("0xdd"));
+        assert!(result[&1].values().all(|answer| *answer == Some(true)));
     }
 
     #[test]
@@ -4322,6 +4466,9 @@ pub struct DropPhasesResult {
     pub address: String,
     pub wallet_count: usize,
     pub successful_wallets: usize,
+    /// Phase list index -> address -> true/false/unknown. Failed wallets are
+    /// absent, never silently converted into a negative WL result.
+    pub wallet_eligibility: HashMap<usize, HashMap<String, Option<bool>>>,
     pub failed_wallets: usize,
     pub recommended_index: Option<usize>,
     pub stages: Vec<StageRow>,
@@ -4470,6 +4617,40 @@ fn aggregate_stage_eligibility(
     aggregates
 }
 
+fn phase_wallet_eligibility(
+    reference: &opensea::CollectionInfo,
+    completed: &[(usize, String, opensea::CollectionInfo)],
+) -> HashMap<usize, HashMap<String, Option<bool>>> {
+    reference
+        .stages
+        .iter()
+        .enumerate()
+        .map(|(index, stage)| {
+            let wallets = completed
+                .iter()
+                .map(|(_, address, info)| {
+                    let eligibility = info
+                        .stages
+                        .iter()
+                        .find(|candidate| {
+                            candidate.stage_type == stage.stage_type
+                                && candidate.stage_index == stage.stage_index
+                        })
+                        .and_then(|candidate| {
+                            if is_public_sale_stage_type(&candidate.stage_type) {
+                                Some(true)
+                            } else {
+                                candidate.is_eligible
+                            }
+                        });
+                    (normalize_address(address), eligibility)
+                })
+                .collect();
+            (index, wallets)
+        })
+        .collect()
+}
+
 fn recommended_phase_index(info: &opensea::CollectionInfo) -> Option<usize> {
     recommended_phase_index_at(info, chrono::Utc::now().timestamp())
 }
@@ -4503,8 +4684,8 @@ fn recommended_phase_index_at(info: &opensea::CollectionInfo, now: i64) -> Optio
                 .filter(|(_, stage)| selectable(stage))
                 .min_by_key(|(_, stage)| {
                     (
-                        stage.stage_type == "PUBLIC_SALE",
                         stage.start_time.map(|t| t as i64).unwrap_or(i64::MAX),
+                        is_public_sale_stage_type(&stage.stage_type),
                         stage.stage_index.unwrap_or(0),
                     )
                 })
@@ -4689,6 +4870,7 @@ fn chain_id_label(id: u64) -> String {
         143 => "Monad".into(),
         4326 => "MegaETH".into(),
         4663 => "Robinhood Chain".into(),
+        5042002 => "Arc Testnet (USDC)".into(),
         0 => "Not selected".into(),
         other => format!("chainId {other}"),
     }
@@ -4884,6 +5066,7 @@ fn provider_chain_slugs(
 /// Well-known public RPC endpoints when no key/custom URL is configured.
 fn public_rpc_fallback(chain: &str) -> Vec<&'static str> {
     match chain.to_lowercase().as_str() {
+        "arc_testnet" | "arc-testnet" => vec!["https://rpc.testnet.arc.network"],
         "ethereum" | "mainnet" | "eth" => vec![
             "https://ethereum.publicnode.com",
             "https://cloudflare-eth.com",

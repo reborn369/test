@@ -311,7 +311,7 @@
                           <option value="shape">Shape</option>
                           <option value="monad">Monad</option>
                           <option value="megaeth">MegaETH</option>
-                          <option value="robinhood" selected>Robinhood Chain</option>
+                          <option value="robinhood" selected>Robinhood Chain</option><option value="arc_testnet">Arc Testnet (USDC)</option>
                         </select>
                       </label>
                       <label id="raw-qty-wrap"><span data-i18n="raw.qty">NFTs</span>
@@ -505,7 +505,7 @@
                         <option value="shape">Shape</option>
                         <option value="monad">Monad</option>
                         <option value="megaeth">MegaETH</option>
-                        <option value="robinhood">Robinhood Chain</option>
+                        <option value="robinhood">Robinhood Chain</option><option value="arc_testnet">Arc Testnet (USDC)</option>
                     </select>
                   </label>
                   <label><span data-i18n="disperse.from">From wallet</span> <span class="req-star">*</span>
@@ -570,7 +570,7 @@
                       <option value="shape">Shape</option>
                       <option value="monad">Monad</option>
                       <option value="megaeth">MegaETH</option>
-                      <option value="robinhood">Robinhood Chain</option>
+                      <option value="robinhood">Robinhood Chain</option><option value="arc_testnet">Arc Testnet (USDC)</option>
                     </select>
                   </label>
                   <label><span data-i18n="mc.from">From wallet</span> <span class="req-star">*</span>
@@ -632,7 +632,7 @@
                         <option value="shape">Shape</option>
                         <option value="monad">Monad</option>
                         <option value="megaeth">MegaETH</option>
-                        <option value="robinhood">Robinhood Chain</option>
+                        <option value="robinhood">Robinhood Chain</option><option value="arc_testnet">Arc Testnet (USDC)</option>
                       </select>
                     </label>
                     <label><span data-i18n="sweep.destination">Destination</span> <span class="req-star">*</span>
@@ -695,7 +695,7 @@
                         <option value="shape">Shape</option>
                         <option value="monad">Monad</option>
                         <option value="megaeth">MegaETH</option>
-                        <option value="robinhood">Robinhood Chain</option>
+                        <option value="robinhood">Robinhood Chain</option><option value="arc_testnet">Arc Testnet (USDC)</option>
                       </select>
                     </label>
                     <label><span data-i18n="sweep.nftContract">NFT contract (optional filter)</span>
@@ -832,7 +832,7 @@
                         <option value="blast">Blast</option>
                         <option value="zora">Zora</option>
                         <option value="apechain">ApeChain</option>
-                        <option value="robinhood">Robinhood Chain</option>
+                        <option value="robinhood">Robinhood Chain</option><option value="arc_testnet">Arc Testnet (USDC)</option>
                         <option value="monad">Monad</option>
                       </select>
                     </label>
@@ -1038,6 +1038,7 @@
                     <label>Base RPC <input type="text" id="set-rpc-base" placeholder="optional" /></label>
                     <label>Polygon RPC <input type="text" id="set-rpc-polygon" placeholder="optional" /></label>
                     <label>Robinhood RPC <input type="text" id="set-rpc-robinhood" placeholder="optional" /></label>
+                    <label>Arc Testnet RPC (USDC) <input type="text" id="set-rpc-arc-testnet" placeholder="https://rpc.testnet.arc.network" /></label>
                     <label>Arbitrum RPC <input type="text" id="set-rpc-arbitrum" placeholder="optional" /></label>
                     <label>Optimism RPC <input type="text" id="set-rpc-optimism" placeholder="optional" /></label>
                     <label>Ink RPC <input type="text" id="set-rpc-ink" placeholder="optional — Alchemy/public fallback available" /></label>
@@ -1132,7 +1133,7 @@
                 <div class="task-section-title"><span>2</span><div><strong data-i18n="tasks.mintSettingsTitle">Mint settings</strong><small data-i18n="tasks.mintSettingsHint">The defaults are suitable for a normal fast mint.</small></div></div>
                 <div class="task-primary-grid">
                   <label><span data-i18n="tasks.qty">Quantity per wallet</span><input type="number" id="wizard-qty" min="1" max="50" value="1" /></label>
-                  <label><span data-i18n="tasks.chain">Network</span><select id="task-chain"><option value="auto">Auto — after loading</option><option value="ethereum">Ethereum</option><option value="base">Base</option><option value="polygon">Polygon</option><option value="arbitrum">Arbitrum</option><option value="optimism">Optimism</option><option value="ink">Ink</option><option value="bsc">BSC</option><option value="avalanche">Avalanche</option><option value="blast">Blast</option><option value="zora">Zora</option><option value="apechain">ApeChain</option><option value="shape">Shape</option><option value="monad">Monad</option><option value="megaeth">MegaETH</option><option value="robinhood">Robinhood Chain</option></select></label>
+                  <label><span data-i18n="tasks.chain">Network</span><select id="task-chain"><option value="auto">Auto — after loading</option><option value="ethereum">Ethereum</option><option value="base">Base</option><option value="polygon">Polygon</option><option value="arbitrum">Arbitrum</option><option value="optimism">Optimism</option><option value="ink">Ink</option><option value="bsc">BSC</option><option value="avalanche">Avalanche</option><option value="blast">Blast</option><option value="zora">Zora</option><option value="apechain">ApeChain</option><option value="shape">Shape</option><option value="monad">Monad</option><option value="megaeth">MegaETH</option><option value="robinhood">Robinhood Chain</option><option value="arc_testnet">Arc Testnet (USDC)</option></select></label>
                   <label><span data-i18n="tasks.gasMode">Gas</span><select id="task-gas-mode"><option value="auto" data-i18n="tasks.gasAuto">Auto</option><option value="manual" data-i18n="tasks.gasManual">Manual</option></select></label>
                   <label id="task-gas-limit-wrap" class="hidden"><span data-i18n="tasks.gasLimit">Gas limit</span><input type="number" id="task-gas-limit" min="21000" step="1000" value="250000" /></label>
                 </div>

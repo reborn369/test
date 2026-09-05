@@ -1457,6 +1457,25 @@ pub fn stage_is_selectable_at(stage: &StageInfo, now: i64) -> bool {
     stage_effective_eligible(stage) && !stage_is_expired_at(stage, now)
 }
 
+/// Existing preparation already fetched this wallet's stage. A numeric mint
+/// allowance must not override an explicit negative eligibility answer.
+pub fn admitted_mint_quantity(
+    info: &CollectionInfo,
+    stage: Option<&StageInfo>,
+    requested: u32,
+) -> u32 {
+    if stage.is_some_and(|s| {
+        s.is_eligible == Some(false) && s.stage_type != "PUBLIC_SALE" && s.stage_type != "PUBLIC"
+    }) {
+        return 0;
+    }
+    requested.min(
+        stage
+            .and_then(|s| available_mint_quantity(info, s))
+            .unwrap_or(requested),
+    )
+}
+
 fn stage_wallet_limit(stage: &StageInfo) -> Option<i64> {
     stage.max_mintable.or_else(|| {
         stage

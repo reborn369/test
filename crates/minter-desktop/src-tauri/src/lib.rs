@@ -1047,6 +1047,7 @@ struct SettingsDto {
     rpc_url_base: String,
     rpc_url_polygon: String,
     rpc_url_robinhood: String,
+    rpc_url_arc_testnet: String,
     rpc_url_arbitrum: String,
     rpc_url_optimism: String,
     rpc_url_ink: String,
@@ -1083,6 +1084,7 @@ impl SettingsDto {
             rpc_url_base: s.settings.rpc_url_base.clone(),
             rpc_url_polygon: s.settings.rpc_url_polygon.clone(),
             rpc_url_robinhood: s.settings.rpc_url_robinhood.clone(),
+            rpc_url_arc_testnet: s.settings.rpc_url_arc_testnet.clone(),
             rpc_url_arbitrum: s.settings.rpc_url_arbitrum.clone(),
             rpc_url_optimism: s.settings.rpc_url_optimism.clone(),
             rpc_url_ink: s.settings.rpc_url_ink.clone(),
@@ -1133,6 +1135,7 @@ struct SaveSettingsInput {
     rpc_url_base: Option<String>,
     rpc_url_polygon: Option<String>,
     rpc_url_robinhood: Option<String>,
+    rpc_url_arc_testnet: Option<String>,
     rpc_url_arbitrum: Option<String>,
     rpc_url_optimism: Option<String>,
     rpc_url_ink: Option<String>,
@@ -1218,6 +1221,9 @@ fn save_settings_inner(state: &AppState, input: SaveSettingsInput) -> Result<Str
     }
     if let Some(v) = input.rpc_url_robinhood {
         settings.rpc_url_robinhood = v;
+    }
+    if let Some(v) = input.rpc_url_arc_testnet {
+        settings.rpc_url_arc_testnet = v;
     }
     if let Some(v) = input.rpc_url_arbitrum {
         settings.rpc_url_arbitrum = v;
@@ -2638,6 +2644,7 @@ async fn list_drop_phases(
 #[serde(rename_all = "camelCase")]
 struct MintCostQuoteInput {
     chain: String,
+    stage_type: Option<String>,
     contract: String,
     wallet_addresses: Vec<String>,
     wallet_quantities: std::collections::HashMap<String, u32>,
@@ -2678,6 +2685,7 @@ async fn mint_cost_quote(
             &input.unit_price_wei,
             input.manual_gas_limit,
             input.priority_fee_gwei.as_deref(),
+            input.stage_type.as_deref(),
         )
         .await
         .map_err(|error| error.to_string())

@@ -38,6 +38,9 @@ jobs:
       - name: test (minter-core)
         run: cargo test -p minter-core --lib
 
+      - name: UI regression tests
+        run: node --test scripts/audit-ui.cjs
+
   desktop:
     name: clippy · test (minter-desktop)
     runs-on: windows-latest

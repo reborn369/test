@@ -98,19 +98,26 @@ let gasMonitorTimer = null;
 let gasMonitorBusy = false;
 let gasUsdPrice = null;
 let gasUsdUpdatedAt = 0;
+let gasUsdAttemptAt = 0;
+let gasMonitorAttemptAt = 0;
+let gasMonitorVersion = 0;
 let activeTaskCostQuote = null;
 
 function gasHeaderMarkup() {
   if (!gasSnapshot) {
     return `<span class="sb-v loading">${escapeHtml(gasMonitorChain)} · …</span>`;
   }
-  const gasUnits = Number(activeTaskCostQuote?.gasUsedEstimate) || 200_000;
+  const currentQuote = activeTaskCostQuote?.chain === gasMonitorChain ? activeTaskCostQuote : null;
+  const gasUnits = Number(currentQuote?.gasUsedEstimate) || 200_000;
   const nativePrice = Number(gasUsdPrice);
-  const gwei = Number(gasSnapshot.effectiveFeeGwei);
+  const manualPriority = ($("task-prio")?.value || "").trim();
+  const gwei = currentQuote && manualPriority
+    ? Math.min(Number(gasSnapshot.baseFeeGwei) + Number(manualPriority), Number(currentQuote.maxFeeGwei))
+    : Number(gasSnapshot.effectiveFeeGwei);
   const calculatedUsd = gasUsdPrice != null && Number.isFinite(nativePrice) && Number.isFinite(gwei)
     ? (gwei * gasUnits * nativePrice) / 1_000_000_000
     : null;
-  const exactTaskQuote = Number(activeTaskCostQuote?.gasUsedEstimate) > 0;
+  const exactTaskQuote = currentQuote?.gasSource === "collection_history";
   // Always recompute from the fresh header fee snapshot. The collection quote
   // supplies gas units, not a frozen dollar value from when phases were loaded.
   const usd = calculatedUsd;
@@ -129,12 +136,18 @@ function gasHeaderMarkup() {
 
 function renderHeaderGas() {
   const cell = $("header-gas-value");
-  if (cell) cell.innerHTML = gasHeaderMarkup();
+  if (cell) {
+    const stale = gasSnapshot && Date.now() - gasSnapshot.updatedAtMs > 45_000;
+    const stalePrice = gasUsdPrice != null && Date.now() - gasUsdUpdatedAt > 360_000;
+    cell.innerHTML = gasHeaderMarkup() + (stale || stalePrice ? ' <span class="warn">(устарело)</span>' : '');
+  }
 }
 
 function refreshVisibleTaskGasCost() {
   const quote = activeTaskCostQuote;
-  if (!quote || !gasSnapshot || !$("task-cost-fee")) return;
+  if (!quote || !gasSnapshot || quote.chain !== gasSnapshot.chain || !$("task-cost-fee")) return;
+  // A manual priority belongs to the task, not the generic header ticker.
+  if (($("task-prio")?.value || "").trim()) return;
   const gwei = Number(gasSnapshot.effectiveFeeGwei);
   const gasUsed = Number(quote.gasUsedEstimate);
   const usdPrice = Number(gasUsdPrice);
@@ -154,14 +167,21 @@ function refreshVisibleTaskGasCost() {
 
 async function refreshGasMonitor(forceUsd = false) {
   if (gasMonitorBusy || !lastUiStatus?.unlocked) return;
+  renderHeaderGas();
+  if (Date.now() - gasMonitorAttemptAt < 15_000) return;
+  gasMonitorAttemptAt = Date.now();
+  const version = gasMonitorVersion;
+  const chain = gasMonitorChain;
   gasMonitorBusy = true;
   try {
-    const includeUsd = forceUsd || Date.now() - gasUsdUpdatedAt >= 60_000;
+    const includeUsd = Date.now() - gasUsdAttemptAt >= 300_000;
+    if (includeUsd) gasUsdAttemptAt = Date.now();
     const snapshot = await invokeSafe(
       "network_fee_snapshot",
-      { chain: gasMonitorChain, includeUsd },
+      { chain, includeUsd },
       { quiet: true }
     );
+    if (version !== gasMonitorVersion) return;
     if (snapshot) {
       gasSnapshot = snapshot;
       if (snapshot.usdPrice) {
@@ -180,6 +200,11 @@ function setGasMonitorChain(chain) {
   const next = String(chain || "").trim().toLowerCase();
   if (!next || next === "auto" || next === gasMonitorChain) return;
   gasMonitorChain = next;
+  gasMonitorVersion++;
+  gasMonitorAttemptAt = 0;
+  gasUsdAttemptAt = 0;
+  gasUsdPrice = null;
+  gasUsdUpdatedAt = 0;
   localStorage.setItem("minter.gasChain", next);
   gasSnapshot = null;
   renderHeaderGas();
@@ -188,7 +213,7 @@ function setGasMonitorChain(chain) {
 
 function ensureGasMonitor() {
   if (!gasMonitorTimer) {
-    gasMonitorTimer = setInterval(() => refreshGasMonitor(false), 5_000);
+    gasMonitorTimer = setInterval(() => refreshGasMonitor(false), 15_000);
   }
   refreshGasMonitor(!gasUsdPrice);
 }
@@ -380,6 +405,9 @@ function explorerTxUrlLocal(chain, txHash) {
     megaeth: "https://mega.etherscan.io/tx/",
     "4326": "https://mega.etherscan.io/tx/",
     robinhood: "https://robinhoodchain.blockscout.com/tx/",
+    arc_testnet: "https://testnet.arcscan.app/tx/",
+    "arc-testnet": "https://testnet.arcscan.app/tx/",
+    "5042002": "https://testnet.arcscan.app/tx/",
     "robinhood_chain": "https://robinhoodchain.blockscout.com/tx/",
     "4663": "https://robinhoodchain.blockscout.com/tx/",
     ink: "https://explorer.inkonchain.com/tx/",
@@ -2161,6 +2189,7 @@ async function loadSettings() {
   $("set-rpc-base").value = s.rpcUrlBase || "";
   $("set-rpc-polygon").value = s.rpcUrlPolygon || "";
   $("set-rpc-robinhood").value = s.rpcUrlRobinhood || "";
+  $("set-rpc-arc-testnet").value = s.rpcUrlArcTestnet || "";
   $("set-rpc-arbitrum").value = s.rpcUrlArbitrum || "";
   $("set-rpc-optimism").value = s.rpcUrlOptimism || "";
   $("set-rpc-ink").value = s.rpcUrlInk || "";
@@ -2221,6 +2250,7 @@ $("btn-save-settings").addEventListener("click", async () => {
       rpcUrlBase: $("set-rpc-base").value,
       rpcUrlPolygon: $("set-rpc-polygon").value,
       rpcUrlRobinhood: $("set-rpc-robinhood").value,
+      rpcUrlArcTestnet: $("set-rpc-arc-testnet").value,
       rpcUrlArbitrum: $("set-rpc-arbitrum").value,
       rpcUrlOptimism: $("set-rpc-optimism").value,
       rpcUrlInk: $("set-rpc-ink").value,
@@ -2908,6 +2938,26 @@ function rawSelectedChain() {
   return ($("raw-chain")?.value || "").trim();
 }
 
+function nativeSymbolForChain(chain) {
+  return ({arc_testnet: "USDC", "arc-testnet": "USDC", polygon: "POL", matic: "POL", bsc: "BNB", avalanche: "AVAX", apechain: "APE", monad: "MON"})[chain] || "ETH";
+}
+
+function updateNativeCurrencyLabels() {
+  const rawSymbol = nativeSymbolForChain(rawSelectedChain());
+  for (const id of ["raw-price-label", "raw-mode-hint", "raw-value-label"]) {
+    const node = $(id);
+    if (node) node.textContent = node.textContent.replace(/\b(?:ETH|USDC|POL|BNB|AVAX|APE|MON)\b/g, rawSymbol);
+  }
+  const amountLabel = document.querySelector('[data-i18n="disperse.amount"]');
+  if (amountLabel) amountLabel.textContent = `Сумма на кошелёк (${nativeSymbolForChain($("disp-chain")?.value)})`;
+  const sweepSymbol = nativeSymbolForChain($("sweep-eth-chain")?.value);
+  if ($("sweep-tab-eth")) $("sweep-tab-eth").textContent = sweepSymbol;
+  if ($("btn-sweep-eth")) $("btn-sweep-eth").textContent = `Sweep ${sweepSymbol}`;
+}
+document.addEventListener("change", event => {
+  if (["raw-chain", "disp-chain", "sweep-eth-chain"].includes(event.target?.id)) updateNativeCurrencyLabels();
+});
+
 /** @type {Map<string, {eth:string, ok:boolean}>} */
 let rawBalanceMap = new Map();
 /** @type {object|null} */
@@ -3097,7 +3147,7 @@ function fillRawAdapterPhases(row) {
           ? formatUnixLocal(phase.startTime)
           : "WAIT";
     const blocked = phase.disabledReason ? ` · ${phase.disabledReason}` : "";
-    option.textContent = `${phase.label} · ${phase.valueEth} ETH total · ${state}${blocked}`;
+    option.textContent = `${phase.label} · ${phase.valueEth} ${nativeSymbolForChain(rawSelectedChain())} total · ${state}${blocked}`;
     if (index === recommended && phase.selectable) option.selected = true;
     select.appendChild(option);
   });
@@ -3134,7 +3184,7 @@ async function runRawProbe() {
       if (row.ok && (row.valueEth || row.totalMinted != null)) {
         const bits = [];
         if (row.phaseType) bits.push(row.phaseType);
-        if (row.valueEth) bits.push(`~${row.valueEth} ETH`);
+        if (row.valueEth) bits.push(`~${row.valueEth} ${nativeSymbolForChain(rawSelectedChain())}`);
         if (row.totalMinted != null && row.maxSupply)
           bits.push(`${row.totalMinted}/${row.maxSupply}`);
         if (row.collectorFeeEth) bits.push(`fee ${row.collectorFeeEth}`);
@@ -3187,7 +3237,7 @@ async function filterRawWalletsByBalance(wallets) {
       }
       const info = rawBalanceMap.get(addrKey(cb.value));
       if (info) {
-        badge.textContent = info.eth + " ETH";
+        badge.textContent = info.eth + " " + nativeSymbolForChain(rawSelectedChain());
         badge.classList.toggle("ok", info.ok);
         badge.classList.toggle("low", !info.ok);
       }
@@ -3242,7 +3292,7 @@ async function loadRawWallets() {
         : true;
       const bal = rawBalanceMap.get(addrKey(w.address));
       const balHtml = bal
-        ? `<span class="raw-bal ${bal.ok ? "ok" : "low"}">${escapeHtml(bal.eth)} ETH</span>`
+        ? `<span class="raw-bal ${bal.ok ? "ok" : "low"}">${escapeHtml(bal.eth)} ${nativeSymbolForChain(rawSelectedChain())}</span>`
         : "";
       row.innerHTML = `<input type="checkbox" class="raw-wallet-cb" value="${escapeHtml(w.address)}" ${
         checked ? "checked" : ""
@@ -3849,7 +3899,7 @@ async function runRawMintOnce() {
     lines: [
       `${chain} · ${wallets.length} wallet(s)`,
       contract,
-      `${fn} · ${valueEth} ETH`,
+      `${fn} · ${valueEth} ${nativeSymbolForChain(rawSelectedChain())}`,
     ],
   });
   if (!liveGate.ok) {
@@ -3981,6 +4031,7 @@ async function runRawSniperOnce() {
       return;
     }
   }
+  updateNativeCurrencyLabels();
   syncRawTimeoutHidden();
   let timeoutSecs = parseInt($("raw-timeout")?.value || "1800", 10);
   if (!Number.isFinite(timeoutSecs) || timeoutSecs < 30) timeoutSecs = 1800;
@@ -4000,7 +4051,7 @@ async function runRawSniperOnce() {
   let params = splitTopLevelParams($("raw-params")?.value || "");
   if (preset === "auto") params = []; // core builds verified adapter calldata
 
-  let payHint = `~${valueEth} ETH`;
+  let payHint = `~${valueEth} ${nativeSymbolForChain(rawSelectedChain())}`;
   const gasHint = [
     gas.priorityFeeGwei ? `prio ${gas.priorityFeeGwei} gwei` : "prio auto",
     gas.maxFeeGwei ? `max ${gas.maxFeeGwei} gwei` : null,
@@ -4279,7 +4330,7 @@ let disperseQuoteSeq = 0;
 
 function disperseMoney(eth, usd) {
   if (eth == null) return "—";
-  return `${eth} ETH${usd != null ? ` · $${usd}` : ""}`;
+  return `${eth} ${nativeSymbolForChain($("disp-chain")?.value)}${usd != null ? ` · $${usd}` : ""}`;
 }
 
 function scheduleDisperseQuote({ chain, from, to, amountEth }) {
@@ -4367,9 +4418,9 @@ function updateDisperseSummary() {
   if (card) {
     card.classList.remove("hidden");
     const line = $("disp-total-line");
-    if (line) line.textContent = `${to.length} × ${weiToEthStr(wei)} ETH`;
+    if (line) line.textContent = `${to.length} × ${weiToEthStr(wei)} ${nativeSymbolForChain($("disp-chain")?.value)}`;
     const amtEl = $("disp-total-amt");
-    if (amtEl) amtEl.textContent = `${weiToEthStr(total)} ETH`;
+    if (amtEl) amtEl.textContent = `${weiToEthStr(total)} ${nativeSymbolForChain($("disp-chain")?.value)}`;
     const gasEl = $("disp-total-gas");
     if (gasEl) gasEl.textContent = "calculating from live RPC…";
     const sumEl = $("disp-total-sum");
@@ -4544,7 +4595,7 @@ $("btn-disperse")?.addEventListener("click", async () => {
     lines: [
       `Chain: ${chain}`,
       `From: ${from}`,
-      `${to.length} destination(s) × ${amountEth} ETH`,
+      `${to.length} destination(s) × ${amountEth} ${nativeSymbolForChain($("disp-chain")?.value)}`,
     ],
   });
   if (!liveGate.ok) {
@@ -4553,8 +4604,8 @@ $("btn-disperse")?.addEventListener("click", async () => {
   }
   if (out) {
     out.textContent = dry
-      ? `Dry-run disperse: ${from.slice(0, 10)}… → ${to.length} wallet(s) × ${amountEth} ETH…`
-      : `LIVE disperse: ${from.slice(0, 10)}… → ${to.length} wallet(s) × ${amountEth} ETH…`;
+      ? `Dry-run disperse: ${from.slice(0, 10)}… → ${to.length} wallet(s) × ${amountEth} ${nativeSymbolForChain($("disp-chain")?.value)}…`
+      : `LIVE disperse: ${from.slice(0, 10)}… → ${to.length} wallet(s) × ${amountEth} ${nativeSymbolForChain($("disp-chain")?.value)}…`;
   }
   if ($("btn-disperse")) $("btn-disperse").disabled = true;
   try {
@@ -4782,6 +4833,8 @@ function moneyPair(native, usd, symbol = "ETH") {
 }
 
 function resetTaskCostQuote(message = null) {
+  taskCostQuoteSeq++;
+  clearTimeout(taskCostQuoteTimer);
   activeTaskCostQuote = null;
   const ids = ["task-cost-gas", "task-cost-mint", "task-cost-fee", "task-cost-total", "task-cost-required", "task-cost-required-total"];
   ids.forEach((id) => { if ($(id)) $(id).textContent = "—"; });
@@ -4808,7 +4861,7 @@ function renderTaskCostQuote(quote) {
     ? (getLang() === "ru" ? `по ${quote.gasSampleCount} реальным минтам коллекции` : `${quote.gasSampleCount} real collection mints`)
     : quote.gasSource === "manual"
       ? (getLang() === "ru" ? "ручной gas limit" : "manual gas limit")
-      : (getLang() === "ru" ? "истории нет · показан безопасный резерв" : "no history · safe reserve shown");
+      : (getLang() === "ru" ? "истории нет · предварительная оценка, не точная комиссия" : "no history · preliminary estimate, not an exact fee");
   $("task-cost-source").textContent = source;
   $("task-cost-source").title = `Gas limit ${quote.gasLimit.toLocaleString()} · fee cap ×${quote.feeCapMultiplier}`;
   const ready = $("task-cost-ready");
@@ -4833,10 +4886,16 @@ async function refreshTaskCostQuote(force = false) {
   }
   const chainChoice = $("task-chain")?.value || "auto";
   const chain = chainChoice === "auto" ? lastLoadedPhases.chain : chainChoice;
+  const normalizeChain = value => ({mainnet: "ethereum", eth: "ethereum", matic: "polygon", robinhood_chain: "robinhood", "robinhood-chain": "robinhood", "arc-testnet": "arc_testnet"})[value] || value;
+  if (normalizeChain(chain) !== normalizeChain(lastLoadedPhases.chain)) {
+    resetTaskCostQuote("Сеть не совпадает с сетью коллекции");
+    return null;
+  }
   const gasMode = $("task-gas-mode")?.value === "manual" ? "manual" : "auto";
   const input = {
     chain,
     contract: lastLoadedPhases.contract || "",
+    stageType: lastLoadedPhases.stages.find(s => s.index === meta.phaseIndex)?.stageType || null,
     walletAddresses: wallets,
     walletQuantities: collectTaskWalletQuantities() || {},
     defaultQuantity: Math.max(1, Number($("wizard-qty")?.value) || 1),
@@ -4847,7 +4906,7 @@ async function refreshTaskCostQuote(force = false) {
   const seq = ++taskCostQuoteSeq;
   if ($("task-cost-source")) $("task-cost-source").textContent = getLang() === "ru" ? "Считаю по сети и кошелькам…" : "Calculating network and wallets…";
   const quote = await invokeSafe("mint_cost_quote", { input }, { quiet: !force });
-  if (seq !== taskCostQuoteSeq) return activeTaskCostQuote;
+  if (seq !== taskCostQuoteSeq) return null;
   if (!quote) {
     resetTaskCostQuote(getLang() === "ru" ? "Не удалось получить расчёт" : "Could not calculate quote");
     return null;
@@ -4858,6 +4917,7 @@ async function refreshTaskCostQuote(force = false) {
 }
 
 function scheduleTaskCostQuote() {
+  taskCostQuoteSeq++;
   if (taskCostQuoteTimer) clearTimeout(taskCostQuoteTimer);
   taskCostQuoteTimer = setTimeout(() => refreshTaskCostQuote(false), 450);
 }
@@ -5322,6 +5382,9 @@ let taskModalPreselect = null;
 let taskGroupFilter = "all";
 
 async function openTaskModal(opts = {}) {
+  phaseLoadVersion++;
+  loadedPhaseInput = null;
+  clearTimeout(wlDebounce);
   const mode = opts.mode || "create";
   taskModalMode = mode;
   taskModalEditId = opts.taskId || null;
@@ -5487,8 +5550,12 @@ async function loadTaskModalWallets(preselect) {
  * badge toggle is switched on.
  */
 let wlDebounce = null;
+let phaseLoadVersion = 0;
+let loadedPhaseInput = null;
 function autoLoadWlForSlug() {
   const slug = ($("wizard-slug")?.value || "").trim();
+  const version = phaseLoadVersion;
+  clearTimeout(wlDebounce);
   if (!slug) {
     taskWlAddresses = null;
     taskWlFilterActive = false;
@@ -5499,6 +5566,7 @@ function autoLoadWlForSlug() {
   wlDebounce = setTimeout(async () => {
     try {
       const phases = await invoke("load_wl_for_slug", { slug });
+      if (version !== phaseLoadVersion || slug !== ($("wizard-slug")?.value || "").trim() || lastLoadedPhases?.walletEligibility) return;
       taskWlPhases = Array.isArray(phases) && phases.length ? phases : null;
       applyWlForSelectedPhase();
     } catch (e) {
@@ -5534,7 +5602,22 @@ function wlStageKeyOf(stage) {
  * phase chosen yet (auto) the union is shown, and the badge says so.
  */
 function applyWlForSelectedPhase() {
-  if (!taskWlPhases) {
+  if (lastLoadedPhases?.walletEligibility) {
+    const stage = lastLoadedPhases.stages.find(s => String(s.index) === $("wizard-phase")?.value);
+    const publicPhase = stage && ["PUBLIC", "PUBLIC_SALE"].includes(stage.stageType);
+    const answers = lastLoadedPhases.walletEligibility[stage?.index] || {};
+    taskWlAddresses = publicPhase ? null : new Set(Object.entries(answers).filter(([, v]) => v === true).map(([a]) => addrKey(a)));
+    taskWlPhases = null; // saved checker data must not replace fresh answers
+    taskWlPhaseLabel = wlStageKeyOf(stage) || "";
+    taskWlFilterActive = false;
+    taskModalPreselect = null;
+    taskModalChecked = new Set(taskModalWalletCache.filter(w => publicPhase || answers[addrKey(w.address)] === true).map(w => addrKey(w.address)));
+    taskModalSeeded = true;
+    renderTaskModalWalletList();
+    updateWlBadge(taskWlAddresses?.size || 0);
+    return;
+  }
+  if (!taskWlPhases && !lastLoadedPhases?.walletEligibility) {
     taskWlAddresses = null;
     taskWlPhaseLabel = "";
     taskWlFilterActive = false;
@@ -5589,7 +5672,7 @@ function applyWlForSelectedPhase() {
 
 // Re-narrow whenever the operator changes the target phase.
 $("wizard-phase")?.addEventListener("change", () => {
-  if (taskWlPhases) applyWlForSelectedPhase();
+  applyWlForSelectedPhase();
   scheduleTaskCostQuote();
 });
 
@@ -5635,6 +5718,18 @@ $("task-wl-badge")?.addEventListener("click", () => {
 });
 
 $("wizard-slug")?.addEventListener("input", () => {
+  phaseLoadVersion++;
+  loadedPhaseInput = null;
+  lastLoadedPhases = null;
+  taskWlPhases = null;
+  taskWlAddresses = null;
+  taskWlFilterActive = false;
+  clearTimeout(wlDebounce);
+  resetTaskCostQuote();
+  fillPhaseSelect([], null, null);
+  $("phase-hint").textContent = "";
+  $("btn-load-phases").disabled = false;
+  renderTaskModalWalletList();
   // Only meaningful once the modal has wallets loaded.
   if (taskModalWalletCache.length) autoLoadWlForSlug();
 });
@@ -5792,7 +5887,8 @@ function renderTaskModalWalletList() {
       row.style.height = TASK_WALLET_ROW_H + "px";
       row.style.padding = "4px 8px";
       const key = addrKey(w.address);
-      const checked = taskModalChecked.has(key);
+      const allowed = taskWalletAllowed(w.address);
+      const checked = allowed && taskModalChecked.has(key);
       const g = walletGroupOf(w.address);
       const gBadge = g ? ` [${g}]` : "";
       const wlTag =
@@ -5820,6 +5916,11 @@ function renderTaskModalWalletList() {
         <span class="task-wallet-address">${w.index}. ${escapeHtml(shortAddr(w.address))}${escapeHtml(gBadge)}${wlTag}</span>
         <select class="task-wallet-proxy" data-address="${escapeHtml(w.address)}" aria-label="Proxy route">${routeOptions}</select>`;
       const walletCheckbox = row.querySelector("input");
+      walletCheckbox.disabled = !allowed;
+      if (!allowed) {
+        const answer = lastLoadedPhases?.walletEligibility?.[$("wizard-phase")?.value]?.[key];
+        row.title = answer === false ? "Нет допуска к выбранной фазе" : "Допуск не подтверждён: нужна повторная проверка фаз";
+      }
       walletCheckbox.addEventListener("change", (e) => {
         if (e.target.checked) taskModalChecked.add(key);
         else taskModalChecked.delete(key);
@@ -5886,7 +5987,7 @@ document.addEventListener("click", (e) => {
     } else {
       taskModalChecked = new Set();
       for (const w of taskModalWalletCache) {
-        if (walletGroupOf(w.address) === taskGroupFilter) {
+        if (walletGroupOf(w.address) === taskGroupFilter && taskWalletAllowed(w.address)) {
           taskModalChecked.add(addrKey(w.address));
         }
       }
@@ -5899,6 +6000,13 @@ document.addEventListener("click", (e) => {
   }
 });
 
+function taskWalletAllowed(address) {
+  if (!lastLoadedPhases?.walletEligibility) return true;
+  const stage = lastLoadedPhases.stages.find(s => String(s.index) === $("wizard-phase")?.value);
+  if (stage && ["PUBLIC", "PUBLIC_SALE"].includes(stage.stageType)) return true;
+  return lastLoadedPhases.walletEligibility[stage?.index]?.[addrKey(address)] === true;
+}
+
 function selectedTaskWallets() {
   // Prefer virtual checked set when present
   if (taskModalChecked && taskModalChecked.size) {
@@ -5908,9 +6016,9 @@ function selectedTaskWallets() {
     );
     return [...taskModalChecked]
       .map((k) => byKey.get(k))
-      .filter(Boolean);
+      .filter(address => address && taskWalletAllowed(address));
   }
-  return [...document.querySelectorAll(".task-wallet-cb:checked")].map((cb) => cb.value);
+  return [...document.querySelectorAll(".task-wallet-cb:checked")].map((cb) => cb.value).filter(taskWalletAllowed);
 }
 
 function collectTaskProxyRoutes(wallets) {
@@ -6141,7 +6249,7 @@ $("task-wallets-all")?.addEventListener("change", (e) => {
   if (taskModalFiltered.length) {
     for (const w of taskModalFiltered) {
       const k = addrKey(w.address);
-      if (on) taskModalChecked.add(k);
+      if (on && taskWalletAllowed(w.address)) taskModalChecked.add(k);
       else taskModalChecked.delete(k);
     }
     renderTaskModalWalletList();
@@ -6196,7 +6304,7 @@ $("task-modal-save")?.addEventListener("click", async () => {
   if (gasMode === "manual") {
     gasLimit = Math.max(21000, Number($("task-gas-limit")?.value) || 250000);
   }
-  if (!lastLoadedPhases?.stages?.length) {
+  if (!lastLoadedPhases?.stages?.length || loadedPhaseInput !== slug) {
     $("wizard-msg").textContent =
       "Load phases before saving so the exact price and phase status are locked";
     return;
@@ -6292,6 +6400,11 @@ $("task-modal-save")?.addEventListener("click", async () => {
 // —— Mint phases picker (in create-task modal) ——
 $("btn-load-phases")?.addEventListener("click", async () => {
   const slug = $("wizard-slug").value.trim();
+  const version = ++phaseLoadVersion;
+  clearTimeout(wlDebounce);
+  loadedPhaseInput = null;
+  lastLoadedPhases = null;
+  resetTaskCostQuote();
   if (!slug) {
     $("wizard-msg").textContent = "Enter collection slug first";
     return;
@@ -6299,12 +6412,15 @@ $("btn-load-phases")?.addEventListener("click", async () => {
   $("btn-load-phases").disabled = true;
   $("phase-hint").textContent = "Loading phases…";
   try {
-    const walletAddresses = selectedTaskWallets();
+    // Check all loaded wallets so switching phase does not require the separate WL checker.
+    const walletAddresses = taskModalWalletCache.map(w => w.address);
     if (!walletAddresses.length) {
       throw new Error("Select at least one wallet before loading phases");
     }
     const r = await invoke("list_drop_phases", { slug, walletAddresses });
+    if (version !== phaseLoadVersion || slug !== $("wizard-slug").value.trim()) return;
     lastLoadedPhases = r;
+    loadedPhaseInput = slug;
     setGasMonitorChain(r.chain);
     const rawNetwork = String(r.chain || "").toLowerCase();
     const normalizedNetwork = ({
@@ -6318,8 +6434,8 @@ $("btn-load-phases")?.addEventListener("click", async () => {
       (option) => option.value.toLowerCase() === normalizedNetwork
     );
     if (networkOption) $("task-chain").value = networkOption.value;
-    const prev = $("wizard-phase")?.value;
-    fillPhaseSelect(r.stages, r.recommendedIndex, prev === "" ? null : prev);
+    fillPhaseSelect(r.stages, r.recommendedIndex, null);
+    applyWlForSelectedPhase();
     const selectedStage = (r.stages || []).find((stage) => stage.index === r.recommendedIndex);
     const selectedLabel = selectedStage
       ? `#${selectedStage.index + 1} ${selectedStage.label || selectedStage.stageType}`
@@ -6332,10 +6448,11 @@ $("btn-load-phases")?.addEventListener("click", async () => {
     $("wizard-msg").textContent = "Phases loaded";
     await refreshTaskCostQuote(false);
   } catch (e) {
+    if (version !== phaseLoadVersion) return;
     $("phase-hint").textContent = "";
     $("wizard-msg").textContent = String(e);
   } finally {
-    $("btn-load-phases").disabled = false;
+    if (version === phaseLoadVersion) $("btn-load-phases").disabled = false;
   }
 });
 

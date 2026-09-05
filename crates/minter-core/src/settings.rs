@@ -26,6 +26,7 @@ pub struct Settings {
     pub rpc_url_base: String,
     pub rpc_url_polygon: String,
     pub rpc_url_robinhood: String,
+    pub rpc_url_arc_testnet: String,
     pub rpc_url_arbitrum: String,
     pub rpc_url_optimism: String,
     pub rpc_url_ink: String,
@@ -85,6 +86,7 @@ impl Default for Settings {
             rpc_url_base: String::new(),
             rpc_url_polygon: String::new(),
             rpc_url_robinhood: String::new(),
+            rpc_url_arc_testnet: String::new(),
             rpc_url_arbitrum: String::new(),
             rpc_url_optimism: String::new(),
             rpc_url_ink: String::new(),
@@ -127,6 +129,7 @@ pub const MANAGED_CONNECTION_ENV_KEYS: &[&str] = &[
     "RPC_URL_POLYGON",
     "POLYGON_RPC_URL",
     "RPC_URL_ROBINHOOD",
+    "RPC_URL_ARC_TESTNET",
     "RPC_URL_ARBITRUM",
     "RPC_URL_OPTIMISM",
     "RPC_URL_INK",
@@ -179,6 +182,7 @@ impl Settings {
         self.rpc_url_base.clear();
         self.rpc_url_polygon.clear();
         self.rpc_url_robinhood.clear();
+        self.rpc_url_arc_testnet.clear();
         self.rpc_url_arbitrum.clear();
         self.rpc_url_optimism.clear();
         self.rpc_url_ink.clear();
@@ -253,6 +257,9 @@ impl Settings {
         }
         if let Some(v) = take(&self.rpc_url_robinhood, &["RPC_URL_ROBINHOOD"]) {
             self.rpc_url_robinhood = v;
+        }
+        if let Some(v) = take(&self.rpc_url_arc_testnet, &["RPC_URL_ARC_TESTNET"]) {
+            self.rpc_url_arc_testnet = v;
         }
         if let Some(v) = take(&self.rpc_url_arbitrum, &["RPC_URL_ARBITRUM"]) {
             self.rpc_url_arbitrum = v;
@@ -641,6 +648,12 @@ impl Settings {
                 self.rpc_url_robinhood.trim().to_string(),
             );
         }
+        if !self.rpc_url_arc_testnet.trim().is_empty() {
+            m.insert(
+                "RPC_URL_ARC_TESTNET".to_string(),
+                self.rpc_url_arc_testnet.trim().to_string(),
+            );
+        }
         if !self.rpc_url_arbitrum.trim().is_empty() {
             m.insert(
                 "RPC_URL_ARBITRUM".to_string(),
@@ -752,6 +765,7 @@ impl Settings {
             || !self.rpc_url_base.trim().is_empty()
             || !self.rpc_url_polygon.trim().is_empty()
             || !self.rpc_url_robinhood.trim().is_empty()
+            || !self.rpc_url_arc_testnet.trim().is_empty()
             || !self.rpc_url_arbitrum.trim().is_empty()
             || !self.rpc_url_optimism.trim().is_empty()
             || !self.rpc_url_ink.trim().is_empty()

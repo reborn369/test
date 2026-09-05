@@ -1081,7 +1081,7 @@ async fn fetch_and_parse_gql(
         opensea::MintActionRoute::Short => log_always(
             reporter,
             format!(
-                "[{}] OpenSea SHORT OK {}ms hash={}вЂ¦{}",
+                "[{}] OpenSea SHORT RESPONSE {}ms hash={}вЂ¦{}",
                 sign::shorten_address(addr),
                 fetch.short_ms.unwrap_or(gql_ms),
                 &opensea::MINT_ACTION_TIMELINE_HASH[..8],
@@ -1091,7 +1091,7 @@ async fn fetch_and_parse_gql(
         opensea::MintActionRoute::FullFallbackExpired => log_always(
             reporter,
             format!(
-                "[{}] OpenSea SHORT HASH EXPIRED {}ms -> FULL FALLBACK OK {}ms (total={}ms)",
+                "[{}] OpenSea SHORT HASH EXPIRED {}ms -> FULL FALLBACK RESPONSE {}ms (total={}ms)",
                 sign::shorten_address(addr),
                 fetch.short_ms.unwrap_or_default(),
                 fetch.full_ms.unwrap_or_default(),
@@ -1101,7 +1101,7 @@ async fn fetch_and_parse_gql(
         opensea::MintActionRoute::FullHashDisabled => log_always(
             reporter,
             format!(
-                "[{}] OpenSea SHORT DISABLED (expired precheck) -> FULL FALLBACK OK {}ms",
+                "[{}] OpenSea SHORT DISABLED (expired precheck) -> FULL FALLBACK RESPONSE {}ms",
                 sign::shorten_address(addr),
                 fetch.full_ms.unwrap_or(gql_ms)
             ),
@@ -1123,7 +1123,7 @@ async fn fetch_and_parse_gql(
             reporter,
             quiet,
             format!(
-                "[{}] GQL fetch OK {}ms (saved {})",
+                "[{}] GQL RESPONSE {}ms (saved {})",
                 sign::shorten_address(addr),
                 gql_ms,
                 debug_file
@@ -1134,14 +1134,36 @@ async fn fetch_and_parse_gql(
             reporter,
             quiet,
             format!(
-                "[{}] GQL fetch OK {}ms",
+                "[{}] GQL RESPONSE {}ms",
                 sign::shorten_address(addr),
                 gql_ms,
             ),
         );
     }
 
-    let tx_data = opensea::extract_opensea_action_tx(&resp)?;
+    let tx_data = match opensea::extract_opensea_action_tx(&resp) {
+        Ok(data) => {
+            log_always(
+                reporter,
+                format!(
+                    "[{}] OpenSea CALLDATA RECEIVED (not yet sent)",
+                    sign::shorten_address(addr)
+                ),
+            );
+            data
+        }
+        Err(error) => {
+            log_always(
+                reporter,
+                format!(
+                    "[{}] OpenSea ACTION REJECTED (no transaction sent): {}",
+                    sign::shorten_address(addr),
+                    error
+                ),
+            );
+            return Err(error);
+        }
+    };
     let to_addr: alloy_primitives::Address = tx_data
         .get("to")
         .and_then(|v| v.as_str())
@@ -2628,7 +2650,8 @@ async fn run_opensea_mint_inner(
                         let available = wallet_stage
                             .and_then(|s| opensea::available_mint_quantity(&wallet_info, s))
                             .unwrap_or(requested);
-                        let wallet_quantity = requested.min(available);
+                        let wallet_quantity =
+                            opensea::admitted_mint_quantity(&wallet_info, wallet_stage, requested);
                         let msg = if wallet_quantity == 0 {
                             Some(format!(
                                 "[{}] selected phase available=0, skipping wallet",

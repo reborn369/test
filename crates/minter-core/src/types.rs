@@ -37,6 +37,9 @@ pub fn chain_id_map() -> HashMap<&'static str, u64> {
     m.insert("robinhood", 4663);
     m.insert("robinhood_chain", 4663);
     m.insert("robinhood-chain", 4663);
+    // Only the officially documented Arc Testnet. Never alias this to mainnet.
+    m.insert("arc_testnet", 5042002);
+    m.insert("arc-testnet", 5042002);
     m
 }
 
@@ -58,6 +61,7 @@ pub enum ChainId {
     Monad = 143,
     MegaEth = 4326,
     Robinhood = 4663,
+    ArcTestnet = 5042002,
 }
 
 impl ChainId {
@@ -79,6 +83,7 @@ impl ChainId {
             143 => Some(Self::Monad),
             4326 => Some(Self::MegaEth),
             4663 => Some(Self::Robinhood),
+            5042002 => Some(Self::ArcTestnet),
             _ => None,
         }
     }
@@ -105,6 +110,7 @@ impl ChainId {
             Self::Monad => "monad",
             Self::MegaEth => "megaeth",
             Self::Robinhood => "robinhood",
+            Self::ArcTestnet => "arc_testnet",
         }
     }
 
@@ -126,6 +132,7 @@ impl ChainId {
             Self::Monad,
             Self::MegaEth,
             Self::Robinhood,
+            Self::ArcTestnet,
         ]
     }
 }
@@ -139,6 +146,14 @@ impl fmt::Display for ChainId {
 #[cfg(test)]
 mod chain_id_tests {
     use super::*;
+
+    #[test]
+    fn arc_testnet_is_explicit_and_roundtrips() {
+        assert_eq!(ChainId::from_id(5042002), Some(ChainId::ArcTestnet));
+        assert_eq!(ChainId::ArcTestnet.name(), "arc_testnet");
+        assert_eq!(chain_id_map().get("arc-testnet"), Some(&5042002));
+        assert!(!chain_id_map().contains_key("arc"));
+    }
 
     #[test]
     fn arbitrum_nova_roundtrip() {

@@ -38,6 +38,12 @@ jobs:
         with:
           workspaces: ". -> target"
 
+      - name: UI regression tests
+        run: node --test scripts/audit-ui.cjs
+
+      - name: Core regression tests
+        run: cargo test -p minter-core --lib
+
       - name: Build
         run: |
           cargo build -p minter-desktop --release

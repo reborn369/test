@@ -474,7 +474,7 @@ fn consume_mint_launch(
     let key = format!("{task_id}:{launch_id}");
     if !state.consumed_mint_launches.lock().insert(key) {
         return Err(
-            "Duplicate task launch blocked — use Run again and explicitly re-arm the task".into(),
+            "Duplicate task launch blocked — start the task again to create a fresh launch".into(),
         );
     }
     Ok(())
@@ -915,6 +915,26 @@ async fn wallet_balances(
         .wallet_balances(addrs, chain.as_deref())
         .await
         .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WalletNftCountsInput {
+    wallet_addresses: Option<Vec<String>>,
+    chain: String,
+}
+
+#[tauri::command]
+async fn wallet_nft_counts(
+    state: State<'_, Arc<AppState>>,
+    input: WalletNftCountsInput,
+) -> Result<Vec<minter_core::WalletNftCountRow>, String> {
+    let _slot = net_slot(&state).await?;
+    let session = state.session.lock().clone();
+    session
+        .wallet_nft_counts(input.wallet_addresses, &input.chain)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -2769,6 +2789,7 @@ pub fn run() {
             import_keys_text,
             list_proxies,
             wallet_balances,
+            wallet_nft_counts,
             probe_networks,
             warm_rpc_latency,
             measure_fire_lag,
@@ -3277,13 +3298,13 @@ mod tests {
     }
 
     #[test]
-    fn task_ui_consumes_launch_and_requires_explicit_rearm() {
+    fn task_ui_consumes_launch_and_rearms_on_normal_start() {
         let app = include_str!("../../ui/app.js");
         assert!(app.contains("task.launchConsumed = true;"));
         assert!(app.contains("taskId: task.id"));
         assert!(app.contains("launchId: task.launchId"));
-        assert!(app.contains("requireWord: \"RERUN\""));
-        assert!(app.contains("Blocked duplicate launch"));
+        assert!(app.contains("task.launchId = newTaskLaunchId();"));
+        assert!(!app.contains("btn-task-rearm"));
         assert!(app.contains("hasLaunchConsumed"));
         assert!(app.contains("status === \"done\" || status === \"error\""));
     }

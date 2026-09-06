@@ -324,6 +324,15 @@ pub struct WalletBalanceRow {
     pub chain: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletNftCountRow {
+    pub address: String,
+    pub count: Option<usize>,
+    pub error: Option<String>,
+    pub chain: String,
+}
+
 /// Live, read-only Disperse cost preview using the same RPC/gas policy as the
 /// eventual dry/live run. All monetary strings are display values; transaction
 /// amounts remain integer wei inside core.
@@ -911,6 +920,81 @@ impl Session {
                         chain: chain_label.clone(),
                     });
                 }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// NFT inventory count for selected wallets. This is an explicit refresh,
+    /// never a background poll, and runs with bounded concurrency.
+    pub async fn wallet_nft_counts(
+        &self,
+        wallet_addresses: Option<Vec<String>>,
+        chain: &str,
+    ) -> Result<Vec<WalletNftCountRow>> {
+        if self.signers.is_empty() {
+            bail!("No wallets unlocked");
+        }
+        if chain.trim().is_empty() {
+            bail!("Network required for NFT count");
+        }
+        let rpc = self.rpc_client_for_chain(chain)?;
+        let chain_id = rpc.chain_id().await.context("NFT count chainId")?;
+        if let Some(expected) = Self::expected_chain_id(chain)
+            && chain_id != expected
+        {
+            bail!(
+                "RPC chainId {chain_id} does not match selected network {} (expected {expected})",
+                chain.trim()
+            );
+        }
+        let filter: Option<std::collections::HashSet<String>> =
+            wallet_addresses.and_then(|values| {
+                let set = values
+                    .into_iter()
+                    .map(|address| normalize_address(&address))
+                    .filter(|address| address.len() > 2)
+                    .collect::<std::collections::HashSet<_>>();
+                (!set.is_empty()).then_some(set)
+            });
+        let api_key = self.settings.alchemy_api_key.trim().to_string();
+        let slots = Arc::new(tokio::sync::Semaphore::new(12));
+        let mut jobs = tokio::task::JoinSet::new();
+        for signer in &self.signers {
+            let address = signer.address();
+            let address_string = format!("{address:?}");
+            if filter
+                .as_ref()
+                .is_some_and(|set| !set.contains(&normalize_address(&address_string)))
+            {
+                continue;
+            }
+            let rpc = rpc.clone();
+            let api_key = api_key.clone();
+            let slots = slots.clone();
+            let chain = chain.trim().to_ascii_lowercase();
+            jobs.spawn(async move {
+                let _slot = slots.acquire_owned().await.ok();
+                let key = (!api_key.is_empty()).then_some(api_key.as_str());
+                let result = crate::sweep::count_wallet_assets(&rpc, chain_id, address, key).await;
+                WalletNftCountRow {
+                    address: address_string,
+                    count: result.as_ref().ok().copied(),
+                    error: result.err().map(|error| error.to_string()),
+                    chain,
+                }
+            });
+        }
+        let mut rows = Vec::new();
+        while let Some(joined) = jobs.join_next().await {
+            match joined {
+                Ok(row) => rows.push(row),
+                Err(error) => rows.push(WalletNftCountRow {
+                    address: String::new(),
+                    count: None,
+                    error: Some(format!("NFT count worker failed: {error}")),
+                    chain: chain.trim().to_ascii_lowercase(),
+                }),
             }
         }
         Ok(rows)

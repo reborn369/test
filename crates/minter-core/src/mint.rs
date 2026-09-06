@@ -4755,24 +4755,60 @@ async fn run_opensea_mint_inner(
                 }
 
                 let send_start = std::time::Instant::now();
-                if !was_pre_signed {
-                    report_wallet(reporter.as_ref(),
-                        &addr,
-                        Some(WalletStatus::Sent),
-                        Some("broadcasting...".into()),
-                        None,
-                        None,
-                    );
-                }
+                // The signed hash is known before an RPC acknowledges its HTTP
+                // response. Surface it immediately so the UI cannot lag behind
+                // a transaction that is already in the mempool or a block.
+                report_wallet(reporter.as_ref(),
+                    &addr,
+                    Some(WalletStatus::Sent),
+                    Some(if was_pre_signed {
+                        "broadcasting prepared tx...".into()
+                    } else {
+                        "broadcasting...".into()
+                    }),
+                    Some(signed_hash),
+                    None,
+                );
                 // Report form (not `race_send`) so the accepting endpoint is
                 // named in the log and the wallet row. Which node actually took
                 // the transaction is the one fact that tells a paid endpoint
                 // apart from the public fallback under real load.
-                let send_result = if ink_broadcast {
-                    rpc.send_raw_transaction_ink_report(&raw, wallet_lane)
-                        .await
-                } else {
-                    rpc.send_raw_transaction_report(&raw).await
+                let send_future = async {
+                    if ink_broadcast {
+                        rpc.send_raw_transaction_ink_report(&raw, wallet_lane).await
+                    } else {
+                        rpc.send_raw_transaction_report(&raw).await
+                    }
+                };
+                tokio::pin!(send_future);
+
+                // Fast acknowledgements keep the existing zero-extra-read path.
+                // Only when an acknowledgement itself is slow do we start one
+                // bounded receipt watcher for the locally-known hash.
+                let mut receipt_before_ack = None;
+                let send_result = tokio::select! {
+                    result = &mut send_future => result,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(600)) => {
+                        tokio::select! {
+                            result = &mut send_future => result,
+                            receipt = rpc.wait_for_receipt(&signed_hash, 120) => {
+                                match receipt {
+                                    Ok(value) => {
+                                        receipt_before_ack = Some(value);
+                                        Ok(crate::rpc::SendReport {
+                                            hash: signed_hash,
+                                            winner: "chain receipt before RPC ack".into(),
+                                            nodes_tried: 0,
+                                            http_attempts: 0,
+                                            winner_latency_ms: send_start.elapsed().as_millis() as u64,
+                                            losers: Vec::new(),
+                                        })
+                                    }
+                                    Err(_) => send_future.await,
+                                }
+                            }
+                        }
+                    }
                 };
                 let tx_hash = match send_result {
                     Ok(send_report) => {
@@ -5064,6 +5100,17 @@ async fn run_opensea_mint_inner(
                     sign::shorten_address(&addr),
                     mint_started_at.elapsed().as_millis(),
                     sign::shorten_hash(&tx_hash)));
+
+                if let Some(receipt) = receipt_before_ack {
+                    let info = crate::rpc::parse_receipt(&receipt);
+                    log_always(reporter.as_ref(), format!(
+                        "[{}] RECEIPT BEFORE RPC ACK t+{}ms block={} tx={}",
+                        sign::shorten_address(&addr),
+                        mint_started_at.elapsed().as_millis(),
+                        info.block_number,
+                        sign::shorten_hash(&tx_hash)));
+                    break (addr, receipt_to_result(addr, tx_hash, &info));
+                }
 
                 // Track original + every RBF hash; receipt on any candidate is success.
                 // Seed with every hash this worker broadcast, not just the last
@@ -5405,12 +5452,6 @@ async fn run_opensea_mint_inner(
         reporter.as_ref(),
         format!("Minting with {} wallet worker(s)...", n_workers),
     );
-    report_phase(
-        reporter.as_ref(),
-        "confirm",
-        format!("Waiting for confirmations ({n_workers} wallet(s))…"),
-    );
-
     let mut results: Vec<MintResult> = Vec::new();
     while let Some(res) = handles.join_next().await {
         match res {
@@ -5422,16 +5463,6 @@ async fn run_opensea_mint_inner(
                     Some(format!("gas={:?}", result.gas_used)),
                     result.tx_hash,
                     result.error.clone(),
-                );
-                spawn_auto_sweep_for_confirmed(
-                    &mut auto_sweep_jobs,
-                    &mut auto_sweep_started,
-                    &result,
-                    &auto_sweep_signers,
-                    &rpc,
-                    auto_sweep_contract,
-                    auto_sweep_destination,
-                    &gas_params,
                 );
                 results.push(result);
             }
@@ -5683,9 +5714,11 @@ async fn run_opensea_mint_inner(
         }
     }
 
-    // Reconciliation and Flashbots inclusion can turn a late Sent row into a
-    // confirmed mint after its worker returned. Start those missing sweeps now;
-    // already-started wallets are deduplicated by address.
+    // Auto-sweep is deliberately a post-mint queue. No transfer, receipt fetch
+    // or sweep fee lookup may compete with workers that are still preparing,
+    // broadcasting or confirming their mints. Reconciliation and Flashbots
+    // inclusion have also finished by this point, so the queue contains the
+    // final confirmed set exactly once.
     for result in &results {
         spawn_auto_sweep_for_confirmed(
             &mut auto_sweep_jobs,

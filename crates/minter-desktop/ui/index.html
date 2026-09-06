@@ -184,10 +184,6 @@
                 <button type="button" id="btn-create-task" class="primary" data-i18n="tasks.create">Create task</button>
               </div>
               <p class="muted" data-i18n="tasks.mintHint">Slug → phase → wallets → Start. Bot waits for open and mints fast (fixed gas).</p>
-              <div id="task-queue-bar" class="task-queue-bar hidden">
-                <span id="task-queue-label" class="muted"></span>
-                <button type="button" id="btn-clear-queue" class="danger-btn" data-i18n="tasks.clearQueue">Clear queue</button>
-              </div>
               <div id="task-list" class="task-list">
                 <div class="empty-tasks muted" id="task-list-empty">No tasks yet — create one.</div>
               </div>
@@ -222,6 +218,14 @@
                   <div id="mint-phase-banner" class="mint-phase-banner mint-phase-idle">
                     <span class="mint-phase-emoji" id="mint-phase-emoji">⏸️</span>
                     <span class="mint-phase-text" id="mint-phase-text" data-i18n="tasks.phaseIdle">Ready — Start a task</span>
+                  </div>
+                  <div class="mint-progress-rail" aria-label="Mint progress">
+                    <div class="mint-progress-stat"><span>PREP</span><strong id="task-prep">0</strong></div>
+                    <div class="mint-progress-stat"><span>WAIT</span><strong id="task-wait">0</strong></div>
+                    <div class="mint-progress-stat"><span>DATA</span><strong id="task-data">0</strong></div>
+                    <div class="mint-progress-stat"><span>SENT</span><strong id="task-sent">0</strong></div>
+                    <div class="mint-progress-stat is-ok"><span>OK</span><strong id="task-ok">0</strong></div>
+                    <div class="mint-progress-stat is-fail"><span>FAIL</span><strong id="task-fail">0</strong></div>
                   </div>
                   <div class="table-wrap vtable-wrap" id="mint-table-wrap">
                     <table class="data-table" id="mint-table">
@@ -517,8 +521,13 @@
                 <div class="pick-block">
                   <div class="wallet-pick-head">
                     <span><span data-i18n="disperse.to">To wallets</span> <span id="disp-to-count" class="pick-count"></span></span>
-                    <label class="check tight"><input type="checkbox" id="disp-to-all" checked /> <span data-i18n="tasks.selectAll">Select all</span></label>
+                    <div class="wallet-pick-actions">
+                      <label class="check tight"><input type="checkbox" id="disp-to-all" checked /> <span data-i18n="tasks.selectAll">Select all</span></label>
+                      <button type="button" id="btn-disp-load-file" class="ghost-btn">Load addresses</button>
+                      <button type="button" id="btn-disp-clear-file" class="ghost-btn hidden">Clear file</button>
+                    </div>
                   </div>
+                  <p id="disp-source-hint" class="muted small">Uses wallets selected on the Wallets page.</p>
                   <div id="disp-to-list" class="task-wallet-list muted">Unlock vault to load wallets…</div>
                 </div>
                 <div class="form-grid-2">
@@ -850,7 +859,7 @@
                         <th style="width:38%" data-i18n="col.address">Address</th>
                         <th style="width:52px" data-i18n="wallets.col.group">Grp</th>
                         <th style="width:22%" data-i18n="wallets.col.proxy">Proxy</th>
-                        <th style="width:150px" data-i18n="wallets.col.balance">Balance</th>
+                        <th style="width:230px">Balance · USD · NFT</th>
                       </tr>
                     </thead>
                     <tbody id="wallet-tbody"></tbody>
@@ -1206,9 +1215,11 @@
           <span class="mc-phase-detail muted" id="mc-phase-detail"></span>
         </div>
         <div class="mc-stats" id="mc-stats">
+          <div class="mc-stat"><span class="k">PREP</span><span class="v" id="mc-prep">0</span></div>
           <div class="mc-stat"><span class="k">OK</span><span class="v ok" id="mc-ok">0</span></div>
           <div class="mc-stat"><span class="k">FAIL</span><span class="v fail" id="mc-fail">0</span></div>
           <div class="mc-stat"><span class="k">SENT</span><span class="v" id="mc-sent">0</span></div>
+          <div class="mc-stat"><span class="k">DATA</span><span class="v" id="mc-data">0</span></div>
           <div class="mc-stat"><span class="k">WAIT</span><span class="v" id="mc-wait">0</span></div>
           <div class="mc-stat"><span class="k">TOTAL</span><span class="v" id="mc-total">0</span></div>
         </div>

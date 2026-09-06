@@ -1192,6 +1192,17 @@ async fn discover_wallet_assets(
     bail!("NFT discovery failed: {}", errors.join(" | "))
 }
 
+pub(crate) async fn count_wallet_assets(
+    rpc: &RpcClient,
+    chain_id: u64,
+    owner: Address,
+    alchemy_api_key: Option<&str>,
+) -> Result<usize> {
+    discover_wallet_assets(rpc, chain_id, owner, None, alchemy_api_key)
+        .await
+        .map(|assets| assets.len())
+}
+
 async fn nft_owner_of(rpc: &RpcClient, contract: Address, token_id: U256) -> Result<Address> {
     let mut data = function_selector("ownerOf(uint256)").to_vec();
     data.extend(encode_u256(token_id));

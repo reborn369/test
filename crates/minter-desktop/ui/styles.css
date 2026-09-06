@@ -655,18 +655,6 @@ a:focus-visible,
   text-align: center;
 }
 
-.task-queue-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 8px 12px;
-  margin-bottom: 10px;
-  background: var(--card-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-}
-
 .task-template-select {
   max-width: 180px;
   font-size: 0.85rem;
@@ -2883,6 +2871,25 @@ input[type="checkbox"] {
 
 .wallet-table-align .data-table td {
   vertical-align: middle;
+  padding-top: 5px;
+  padding-bottom: 5px;
+}
+
+.wallet-assets-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.wallet-nft-count {
+  padding: 2px 6px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  color: var(--text);
+  background: var(--card-2);
+  font-size: 0.7rem;
 }
 
 .wallet-table-align .wallet-proxy-sel {
@@ -3314,7 +3321,7 @@ input[type="checkbox"] {
 
 .mc-stats {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(7, 1fr);
   gap: 6px;
 }
 
@@ -3396,7 +3403,7 @@ input[type="checkbox"] {
 }
 
 .mc-overlay.mc-collapsed .mc-stats {
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
 }
 
 .inline-field.tight {
@@ -4335,6 +4342,46 @@ textarea#add-key {
 #wallet-table-wrap.vtable-wrap {
   max-height: min(62vh, 860px);
 }
+
+.wallet-pick-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.mint-progress-rail {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 6px;
+  margin: 0 0 10px;
+}
+
+.mint-progress-stat {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--card-2);
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.mint-progress-stat strong {
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 0.9rem;
+}
+
+.mint-progress-stat.is-ok strong { color: var(--green); }
+.mint-progress-stat.is-fail strong { color: var(--red); }
 
 /* ============================================================
    RPCs page redesign — compact network pills + clean results

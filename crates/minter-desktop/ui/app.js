@@ -1238,7 +1238,7 @@ function paintWalletRow(i) {
   }
   const bal =
     w.balanceEth != null
-      ? `<span class="${w.balanceOk ? "ok" : "warn"}">${escapeHtml(w.balanceEth)} ${escapeHtml(w.nativeSymbol || "ETH")}</span><br><span class="muted small">$${escapeHtml(w.balanceUsd ?? "—")}</span>`
+      ? `<span class="wallet-assets-line"><span class="${w.balanceOk ? "ok" : "warn"}">${escapeHtml(w.balanceEth)} ${escapeHtml(w.nativeSymbol || "ETH")}</span><span class="muted">$${escapeHtml(w.balanceUsd ?? "—")}</span><span class="wallet-nft-count" title="${escapeHtml(w.nftError || "NFTs on selected network")}">NFT ${escapeHtml(w.nftCount ?? "—")}</span></span>`
       : `<span class="muted">—</span>`;
   tr.innerHTML = `
     <td><input type="checkbox" class="wallet-cb" data-addr="${escapeHtml(w.address)}" ${sel ? "checked" : ""} /></td>
@@ -1314,6 +1314,8 @@ async function loadWallets() {
         balanceUsd: w.balanceUsd,
         usdPrice: w.usdPrice,
         nativeSymbol: w.nativeSymbol,
+        nftCount: w.nftCount,
+        nftError: w.nftError,
       }])
   );
   walletData = (list || []).map((w) => {
@@ -1326,6 +1328,8 @@ async function loadWallets() {
       balanceUsd: b?.balanceUsd,
       usdPrice: b?.usdPrice,
       nativeSymbol: b?.nativeSymbol,
+      nftCount: b?.nftCount,
+      nftError: b?.nftError,
     };
   });
   // keep selection only for still-present addresses
@@ -1573,9 +1577,18 @@ $("btn-wallets-balances")?.addEventListener("click", async () => {
     const addrs = walletSelection.size
       ? [...walletSelection]
       : walletData.map((w) => w.address);
-    const rows = await invoke("wallet_balances", {
+    const balancesPromise = invoke("wallet_balances", {
       input: { walletAddresses: addrs, chain },
     });
+    const nftPromise = chain
+      ? invoke("wallet_nft_counts", {
+          input: { walletAddresses: addrs, chain },
+        }).catch((error) => {
+          console.warn("wallet NFT counts", error);
+          return [];
+        })
+      : Promise.resolve([]);
+    const rows = await balancesPromise;
     const map = new Map(rows.map((r) => [addrKey(r.address), r]));
     for (const w of walletData) {
       const r = map.get(addrKey(w.address));
@@ -1586,6 +1599,18 @@ $("btn-wallets-balances")?.addEventListener("click", async () => {
         w.usdPrice = r.usdPrice;
         w.nativeSymbol = r.nativeSymbol || "ETH";
         w.balanceChain = r.chain || chain;
+      }
+    }
+    renderWalletsVirtual();
+    const nftRows = await nftPromise;
+    const nftMap = new Map(
+      nftRows.filter((row) => row.address).map((row) => [addrKey(row.address), row])
+    );
+    for (const w of walletData) {
+      const row = nftMap.get(addrKey(w.address));
+      if (row) {
+        w.nftCount = row.count;
+        w.nftError = row.error || "";
       }
     }
     renderWalletsVirtual();
@@ -4325,6 +4350,7 @@ setTimeout(() => {
 // —— Disperse (1 wallet → many, fixed amount each) ——
 /** @type {Array<{address:string,index:number}>} */
 let disperseWalletCache = [];
+let disperseTempRecipients = [];
 let disperseQuoteTimer = null;
 let disperseQuoteSeq = 0;
 
@@ -4465,10 +4491,13 @@ async function loadDisperseWallets() {
   if (!fromSel || !toBox) return;
   try {
     const list = await invoke("list_wallets");
-    disperseWalletCache = list || [];
+    const selected = new Set([...walletSelection].map(addrKey));
+    disperseWalletCache = (list || []).filter((wallet) =>
+      selected.has(addrKey(wallet.address))
+    );
     const prevFrom = fromSel.value;
     fromSel.innerHTML = `<option value="">${escapeHtml(t("disperse.fromPick") || "— select source —")}</option>`;
-    for (const w of list) {
+    for (const w of disperseWalletCache) {
       const opt = document.createElement("option");
       opt.value = w.address;
       opt.textContent = `${w.index}. ${shortAddr(w.address)}`;
@@ -4476,8 +4505,17 @@ async function loadDisperseWallets() {
     }
     if (prevFrom && [...fromSel.options].some((o) => o.value === prevFrom)) {
       fromSel.value = prevFrom;
-    } else if (list.length) {
-      fromSel.value = list[0].address;
+    } else if (disperseWalletCache.length) {
+      fromSel.value = disperseWalletCache[0].address;
+    }
+    const hint = $("disp-source-hint");
+    if (hint) {
+      hint.textContent = disperseWalletCache.length
+        ? disperseWalletCache.length + " selected vault wallet(s)" +
+          (disperseTempRecipients.length
+            ? " · " + disperseTempRecipients.length + " temporary recipient(s)"
+            : "")
+        : "No vault wallets selected. Select them on Wallets, or load recipient addresses from a file.";
     }
     renderDisperseToList();
     updateDisperseSummary();
@@ -4489,7 +4527,18 @@ async function loadDisperseWallets() {
 function renderDisperseToList() {
   const toBox = $("disp-to-list");
   if (!toBox) return;
-  const list = disperseWalletCache;
+  const vaultKeys = new Set(
+    disperseWalletCache.map((wallet) => addrKey(wallet.address))
+  );
+  const list = disperseWalletCache.concat(
+    disperseTempRecipients
+      .filter((address) => !vaultKeys.has(addrKey(address)))
+      .map((address, index) => ({
+        address,
+        index: "file " + (index + 1),
+        temporary: true,
+      }))
+  );
   const from = ($("disp-from")?.value || "").toLowerCase();
   if (!list.length) {
     toBox.innerHTML = `<div class="muted" style="padding:8px">${escapeHtml(t("wallets.empty"))}</div>`;
@@ -4506,7 +4555,9 @@ function renderDisperseToList() {
     if (String(w.address).toLowerCase() === from) continue;
     const row = document.createElement("label");
     row.className = "task-wallet-row";
-    const checked = keepPrev ? prev.has(String(w.address).toLowerCase()) : true;
+    const checked = keepPrev
+      ? prev.has(String(w.address).toLowerCase()) || !!w.temporary
+      : true;
     row.innerHTML = `<input type="checkbox" class="disp-to-cb" value="${escapeHtml(w.address)}" ${
       checked ? "checked" : ""
     } />
@@ -4832,6 +4883,38 @@ function moneyPair(native, usd, symbol = "ETH") {
   return `${usd != null ? `$${usd} · ` : ""}${nativeText} ${symbol}`;
 }
 
+$("btn-disp-load-file")?.addEventListener("click", async () => {
+  try {
+    const picked = await invoke("pick_file", {
+      title: "Load disperse recipient addresses",
+      filters: ["txt", "csv", "*"],
+    });
+    if (!picked?.token) return;
+    const text = await invoke("read_text_file", { token: picked.token });
+    const matches = String(text || "").match(/0x[0-9a-fA-F]{40}/g) || [];
+    const unique = new Map(matches.map((address) => [addrKey(address), address]));
+    disperseTempRecipients = [...unique.values()];
+    $("btn-disp-clear-file")?.classList.toggle(
+      "hidden",
+      disperseTempRecipients.length === 0
+    );
+    await loadDisperseWallets();
+    if ($("disp-out")) {
+      $("disp-out").textContent = disperseTempRecipients.length
+        ? "Loaded " + disperseTempRecipients.length + " temporary recipient address(es)"
+        : "No valid 0x wallet addresses found in the selected file";
+    }
+  } catch (error) {
+    if ($("disp-out")) $("disp-out").textContent = String(error);
+  }
+});
+
+$("btn-disp-clear-file")?.addEventListener("click", async () => {
+  disperseTempRecipients = [];
+  $("btn-disp-clear-file")?.classList.add("hidden");
+  await loadDisperseWallets();
+});
+
 function resetTaskCostQuote(message = null) {
   taskCostQuoteSeq++;
   clearTimeout(taskCostQuoteTimer);
@@ -4925,12 +5008,9 @@ function scheduleTaskCostQuote() {
 let vaultAddrSet = new Set();
 /** @type {any} */
 let lastUiStatus = null;
-/** FIFO queue of task ids waiting to run */
-let taskQueue = [];
 let tasksLoaded = false;
 let persistTimer = null;
 let countdownTimer = null;
-let queueProcessing = false;
 
 const TASK_TEMPLATES = {
   // "sniper" key kept for old saved UI state; product name is Standard mint
@@ -6075,7 +6155,6 @@ function renderTaskList() {
   if (!list) return;
   reconcileTaskRunState();
   list.innerHTML = "";
-  updateQueueBar();
   if (!mintTasks.length) {
     list.innerHTML = `<div class="empty-tasks muted" id="task-list-empty">${escapeHtml(
       t("tasks.empty") || "No tasks yet — create one."
@@ -6090,7 +6169,6 @@ function renderTaskList() {
     const isActiveRun = task.id === activeTaskId;
     const canStart =
       !isActiveRun &&
-      !task.launchConsumed &&
       disp !== "running" &&
       disp !== "queued" &&
       disp !== "blocked" &&
@@ -6117,11 +6195,6 @@ function renderTaskList() {
     const fbLab = task.useFlashbots ? "FB" : "";
     const atLab = task.atTime ? `at ${String(task.atTime).slice(0, 16)}` : "";
     const cd = formatCountdown(task.phaseStartAt);
-    const qPos = taskQueue.indexOf(task.id);
-    const qBadge =
-      qPos >= 0
-        ? `<span class="badge accent-badge">Q${qPos + 1}</span>`
-        : "";
     const blockLine =
       disp === "blocked" && reasons.length
         ? `<div class="task-card-block">${escapeHtml(reasons[0])}</div>`
@@ -6135,7 +6208,6 @@ function renderTaskList() {
           <span class="status-pill status-${statusPillClass(disp)}">${escapeHtml(
             disp
           )}</span>
-          ${qBadge}
           <span class="badge muted-badge task-countdown" data-start="${
             task.phaseStartAt != null ? task.phaseStartAt : ""
           }">${escapeHtml(cd)}</span>
@@ -6154,9 +6226,7 @@ function renderTaskList() {
         ${blockLine}
       </div>
       <div class="task-card-actions">
-        <button type="button" class="primary ${task.launchConsumed ? "btn-task-rearm" : "btn-task-start"}" data-id="${escapeHtml(task.id)}" ${
-          task.launchConsumed ? (busy ? "disabled" : "") : (canStart ? "" : "disabled")
-        } title="${escapeHtml(task.launchConsumed ? "This task already ran. Re-arm it before another LIVE launch." : (reasons[0] || ""))}">${escapeHtml(task.launchConsumed ? "Run again…" : t("tasks.start"))}</button>
+        <button type="button" class="primary btn-task-start" data-id="${escapeHtml(task.id)}" ${canStart ? "" : "disabled"} title="${escapeHtml(reasons[0] || "")}">${escapeHtml(t("tasks.start"))}</button>
         <button type="button" class="btn-task-edit" data-id="${escapeHtml(task.id)}" ${
           busy ? "disabled" : ""
         }>${escapeHtml(t("tasks.edit") || "Edit")}</button>
@@ -6171,9 +6241,6 @@ function renderTaskList() {
   }
   list.querySelectorAll(".btn-task-start").forEach((btn) => {
     btn.addEventListener("click", () => requestStartTask(btn.dataset.id));
-  });
-  list.querySelectorAll(".btn-task-rearm").forEach((btn) => {
-    btn.addEventListener("click", () => requestRearmTask(btn.dataset.id));
   });
   list.querySelectorAll(".btn-task-edit").forEach((btn) => {
     btn.addEventListener("click", () =>
@@ -6199,33 +6266,12 @@ function renderTaskList() {
       // Unstick zombie running before remove
       if (tk && tk.status === "running") tk.status = "ready";
       mintTasks = mintTasks.filter((x) => x.id !== id);
-      taskQueue = taskQueue.filter((q) => q !== id);
       schedulePersistTasks();
       renderTaskList();
     });
   });
   ensureCountdownTimer();
   syncMissionControlActions();
-}
-
-function updateQueueBar() {
-  const bar = $("task-queue-bar");
-  const lab = $("task-queue-label");
-  if (!bar || !lab) return;
-  if (!taskQueue.length && !activeTaskId) {
-    hide(bar);
-    return;
-  }
-  show(bar);
-  const parts = [];
-  if (activeTaskId) {
-    const a = mintTasks.find((x) => x.id === activeTaskId);
-    parts.push(`${t("tasks.running") || "Running"}: ${a?.name || activeTaskId}`);
-  }
-  if (taskQueue.length) {
-    parts.push(`${t("tasks.queued") || "Queued"}: ${taskQueue.length}`);
-  }
-  lab.textContent = parts.join(" · ");
 }
 
 $("btn-create-task")?.addEventListener("click", () => openTaskModal({ mode: "create" }));
@@ -6260,16 +6306,6 @@ $("task-wallets-all")?.addEventListener("change", (e) => {
   }
   scheduleTaskCostQuote();
 });
-$("btn-clear-queue")?.addEventListener("click", () => {
-  for (const id of taskQueue) {
-    const tk = mintTasks.find((x) => x.id === id);
-    if (tk && tk.status === "queued") tk.status = "ready";
-  }
-  taskQueue = [];
-  renderTaskList();
-  appendMintLog(t("tasks.queueCleared") || "Queue cleared");
-});
-
 $("task-template")?.addEventListener("change", (e) => {
   const key = e.target.value;
   e.target.value = "";
@@ -6463,7 +6499,7 @@ let mintRowOrder = [];
 function ensureMintRow(addr) {
   const key = addr || "_";
   if (mintRows.has(key)) return mintRows.get(key);
-  const row = { address: addr || "-", status: "WAIT", detail: "", tx: "", error: "" };
+  const row = { address: addr || "-", status: "PREP", detail: "", tx: "", error: "" };
   mintRows.set(key, row);
   mintRowOrder.push(key);
   return row;
@@ -6496,6 +6532,9 @@ function statusBadge(status) {
   } else if (st.includes("WAIT")) {
     kind = "wait";
     label = "WAIT";
+  } else if (st.includes("PREP")) {
+    kind = "wait";
+    label = "PREP";
   }
   return { kind, label };
 }
@@ -6843,6 +6882,8 @@ function countMintStatuses() {
   let fail = 0;
   let sent = 0;
   let wait = 0;
+  let data = 0;
+  let prep = 0;
   for (const key of mintRowOrder) {
     const row = mintRows.get(key);
     if (!row) continue;
@@ -6850,9 +6891,11 @@ function countMintStatuses() {
     if (st.includes("CONFIRM") || st === "OK") ok++;
     else if (st.includes("FAIL") || st.includes("CANCEL")) fail++;
     else if (st.includes("SENT") || st.includes("PEND")) sent++;
-    else wait++;
+    else if (st.includes("WAIT")) wait++;
+    else if (st.includes("CALL") || st.includes("DATA") || st.includes("SIM")) data++;
+    else prep++;
   }
-  return { ok, fail, sent, wait, total: mintRowOrder.length };
+  return { ok, fail, sent, wait, data, prep, total: mintRowOrder.length };
 }
 
 function updateMcStats() {
@@ -6865,7 +6908,15 @@ function updateMcStats() {
   set("mc-fail", c.fail);
   set("mc-sent", c.sent);
   set("mc-wait", c.wait);
+  set("mc-data", c.data);
+  set("mc-prep", c.prep);
   set("mc-total", c.total);
+  set("task-ok", c.ok);
+  set("task-fail", c.fail);
+  set("task-sent", c.sent);
+  set("task-wait", c.wait);
+  set("task-data", c.data);
+  set("task-prep", c.prep);
 }
 
 function scheduleMcStats() {
@@ -6926,6 +6977,7 @@ function setMintPhaseBanner(phase, label) {
     wait: "⏳",
     fire: "🚀",
     confirm: "📡",
+    sweep: "↗",
     done: "✅",
     error: "❌",
   };
@@ -7200,7 +7252,6 @@ function setMintUiRunning(running) {
     lab.classList.toggle("is-running", running || mintStopping);
   }
   syncMissionControlActions();
-  updateQueueBar();
   renderTaskList();
 }
 
@@ -7247,39 +7298,17 @@ $("btn-warm-auth")?.addEventListener("click", async () => {
   }
 });
 
-/**
- * Re-arm is deliberately separate from Start. A stray/replayed click can at
- * most open this dialog; it cannot spend gas without the operator typing the
- * explicit word and then pressing Start again.
- */
-async function requestRearmTask(taskId) {
-  const task = mintTasks.find((x) => x.id === taskId);
-  if (!task || !task.launchConsumed || activeTaskId || taskStartInFlight) return;
-  const ok = await openConfirmModal({
-    title: "Run this task again?",
-    body: `«${task.name}» has already been launched once. Re-arming permits another LIVE mint and another gas spend.`,
-    lines: ["This does not start the mint yet. After re-arming, press Start."],
-    requireWord: "RERUN",
-    okLabel: "Re-arm task",
-  });
-  if (!ok) return;
-  task.launchId = newTaskLaunchId();
-  task.launchConsumed = false;
-  task.status = "ready";
-  task.lastError = null;
-  task.updatedAt = nowMs();
-  schedulePersistTasks();
-  renderTaskList();
-  appendMintLog(`Task «${task.name}» explicitly re-armed; press Start to launch it again`);
-}
-
-/** Enqueue if busy, else start (LIVE path may require type-LIVE confirm). */
+/** Start when idle; a second active mint is rejected instead of queued. */
 function requestStartTask(taskId) {
   const task = mintTasks.find((x) => x.id === taskId);
   if (!task) return;
   if (task.launchConsumed) {
-    showToast("This task already ran — use Run again… to re-arm it", "warn");
-    return;
+    // A fresh launch id keeps the backend replay guard, while the normal Start
+    // button remains usable after a completed/cancelled run.
+    task.launchId = newTaskLaunchId();
+    task.launchConsumed = false;
+    task.status = "ready";
+    task.lastError = null;
   }
   if (task.status === "running" || task.status === "queued") return;
   // A start is already being set up (pre-flight awaits) — ignore the extra click.
@@ -7294,41 +7323,11 @@ function requestStartTask(taskId) {
     renderTaskList();
     return;
   }
-  if (activeTaskId || queueProcessing || mintStopping) {
-    if (taskQueue.includes(taskId)) return;
-    // Prefer toast when engine busy (single-flight)
-    if (activeTaskId || mintStopping) {
-      showToast(t("tasks.busy") || "Mint already running — wait or Stop first", "warn");
-    }
-    task.status = "queued";
-    taskQueue.push(taskId);
-    appendMintLog(`Queued «${task.name}» (position ${taskQueue.length})`);
-    renderTaskList();
+  if (activeTaskId || mintStopping) {
+    showToast(t("tasks.busy") || "Mint already running — wait or Stop first", "warn");
     return;
   }
-  startMintTask(taskId, { fromQueue: false });
-}
-
-async function processQueue() {
-  if (queueProcessing || activeTaskId) return;
-  if (!taskQueue.length) {
-    renderTaskList();
-    return;
-  }
-  queueProcessing = true;
-  try {
-    while (taskQueue.length) {
-      const nextId = taskQueue.shift();
-      const task = mintTasks.find((x) => x.id === nextId);
-      if (!task) continue;
-      task.status = "ready";
-      // Do not re-enter processQueue from startMintTask
-      await startMintTask(nextId, { fromQueue: true });
-    }
-  } finally {
-    queueProcessing = false;
-    renderTaskList();
-  }
+  startMintTask(taskId);
 }
 
 /**
@@ -7339,13 +7338,12 @@ async function processQueue() {
  * future start.
  *
  * @param {string} taskId
- * @param {{ fromQueue?: boolean }} opts
  */
-async function startMintTask(taskId, opts = {}) {
+async function startMintTask(taskId) {
   if (taskStartInFlight) return;
   taskStartInFlight = true;
   try {
-    await startMintTaskInner(taskId, opts);
+    await startMintTaskInner(taskId);
   } finally {
     taskStartInFlight = false;
   }
@@ -7353,18 +7351,16 @@ async function startMintTask(taskId, opts = {}) {
 
 /**
  * @param {string} taskId
- * @param {{ fromQueue?: boolean }} opts
  */
-async function startMintTaskInner(taskId, opts = {}) {
-  const fromQueue = !!opts.fromQueue;
+async function startMintTaskInner(taskId) {
   const task = mintTasks.find((x) => x.id === taskId);
   if (!task) return;
   if (task.launchConsumed) {
-    appendMintLog(`Blocked duplicate launch of «${task.name}»`);
-    return;
+    task.launchId = newTaskLaunchId();
+    task.launchConsumed = false;
   }
   if (activeTaskId) {
-    if (!fromQueue) requestStartTask(taskId);
+    requestStartTask(taskId);
     return;
   }
   const reasons = computeBlockReasons({ ...task, status: "ready" });
@@ -7444,7 +7440,6 @@ async function startMintTaskInner(taskId, opts = {}) {
       if (!cont) {
         task.status = "ready";
         renderTaskList();
-        if (!fromQueue) setTimeout(() => processQueue(), 0);
         return;
       }
     }
@@ -7485,7 +7480,6 @@ async function startMintTaskInner(taskId, opts = {}) {
   if (!liveGate.ok) {
     task.status = "ready";
     renderTaskList();
-    if (!fromQueue) setTimeout(() => processQueue(), 0);
     return;
   }
 
@@ -7534,7 +7528,7 @@ async function startMintTaskInner(taskId, opts = {}) {
         slug: task.slug,
         taskId: task.id,
         launchId: task.launchId,
-        launchSource: fromQueue ? "queue" : "manual",
+        launchSource: "manual",
         quantity: task.quantity,
         dryRun: false,
         phaseIndex: task.phaseIndex,
@@ -7625,7 +7619,6 @@ async function startMintTaskInner(taskId, opts = {}) {
     syncMissionControlActions();
     scheduleMcStats();
     renderTaskList();
-    if (!fromQueue) setTimeout(() => processQueue(), 50);
   }
 }
 

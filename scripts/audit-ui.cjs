@@ -68,19 +68,21 @@ test('manually injected ineligible checked keys cannot get into a saved task', (
   const {c} = environment(); c.taskModalChecked = new Set(['0xaa', '0xbb', '0xcc']);
   assert.deepEqual(Array.from(c.selectedTaskWallets()), ['0xaa']);
 });
-test('one simulated hour: 240 snapshots, 12 prices; repeated UI refresh adds no requests', async () => {
+test('one simulated hour: 60 snapshots, 2 prices; repeated UI refresh adds no requests', async () => {
   const {c, calls, advance, timers} = environment();
-  for (let i = 0; i < 240; i++) {
-    await c.refreshGasMonitor(); c.ensureGasMonitor(); c.ensureGasMonitor(); advance(15000);
+  await c.refreshGasMonitor(true);
+  for (let i = 1; i < 60; i++) {
+    advance(60000); await c.refreshGasMonitor(); c.ensureGasMonitor(); c.ensureGasMonitor();
   }
-  assert.equal(calls.length, 240);
-  assert.equal(calls.filter(x => x.includeUsd).length, 12);
+  assert.equal(calls.length, 60);
+  assert.equal(calls.filter(x => x.includeUsd).length, 2);
   assert.equal(timers.length, 1);
 });
 test('missing price does not retry each gas tick; locked app makes no requests', async () => {
   const {c, calls, advance} = environment();
   c.invokeSafe = async (method, args) => {calls.push(args); return {};};
-  for (let i = 0; i < 20; i++) {await c.refreshGasMonitor(); advance(15000);}
+  await c.refreshGasMonitor(true);
+  for (let i = 1; i < 20; i++) {advance(60000); await c.refreshGasMonitor();}
   assert.equal(calls.filter(x => x.includeUsd).length, 1);
   c.lastUiStatus.unlocked = false; await c.refreshGasMonitor(); assert.equal(calls.length, 20);
 });

@@ -148,6 +148,17 @@ async fn send_prebuilt_raw_attempt(
 }
 
 impl RpcClient {
+    /// Prefer chain/public endpoints for read-only work while keeping Alchemy
+    /// as a fallback. Transaction broadcast order is intentionally unchanged.
+    pub fn prefer_non_alchemy_reads(&self) -> Self {
+        let mut cloned = self.clone();
+        cloned.urls.sort_by_key(|url| {
+            let lower = url.to_ascii_lowercase();
+            usize::from(lower.contains("alchemy.com") || lower.contains("alchemyapi.io"))
+        });
+        cloned
+    }
+
     pub fn new(urls: Vec<String>) -> Self {
         Self::new_with_proxy(urls, None).expect("failed to create HTTP client")
     }
@@ -1499,6 +1510,18 @@ pub fn parse_receipt(receipt: &serde_json::Value) -> ReceiptInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_client_keeps_alchemy_as_fallback() {
+        let client = RpcClient::new(vec![
+            "https://eth-mainnet.g.alchemy.com/v2/key".to_string(),
+            "https://rpc.example.org".to_string(),
+        ]);
+        let reads = client.prefer_non_alchemy_reads();
+        assert_eq!(reads.urls[0], "https://rpc.example.org");
+        assert!(reads.urls[1].contains("alchemy.com"));
+        assert!(client.urls[0].contains("alchemy.com"));
+    }
 
     #[test]
     fn parse_successful_receipt() {

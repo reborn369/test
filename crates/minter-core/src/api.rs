@@ -855,7 +855,8 @@ impl Session {
         let rpc = match chain.map(str::trim).filter(|c| !c.is_empty()) {
             Some(c) => self.rpc_client_for_chain(c)?,
             None => self.rpc_client()?,
-        };
+        }
+        .prefer_non_alchemy_reads();
         let native_symbol = native_symbol_for_chain(chain).to_string();
         // One price request per explicit balance refresh, never per wallet.
         let usd_price = if self.settings.alchemy_api_key.trim().is_empty() {
@@ -938,7 +939,7 @@ impl Session {
         if chain.trim().is_empty() {
             bail!("Network required for NFT count");
         }
-        let rpc = self.rpc_client_for_chain(chain)?;
+        let rpc = self.rpc_client_for_chain(chain)?.prefer_non_alchemy_reads();
         let chain_id = rpc.chain_id().await.context("NFT count chainId")?;
         if let Some(expected) = Self::expected_chain_id(chain)
             && chain_id != expected
@@ -3206,10 +3207,10 @@ impl Session {
         static CACHE: OnceLock<crate::preview_cache::PreviewCache<(U256, U256)>> = OnceLock::new();
         let urls = collect_rpc_urls_for_chain(&self.env, Some(chain), &[]);
         let key = format!("{chain}:{urls:?}");
-        let rpc = self.rpc_client_for_chain(chain)?;
+        let rpc = self.rpc_client_for_chain(chain)?.prefer_non_alchemy_reads();
         CACHE
             .get_or_init(Default::default)
-            .get(key, std::time::Duration::from_secs(15), || {
+            .get(key, std::time::Duration::from_secs(55), || {
                 rpc.fee_history()
             })
             .await

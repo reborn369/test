@@ -137,8 +137,8 @@ function gasHeaderMarkup() {
 function renderHeaderGas() {
   const cell = $("header-gas-value");
   if (cell) {
-    const stale = gasSnapshot && Date.now() - gasSnapshot.updatedAtMs > 45_000;
-    const stalePrice = gasUsdPrice != null && Date.now() - gasUsdUpdatedAt > 360_000;
+    const stale = gasSnapshot && Date.now() - gasSnapshot.updatedAtMs > 120_000;
+    const stalePrice = gasUsdPrice != null && Date.now() - gasUsdUpdatedAt > 1_900_000;
     cell.innerHTML = gasHeaderMarkup() + (stale || stalePrice ? ' <span class="warn">(устарело)</span>' : '');
   }
 }
@@ -168,13 +168,13 @@ function refreshVisibleTaskGasCost() {
 async function refreshGasMonitor(forceUsd = false) {
   if (gasMonitorBusy || !lastUiStatus?.unlocked) return;
   renderHeaderGas();
-  if (Date.now() - gasMonitorAttemptAt < 15_000) return;
+  if (Date.now() - gasMonitorAttemptAt < 60_000) return;
   gasMonitorAttemptAt = Date.now();
   const version = gasMonitorVersion;
   const chain = gasMonitorChain;
   gasMonitorBusy = true;
   try {
-    const includeUsd = Date.now() - gasUsdAttemptAt >= 300_000;
+    const includeUsd = forceUsd || Date.now() - gasUsdAttemptAt >= 1_800_000;
     if (includeUsd) gasUsdAttemptAt = Date.now();
     const snapshot = await invokeSafe(
       "network_fee_snapshot",
@@ -213,7 +213,7 @@ function setGasMonitorChain(chain) {
 
 function ensureGasMonitor() {
   if (!gasMonitorTimer) {
-    gasMonitorTimer = setInterval(() => refreshGasMonitor(false), 15_000);
+    gasMonitorTimer = setInterval(() => refreshGasMonitor(false), 60_000);
   }
   refreshGasMonitor(!gasUsdPrice);
 }

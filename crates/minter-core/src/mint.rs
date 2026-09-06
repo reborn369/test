@@ -829,6 +829,32 @@ fn validate_seadrop_public_state(
     Ok(state.mint_price)
 }
 
+fn clamp_public_quantities(
+    state: &SeaDropPublicState,
+    default_quantity: &mut u32,
+    wallet_quantities: &mut HashMap<Address, u32>,
+) -> Option<(u32, u32, usize)> {
+    if state.max_total_mintable_by_wallet == 0 {
+        return None;
+    }
+    let limit = state.max_total_mintable_by_wallet.min(u64::from(u32::MAX)) as u32;
+    let old_default = *default_quantity;
+    *default_quantity = (*default_quantity).min(limit).max(1);
+    let mut changed_wallets = 0usize;
+    for value in wallet_quantities.values_mut() {
+        let clamped = (*value).min(limit).max(1);
+        if clamped != *value {
+            *value = clamped;
+            changed_wallets += 1;
+        }
+    }
+    (old_default != *default_quantity || changed_wallets > 0).then_some((
+        old_default,
+        *default_quantity,
+        changed_wallets,
+    ))
+}
+
 fn rebuild_local_public_wallets(
     wallets: &mut [WalletAuth],
     wallet_quantities: &HashMap<Address, u32>,
@@ -1795,6 +1821,10 @@ async fn run_opensea_mint_inner(
         }
         Err(e) => log_always(reporter.as_ref(), format!("RPC probe failed: {}", e)),
     }
+    // Routine reads use the chain/public endpoint first to avoid spending paid
+    // Alchemy CUs. Alchemy remains the fallback, while transaction broadcasts
+    // keep the latency-ranked order above.
+    let read_rpc = rpc.prefer_non_alchemy_reads();
 
     let actual_chain_id = rpc
         .chain_id()
@@ -1889,7 +1919,7 @@ async fn run_opensea_mint_inner(
     let selected_before_early_gate = signers.len();
     let mut balance_handles = Vec::with_capacity(signers.len());
     for (index, signer) in signers.iter().enumerate() {
-        let rpc = rpc.clone();
+        let rpc = read_rpc.clone();
         let address = signer.address();
         balance_handles.push(tokio::spawn(async move {
             (index, address, rpc.balance(&address).await)
@@ -2890,7 +2920,7 @@ async fn run_opensea_mint_inner(
         if !w.auth_ok {
             continue;
         }
-        let rpc = rpc.clone();
+        let rpc = read_rpc.clone();
         let addr = w.address;
         nonce_handles.push(tokio::spawn(async move {
             let result = rpc.nonce(&addr).await;
@@ -2932,7 +2962,7 @@ async fn run_opensea_mint_inner(
     // This is the one fee snapshot used by both the balance gate and signing.
     // Keeping those values identical prevents a wallet from passing preparation
     // with a cheaper fee than the transaction eventually carries.
-    let fee_snapshot = rpc
+    let fee_snapshot = read_rpc
         .fee_history()
         .await
         .unwrap_or((U256::from(1_000_000_000u64), U256::from(1_000_000_000u64)));
@@ -2957,7 +2987,7 @@ async fn run_opensea_mint_inner(
             if !w.auth_ok {
                 continue;
             }
-            let rpc = rpc.clone();
+            let rpc = read_rpc.clone();
             let addr = w.address;
             let qty = wallet_quantities.get(&addr).copied().unwrap_or(quantity);
             let val = price_wei * U256::from(qty);
@@ -3151,6 +3181,7 @@ async fn run_opensea_mint_inner(
         let mut short_probe_started = false;
         let mut gql_warm_started = false;
         let mut fee_refreshed = false;
+        let mut launch_state_refreshed = false;
         let mut last_printed = -1i64;
         let prefetch_lead_ms = if conditional_submit_enabled {
             5_000u64.max(conditional_lead_ms.saturating_add(3_000))
@@ -3223,8 +3254,11 @@ async fn run_opensea_mint_inner(
             let fee_refresh_lead_ms = 5_000u64.max(conditional_fee_lead_ms) as i64;
             if !fee_refreshed && remaining_ms <= fee_refresh_lead_ms {
                 fee_refreshed = true;
-                match tokio::time::timeout(std::time::Duration::from_millis(900), rpc.fee_history())
-                    .await
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(900),
+                    read_rpc.fee_history(),
+                )
+                .await
                 {
                     Ok(Ok((base_fee, network_priority))) => {
                         if let Ok((fresh_max, fresh_priority)) =
@@ -3256,6 +3290,131 @@ async fn run_opensea_mint_inner(
                         "WARN: pre-fire gas refresh timed out; keeping prepared fees".to_string(),
                     ),
                 }
+            }
+
+            // Refresh pending nonces just before the final signing pass. This
+            // is early enough to finish for a large wallet set, but late enough
+            // that a transaction made while the task was waiting cannot leave
+            // every prepared signature stale. Public SeaDrop terms are checked
+            // in the same window so a last-second wallet-limit reduction is
+            // clamped instead of aborting the entire task.
+            let launch_refresh_lead_ms = 2_000u64.max(if conditional_submit_enabled {
+                conditional_lead_ms.saturating_add(1_500)
+            } else {
+                0
+            }) as i64;
+            if !launch_state_refreshed && remaining_ms <= launch_refresh_lead_ms {
+                launch_state_refreshed = true;
+
+                let state_job = if stage_type_owned == "PUBLIC_SALE" {
+                    let state_rpc = rpc.clone();
+                    let seadrop = seadrop_address.clone();
+                    let contract = nft_contract.to_string();
+                    Some(tokio::spawn(async move {
+                        tokio::time::timeout(
+                            std::time::Duration::from_millis(900),
+                            read_seadrop_public_state(&state_rpc, seadrop.as_deref(), &contract),
+                        )
+                        .await
+                    }))
+                } else {
+                    None
+                };
+
+                let mut nonce_jobs = Vec::new();
+                for wallet in wallets.iter().filter(|wallet| wallet.auth_ok) {
+                    let nonce_rpc = read_rpc.clone();
+                    let address = wallet.address;
+                    nonce_jobs.push(tokio::spawn(async move {
+                        let result = tokio::time::timeout(
+                            std::time::Duration::from_millis(900),
+                            nonce_rpc.nonce(&address),
+                        )
+                        .await;
+                        (address, result)
+                    }));
+                }
+
+                let mut nonce_ok = 0usize;
+                let mut nonce_changed = 0usize;
+                let mut nonce_failed = 0usize;
+                for job in nonce_jobs {
+                    match job.await {
+                        Ok((address, Ok(Ok(fresh_nonce)))) => {
+                            if let Some(wallet) =
+                                wallets.iter_mut().find(|wallet| wallet.address == address)
+                            {
+                                if wallet.nonce != fresh_nonce {
+                                    wallet.nonce = fresh_nonce;
+                                    wallet.pre_signed_tx = None;
+                                    wallet.conditional_hash = None;
+                                    nonce_changed += 1;
+                                }
+                                nonce_ok += 1;
+                            }
+                        }
+                        _ => nonce_failed += 1,
+                    }
+                }
+
+                if let Some(state_job) = state_job {
+                    match state_job.await {
+                        Ok(Ok(Ok(state))) => {
+                            if let Some((old, new, changed_wallets)) = clamp_public_quantities(
+                                &state,
+                                &mut quantity,
+                                &mut wallet_quantities,
+                            ) {
+                                log_always(
+                                    reporter.as_ref(),
+                                    format!(
+                                        "  SeaDrop wallet limit changed: requested {old}, current {new}; reduced {changed_wallets} per-wallet value(s), continuing"
+                                    ),
+                                );
+                            }
+                            price_wei = validate_seadrop_public_state(
+                                &state,
+                                expected_unit_price_wei,
+                                quantity,
+                                start_ts,
+                            )?;
+                            fee_recipient =
+                                resolve_public_fee_recipient(&state, fee_recipient.as_deref())?;
+                            rebuild_local_public_wallets(
+                                &mut wallets,
+                                &wallet_quantities,
+                                quantity,
+                                nft_contract,
+                                price_wei,
+                                seadrop_address.as_deref(),
+                                fee_recipient.as_deref(),
+                            )?;
+                        }
+                        Ok(Ok(Err(error))) => log_always(
+                            reporter.as_ref(),
+                            format!(
+                                "WARN: final SeaDrop terms refresh failed; keeping verified terms: {error}"
+                            ),
+                        ),
+                        Ok(Err(_)) => log_always(
+                            reporter.as_ref(),
+                            "WARN: final SeaDrop terms refresh timed out; keeping verified terms"
+                                .to_string(),
+                        ),
+                        Err(error) => log_always(
+                            reporter.as_ref(),
+                            format!(
+                                "WARN: final SeaDrop terms refresh worker failed; keeping verified terms: {error}"
+                            ),
+                        ),
+                    }
+                }
+                log_always(
+                    reporter.as_ref(),
+                    format!(
+                        "  Final nonce refresh: {nonce_ok} OK, {nonce_changed} changed, {nonce_failed} kept previous"
+                    ),
+                );
             }
 
             let left = remaining_ms.saturating_add(999) / 1000;
@@ -3494,6 +3653,16 @@ async fn run_opensea_mint_inner(
                 )
                 .await
                 .context("SeaDrop state check timed out outside the T0 hot path")??;
+                if let Some((old, new, changed_wallets)) =
+                    clamp_public_quantities(&state, &mut quantity, &mut wallet_quantities)
+                {
+                    log_always(
+                        reporter.as_ref(),
+                        format!(
+                            "  SeaDrop wallet limit: requested {old}, current {new}; reduced {changed_wallets} per-wallet value(s)"
+                        ),
+                    );
+                }
                 let verified_price = validate_seadrop_public_state(
                     &state,
                     expected_unit_price_wei,
@@ -3709,6 +3878,16 @@ async fn run_opensea_mint_inner(
         )
         .await
         .context("Final SeaDrop state check timed out; mint not broadcast")??;
+        if let Some((old, new, changed_wallets)) =
+            clamp_public_quantities(&state, &mut quantity, &mut wallet_quantities)
+        {
+            log_always(
+                reporter.as_ref(),
+                format!(
+                    "SeaDrop wallet limit: requested {old}, current {new}; reduced {changed_wallets} per-wallet value(s), continuing"
+                ),
+            );
+        }
         price_wei = validate_seadrop_public_state(
             &state,
             expected_unit_price_wei,
@@ -5933,20 +6112,45 @@ mod tests {
         GQL_STAGGER_MAX_SPREAD_MS, NOT_ACTIVE_CHAIN_WAIT_MAX_SECS, NotActiveInfo,
         OPENSEA_MINT_ACTION_BUDGET, OPENSEA_MINT_ACTION_REFILL_MS, PHASE_OPEN_LAG_WINDOW_SECS,
         RATE_LIMIT_WAIT_BUDGET_MS, ScheduledPreopenPlan, SeaDropPublicState, WalletAuth,
-        assigned_proxy_routes, build_local_public_mint, classify_mint_error,
-        decode_common_seadrop_revert, enrich_mint_rpc_error, estimate_fail_policy,
-        fire_lag_ms_from_clock, format_not_active, format_rpc_plan, gql_action_not_ready_delay,
-        gql_stagger_step_ms, in_phase_open_lag_window, initial_force_fixed_gas,
-        is_gql_action_not_ready, is_proven_pre_open_revert, is_terminal_gql_action_error,
-        keep_before_opensea_auth, parse_not_active, parse_tx_calldata_hex, pre_sign_ready_wallets,
-        rate_limit_backoff, required_mint_balance, resolve_mint_gas_limit,
-        resolve_public_fee_recipient, scheduled_preopen_plan, validate_seadrop_calldata,
-        validate_seadrop_public_state, validate_wallet_subset_counts,
+        assigned_proxy_routes, build_local_public_mint, clamp_public_quantities,
+        classify_mint_error, decode_common_seadrop_revert, enrich_mint_rpc_error,
+        estimate_fail_policy, fire_lag_ms_from_clock, format_not_active, format_rpc_plan,
+        gql_action_not_ready_delay, gql_stagger_step_ms, in_phase_open_lag_window,
+        initial_force_fixed_gas, is_gql_action_not_ready, is_proven_pre_open_revert,
+        is_terminal_gql_action_error, keep_before_opensea_auth, parse_not_active,
+        parse_tx_calldata_hex, pre_sign_ready_wallets, rate_limit_backoff, required_mint_balance,
+        resolve_mint_gas_limit, resolve_public_fee_recipient, scheduled_preopen_plan,
+        validate_seadrop_calldata, validate_seadrop_public_state, validate_wallet_subset_counts,
     };
     use crate::proxy::ProxyManager;
     use crate::types::Signer;
     use alloy_primitives::{Address, Bytes, U256};
     use std::collections::HashSet;
+
+    #[test]
+    fn public_wallet_limit_reduction_clamps_without_aborting() {
+        let state = SeaDropPublicState {
+            mint_price: U256::ZERO,
+            start_time: 1,
+            end_time: 10,
+            max_total_mintable_by_wallet: 1,
+            restrict_fee_recipients: false,
+            allowed_fee_recipients: Vec::new(),
+        };
+        let first = Address::repeat_byte(1);
+        let second = Address::repeat_byte(2);
+        let mut default_quantity = 2;
+        let mut quantities = std::collections::HashMap::from([(first, 2), (second, 1)]);
+
+        let change =
+            clamp_public_quantities(&state, &mut default_quantity, &mut quantities).unwrap();
+
+        assert_eq!(change, (2, 1, 1));
+        assert_eq!(default_quantity, 1);
+        assert_eq!(quantities[&first], 1);
+        assert_eq!(quantities[&second], 1);
+        assert!(validate_seadrop_public_state(&state, U256::ZERO, default_quantity, 1).is_ok());
+    }
 
     fn probe(url: &str, ok: bool, ms: Option<u64>) -> crate::rpc::RpcNodeProbe {
         crate::rpc::RpcNodeProbe {

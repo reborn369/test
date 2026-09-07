@@ -7155,6 +7155,7 @@ function applyMintSummary(summary) {
   if (mintRunHistory.length > 100) mintRunHistory.length = 100;
   scheduleSaveRunsHistory();
   renderNftsPage();
+  renderHomeDashboard();
   const home = $("home-last-mint");
   if (home) {
     home.dataset.hasRun = "1";
@@ -7291,6 +7292,7 @@ function setMintUiRunning(running) {
   }
   syncMissionControlActions();
   renderTaskList();
+  renderHomeDashboard();
 }
 
 $("btn-mint-stop")?.addEventListener("click", () => requestCancelMint());

@@ -135,3 +135,10 @@ test('Arc native currency is USDC; existing Ethereum networks remain ETH', () =>
   assert.equal(c.nativeSymbolForChain('arc_testnet'), 'USDC');
   assert.equal(c.nativeSymbolForChain('robinhood'), 'ETH');
 });
+
+test('mint lifecycle refreshes the Overview dashboard', () => {
+  const running = extract('setMintUiRunning');
+  const summary = extract('applyMintSummary');
+  assert.match(running, /renderTaskList\(\);\s*renderHomeDashboard\(\);/);
+  assert.match(summary, /mintRunHistory\.unshift[\s\S]*renderNftsPage\(\);\s*renderHomeDashboard\(\);/);
+});

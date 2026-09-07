@@ -809,6 +809,32 @@ async function refreshStatus() {
   return s;
 }
 
+const PAGE_KICKERS = {
+  home: "Workspace",
+  tasks: "Minting",
+  raw: "Minting",
+  wallets: "Wallets & funds",
+  disperse: "Wallets & funds",
+  sweep: "Wallets & funds",
+  rpcs: "Network & access",
+  proxies: "Network & access",
+  wl: "Network & access",
+  multicall: "Tools",
+  nfts: "Tools",
+  settings: "System",
+};
+
+function setSidebarOpen(open) {
+  const sidebar = $("app-sidebar");
+  const backdrop = $("sidebar-backdrop");
+  const toggle = $("mobile-nav-toggle");
+  if (!sidebar || !backdrop || !toggle) return;
+  sidebar.classList.toggle("mobile-open", open);
+  backdrop.classList.toggle("hidden", !open);
+  toggle.setAttribute("aria-expanded", String(open));
+  toggle.setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
+}
+
 function showPage(name) {
   document.querySelectorAll(".page").forEach((p) => p.classList.add("hidden"));
   const page = $("page-" + name);
@@ -818,6 +844,9 @@ function showPage(name) {
   });
   const title = $("page-title");
   if (title) title.textContent = t("page." + name) || name;
+  const kicker = $("page-kicker");
+  if (kicker) kicker.textContent = PAGE_KICKERS[name] || "Workspace";
+  setSidebarOpen(false);
 }
 
 async function navigate(name) {
@@ -1034,6 +1063,14 @@ document.querySelectorAll(".nav-item[data-page]").forEach((btn) => {
 });
 document.querySelectorAll("[data-goto]").forEach((btn) => {
   btn.addEventListener("click", () => navigate(btn.dataset.goto));
+});
+$("mobile-nav-toggle")?.addEventListener("click", () => {
+  setSidebarOpen(!$("app-sidebar")?.classList.contains("mobile-open"));
+});
+$("sidebar-backdrop")?.addEventListener("click", () => setSidebarOpen(false));
+$("command-trigger")?.addEventListener("click", openCmdPalette);
+window.addEventListener("resize", () => {
+  if (window.innerWidth > 760) setSidebarOpen(false);
 });
 
 // Language EN/RU

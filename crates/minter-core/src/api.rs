@@ -432,7 +432,7 @@ async fn alchemy_usd_price(api_key: &str, symbol: &str) -> Result<f64> {
         .get_or_init(Default::default)
         .get(
             format!("{}:{symbol}", api_key.trim()),
-            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(1_800),
             || fetch_alchemy_usd_price(api_key, symbol),
         )
         .await
@@ -3430,7 +3430,11 @@ impl Session {
         if wallet_addresses.is_empty() {
             bail!("Select at least one wallet");
         }
-        let rpc = self.rpc_client_for_chain(chain)?;
+        // A quote may read 100 balances and scan recent collection logs. These
+        // are non-critical reads, so use the free chain RPC first and keep the
+        // paid provider only as fallback. Mint broadcasting uses another client
+        // and retains its latency-ranked Alchemy-first order.
+        let rpc = self.rpc_client_for_chain(chain)?.prefer_non_alchemy_reads();
         let (base_fee, network_priority) = self.preview_fees(chain).await?;
         let mut params = self.gas_params();
         params.base_fee_multiplier = mint_fee_cap_multiplier(chain);

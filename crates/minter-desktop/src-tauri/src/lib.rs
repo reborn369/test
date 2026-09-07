@@ -2672,6 +2672,8 @@ struct MintCostQuoteInput {
     unit_price_wei: String,
     manual_gas_limit: Option<u64>,
     priority_fee_gwei: Option<String>,
+    #[serde(default)]
+    verify_funds: bool,
 }
 
 #[tauri::command]
@@ -2706,6 +2708,7 @@ async fn mint_cost_quote(
             input.manual_gas_limit,
             input.priority_fee_gwei.as_deref(),
             input.stage_type.as_deref(),
+            input.verify_funds,
         )
         .await
         .map_err(|error| error.to_string())

@@ -1204,10 +1204,11 @@ pub(crate) async fn count_wallet_assets(
     // its existing Alchemy-first order because correctness there moves assets.
     let mut errors = Vec::new();
     if let Some(base_url) = blockscout_nft_base(chain_id) {
-        match fetch_assets_blockscout(base_url, owner, None).await {
-            Ok(assets) => return Ok(assets.len()),
-            Err(error) => errors.push(format!("Blockscout: {error}")),
-        }
+        // A failed free inventory refresh must not silently spend paid CUs.
+        return fetch_assets_blockscout(base_url, owner, None)
+            .await
+            .map(|assets| assets.len())
+            .context("Free NFT indexer unavailable; count unknown");
     }
     if let (Some(api_key), Some(domain)) = (alchemy_api_key, alchemy_nft_domain(chain_id)) {
         match fetch_assets_alchemy_v3(api_key, domain, owner, None).await {

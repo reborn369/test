@@ -4951,7 +4951,10 @@ function renderTaskCostQuote(quote) {
   ready.textContent = getLang() === "ru"
     ? `${quote.readyWallets}/${quote.walletCount} готовы`
     : `${quote.readyWallets}/${quote.walletCount} ready`;
-  ready.className = `task-cost-ready ${quote.insufficientWallets ? "bad" : "ok"}`;
+  if (quote.unknownWallets) ready.textContent += getLang() === "ru"
+    ? ` · ${quote.unknownWallets} без данных`
+    : ` · ${quote.unknownWallets} unknown`;
+  ready.className = `task-cost-ready ${quote.insufficientWallets ? "bad" : quote.unknownWallets ? "" : "ok"}`;
   renderHeaderGas();
   refreshVisibleTaskGasCost();
 }
@@ -4985,6 +4988,7 @@ async function refreshTaskCostQuote(force = false) {
     unitPriceWei: meta.phasePriceWei,
     manualGasLimit: gasMode === "manual" ? Math.max(21000, Number($("task-gas-limit")?.value) || 250000) : null,
     priorityFeeGwei: ($("task-prio")?.value || "").trim() || null,
+    verifyFunds: force,
   };
   const seq = ++taskCostQuoteSeq;
   if ($("task-cost-source")) $("task-cost-source").textContent = getLang() === "ru" ? "Считаю по сети и кошелькам…" : "Calculating network and wallets…";

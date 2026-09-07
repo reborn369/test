@@ -72,6 +72,7 @@ pub struct RpcClient {
     send_only_urls: Vec<String>,
     next_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
     tuning: RpcTuning,
+    background: bool,
 }
 
 impl Clone for RpcClient {
@@ -82,6 +83,7 @@ impl Clone for RpcClient {
             send_only_urls: self.send_only_urls.clone(),
             next_id: self.next_id.clone(),
             tuning: self.tuning,
+            background: self.background,
         }
     }
 }
@@ -148,15 +150,57 @@ async fn send_prebuilt_raw_attempt(
 }
 
 impl RpcClient {
-    /// Prefer chain/public endpoints for read-only work while keeping Alchemy
-    /// as a fallback. Transaction broadcast order is intentionally unchanged.
-    pub fn prefer_non_alchemy_reads(&self) -> Self {
-        let mut cloned = self.clone();
-        cloned.urls.sort_by_key(|url| {
-            let lower = url.to_ascii_lowercase();
-            usize::from(lower.contains("alchemy.com") || lower.contains("alchemyapi.io"))
-        });
-        cloned
+    /// Construct from the explicit public registry only. The caller must never
+    /// append configured/provider URLs. No automatic paid fallback is possible.
+    pub(crate) fn public_reads(urls: Vec<String>) -> Self {
+        let mut rpc = Self::new(urls);
+        rpc.background = true;
+        rpc.tuning.call_timeout = Duration::from_secs(2);
+        rpc
+    }
+
+    async fn background_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if !self.background {
+            return None;
+        }
+        static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+            std::sync::OnceLock::new();
+        SLOTS
+            .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(4)))
+            .clone()
+            .acquire_owned()
+            .await
+            .ok()
+    }
+
+    /// Measure configured nodes without changing priority or discarding a
+    /// provider because of a single failed probe. Send-only nodes are excluded.
+    pub async fn probe_in_configured_order(&self) -> Vec<RpcNodeProbe> {
+        let mut jobs = Vec::new();
+        for url in &self.urls {
+            let rpc = self.clone();
+            let url = url.clone();
+            jobs.push(tokio::spawn(async move {
+                let start = std::time::Instant::now();
+                let result = tokio::time::timeout(
+                    Duration::from_millis(800),
+                    rpc.rpc_call(&url, "eth_chainId", json!([])),
+                )
+                .await;
+                RpcNodeProbe {
+                    url_short: Self::short_url(&url),
+                    ok: result.is_ok_and(|r| r.is_ok()),
+                    latency_ms: Some(start.elapsed().as_millis() as u64),
+                }
+            }));
+        }
+        let mut results = Vec::new();
+        for job in jobs {
+            if let Ok(row) = job.await {
+                results.push(row);
+            }
+        }
+        results
     }
 
     pub fn new(urls: Vec<String>) -> Self {
@@ -212,6 +256,7 @@ impl RpcClient {
             send_only_urls: Vec::new(),
             next_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             tuning: RpcTuning::from_lookup(|k| std::env::var(k).ok()),
+            background: false,
         })
     }
 
@@ -551,6 +596,7 @@ impl RpcClient {
     }
 
     pub async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        let _slot = self.background_slot().await;
         let max_urls = self.urls.len().min(self.tuning.max_nodes);
         if max_urls == 0 {
             bail!("No RPC URLs configured (method {method})");
@@ -610,6 +656,18 @@ impl RpcClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
+        self.call_hedged_result(method, params, false).await
+    }
+
+    // Receipt null means "ask the other nodes", not successful confirmation.
+    // Only all-null responses establish NotFound; any error means Unknown.
+    async fn call_hedged_result(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        receipt: bool,
+    ) -> Result<serde_json::Value> {
+        let _slot = self.background_slot().await;
         let urls: Vec<String> = self
             .urls
             .iter()
@@ -657,7 +715,7 @@ impl RpcClient {
                         match joined {
                             Some(Ok((url, Ok(val)))) => {
                                 let _ = url;
-                                return Ok(val);
+                                if !receipt || !val.is_null() { return Ok(val); }
                             }
                             Some(Ok((url, Err(e)))) => errors.push(format!(
                                 "{} via {}: {}", method, Self::short_url(&url), e
@@ -678,7 +736,11 @@ impl RpcClient {
                 }
             } else {
                 match set.join_next().await {
-                    Some(Ok((_url, Ok(val)))) => return Ok(val),
+                    Some(Ok((_url, Ok(val)))) => {
+                        if !receipt || !val.is_null() {
+                            return Ok(val);
+                        }
+                    }
                     Some(Ok((url, Err(e)))) => {
                         errors.push(format!("{} via {}: {}", method, Self::short_url(&url), e))
                     }
@@ -686,6 +748,9 @@ impl RpcClient {
                     None => break,
                 }
             }
+        }
+        if receipt && errors.is_empty() {
+            return Ok(serde_json::Value::Null);
         }
         bail!(
             "All RPC {method} attempts failed ({} node(s)): {}",
@@ -848,7 +913,7 @@ impl RpcClient {
 
     pub async fn fee_history(&self) -> Result<(U256, U256)> {
         let result = self
-            .call("eth_feeHistory", json!(["0x1", "latest", [25.0]]))
+            .call_hedged("eth_feeHistory", json!(["0x1", "latest", [25.0]]))
             .await?;
         // A missing/unparseable base fee must be an *error*, not a silent zero:
         // `calculate_fees` would then produce max_fee == tip (e.g. 1.5 gwei) on a
@@ -1312,33 +1377,10 @@ impl RpcClient {
 
     pub async fn transaction_receipt(&self, hash: &B256) -> Result<Option<serde_json::Value>> {
         let hash_hex = format!("0x{}", hex::encode(hash.as_slice()));
-        let mut last_error = None;
-        for (attempt, url) in self.urls.iter().take(self.tuning.max_nodes).enumerate() {
-            match self
-                .rpc_call(url, "eth_getTransactionReceipt", json!([hash_hex]))
-                .await
-            {
-                Ok(result) => {
-                    if attempt > 0 {
-                        crate::rlog!("RPC receipt OK via {}", Self::short_url(url));
-                    }
-                    return if result.is_null() {
-                        Ok(None)
-                    } else {
-                        Ok(Some(result))
-                    };
-                }
-                Err(e) => {
-                    crate::rlog!("RPC receipt failed via {}: {}", Self::short_url(url), e);
-                    last_error = Some(e);
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                }
-            }
-        }
-        bail!(
-            "All RPC receipt attempts failed: {}",
-            last_error.map(|e| e.to_string()).unwrap_or_default()
-        )
+        let result = self
+            .call_hedged_result("eth_getTransactionReceipt", json!([hash_hex]), true)
+            .await?;
+        Ok((!result.is_null()).then_some(result))
     }
 
     pub async fn wait_for_receipt(
@@ -1512,15 +1554,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_client_keeps_alchemy_as_fallback() {
-        let client = RpcClient::new(vec![
-            "https://eth-mainnet.g.alchemy.com/v2/key".to_string(),
-            "https://rpc.example.org".to_string(),
-        ]);
-        let reads = client.prefer_non_alchemy_reads();
-        assert_eq!(reads.urls[0], "https://rpc.example.org");
-        assert!(reads.urls[1].contains("alchemy.com"));
-        assert!(client.urls[0].contains("alchemy.com"));
+    fn public_client_has_only_explicit_public_urls() {
+        let rpc = RpcClient::public_reads(vec!["https://rpc.example.org".into()]);
+        assert!(rpc.background);
+        assert_eq!(rpc.urls, vec!["https://rpc.example.org"]);
+        assert!(rpc.clone().background);
+        assert!(!RpcClient::new(vec!["https://paid.example.org".into()]).background);
     }
 
     #[test]
@@ -1723,6 +1762,103 @@ mod tests {
         let only = spawn_mock(ok_body("0x11"), Duration::ZERO);
         let rpc = RpcClient::new(vec![only]);
         assert_eq!(rpc.nonce(&Address::ZERO).await.unwrap(), 0x11);
+    }
+
+    #[tokio::test]
+    async fn receipt_checks_other_node_after_primary_null() {
+        let primary = spawn_mock(
+            r#"{"jsonrpc":"2.0","id":1,"result":null}"#.into(),
+            Duration::ZERO,
+        );
+        let (secondary, count, _) = spawn_sequence_mock(vec![(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"status":"0x1","blockNumber":"0x1"}}"#.into(),
+            Duration::ZERO,
+        )]);
+        let rpc = RpcClient::new(vec![primary, secondary]);
+        assert!(
+            rpc.transaction_receipt(&B256::ZERO)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fee_refresh_reaches_healthy_fallback_within_launch_budget() {
+        let primary = spawn_mock(ok_body("0x1"), Duration::from_millis(1500));
+        let (secondary, count, _) = spawn_sequence_mock(vec![(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"baseFeePerGas":["0x1","0x1"],"reward":[["0x1"]]}}"#.into(), Duration::ZERO)]);
+        let rpc = RpcClient::new(vec![primary, secondary]);
+        let result = tokio::time::timeout(Duration::from_millis(900), rpc.fee_history())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.0, U256::from(1));
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn public_failure_cannot_reach_paid_provider() {
+        let public = spawn_mock(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"unavailable"}}"#.into(),
+            Duration::ZERO,
+        );
+        let (paid, count, _) = spawn_sequence_mock(vec![(ok_body("0x1"), Duration::ZERO)]);
+        let critical = RpcClient::new(vec![paid, public.clone()]);
+        let preview = RpcClient::public_reads(vec![public]);
+        assert!(preview.balance(&Address::ZERO).await.is_err());
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(critical.balance(&Address::ZERO).await.is_ok());
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn partial_receipt_failure_is_unknown_not_absent() {
+        let missing = spawn_mock(
+            r#"{"jsonrpc":"2.0","id":1,"result":null}"#.into(),
+            Duration::ZERO,
+        );
+        let broken = spawn_mock(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"unavailable"}}"#.into(),
+            Duration::ZERO,
+        );
+        let rpc = RpcClient::new(vec![missing, broken]);
+        assert!(matches!(
+            rpc.find_landed(&[B256::ZERO]).await,
+            ReceiptLookup::Unknown
+        ));
+    }
+
+    #[tokio::test]
+    async fn probe_preserves_configured_primary_even_if_public_is_faster() {
+        let paid = spawn_mock(ok_body("0x1"), Duration::from_millis(60));
+        let public = spawn_mock(ok_body("0x1"), Duration::ZERO);
+        let rpc = RpcClient::new(vec![paid.clone(), public.clone()]);
+        let probes = rpc.probe_in_configured_order().await;
+        assert_eq!(rpc.urls, vec![paid.clone(), public]);
+        assert_eq!(probes[0].url_short, RpcClient::short_url(&paid));
+    }
+
+    #[tokio::test]
+    async fn hundred_wallet_reads_do_not_fan_out_when_primary_is_healthy() {
+        let (paid, paid_calls, _) = spawn_sequence_mock(vec![(ok_body("0x3"), Duration::ZERO)]);
+        let (public, public_calls, _) = spawn_sequence_mock(vec![(ok_body("0x2"), Duration::ZERO)]);
+        let rpc = RpcClient::new(vec![paid, public]);
+        let mut jobs = tokio::task::JoinSet::new();
+        for i in 0..100u64 {
+            let rpc = rpc.clone();
+            jobs.spawn(async move {
+                let mut bytes = [0u8; 20];
+                bytes[12..].copy_from_slice(&i.to_be_bytes());
+                rpc.nonce(&Address::from(bytes)).await
+            });
+        }
+        while let Some(result) = jobs.join_next().await {
+            assert_eq!(result.unwrap().unwrap(), 3);
+        }
+        assert_eq!(paid_calls.load(std::sync::atomic::Ordering::SeqCst), 100);
+        assert_eq!(public_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

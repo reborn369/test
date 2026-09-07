@@ -387,6 +387,7 @@ pub struct MintCostQuote {
     pub wallet_count: usize,
     pub ready_wallets: usize,
     pub insufficient_wallets: usize,
+    pub unknown_wallets: usize,
     pub gas_used_estimate: u64,
     pub gas_limit: u64,
     pub gas_source: String,
@@ -852,11 +853,9 @@ impl Session {
         if self.signers.is_empty() {
             bail!("No wallets unlocked");
         }
-        let rpc = match chain.map(str::trim).filter(|c| !c.is_empty()) {
-            Some(c) => self.rpc_client_for_chain(c)?,
-            None => self.rpc_client()?,
-        }
-        .prefer_non_alchemy_reads();
+        let rpc = public_read_rpc_for_chain(
+            chain.filter(|c| !c.trim().is_empty()).unwrap_or("ethereum"),
+        )?;
         let native_symbol = native_symbol_for_chain(chain).to_string();
         // One price request per explicit balance refresh, never per wallet.
         let usd_price = if self.settings.alchemy_api_key.trim().is_empty() {
@@ -939,8 +938,9 @@ impl Session {
         if chain.trim().is_empty() {
             bail!("Network required for NFT count");
         }
-        let rpc = self.rpc_client_for_chain(chain)?.prefer_non_alchemy_reads();
-        let chain_id = rpc.chain_id().await.context("NFT count chainId")?;
+        // Inventory comes from an indexer; determining a known chain needs no RPC.
+        let chain_id = Self::expected_chain_id(chain).context("Unknown NFT count network")?;
+        let rpc = RpcClient::public_reads(Vec::new());
         if let Some(expected) = Self::expected_chain_id(chain)
             && chain_id != expected
         {
@@ -1418,14 +1418,6 @@ impl Session {
         g
     }
 
-    fn rpc_client(&self) -> Result<RpcClient> {
-        let urls = collect_rpc_urls(&self.env);
-        if urls.is_empty() {
-            bail!("No RPC configured — set Alchemy or RPC in Settings");
-        }
-        Ok(RpcClient::new(urls))
-    }
-
     /// RPC client pinned to a named chain (required for Raw Mint).
     fn rpc_client_for_chain(&self, chain: &str) -> Result<RpcClient> {
         let chain = chain.trim();
@@ -1631,23 +1623,9 @@ impl Session {
         .await
     }
 
-    /// Resolve chain id from RPC (preferred chain or ethereum / any).
+    /// SIWE signs a known network identifier; authentication is not a chain read.
     async fn resolve_chain_id(&self, preferred: Option<&str>) -> u64 {
-        let mut urls = collect_rpc_urls_for_chain(&self.env, preferred, &[]);
-        if urls.is_empty() && preferred.is_some() {
-            urls = collect_rpc_urls_for_chain(&self.env, Some("ethereum"), &[]);
-        }
-        if urls.is_empty() {
-            urls = collect_rpc_urls(&self.env);
-        }
-        if urls.is_empty() {
-            return 1;
-        }
-        let rpc = RpcClient::new(urls);
-        // Do not silently authenticate/sign with mainnet's chain id when the
-        // configured RPC is unavailable. Callers will surface the invalid id
-        // through the auth/RPC request instead of masking the outage.
-        rpc.chain_id().await.unwrap_or(0)
+        Self::expected_chain_id(preferred.unwrap_or("ethereum")).unwrap_or(0)
     }
 
     /// Warm OpenSea SIWE auth into cache for selected (or all) wallets.
@@ -3205,9 +3183,8 @@ impl Session {
     /// once per minute.
     async fn preview_fees(&self, chain: &str) -> Result<(U256, U256)> {
         static CACHE: OnceLock<crate::preview_cache::PreviewCache<(U256, U256)>> = OnceLock::new();
-        let urls = collect_rpc_urls_for_chain(&self.env, Some(chain), &[]);
-        let key = format!("{chain}:{urls:?}");
-        let rpc = self.rpc_client_for_chain(chain)?.prefer_non_alchemy_reads();
+        let key = chain.trim().to_ascii_lowercase();
+        let rpc = public_read_rpc_for_chain(chain)?;
         CACHE
             .get_or_init(Default::default)
             .get(key, std::time::Duration::from_secs(55), || {
@@ -3426,16 +3403,24 @@ impl Session {
         manual_gas_limit: Option<u64>,
         priority_fee_gwei: Option<&str>,
         stage_type: Option<&str>,
+        verify_funds: bool,
     ) -> Result<MintCostQuote> {
         if wallet_addresses.is_empty() {
             bail!("Select at least one wallet");
         }
-        // A quote may read 100 balances and scan recent collection logs. These
-        // are non-critical reads, so use the free chain RPC first and keep the
-        // paid provider only as fallback. Mint broadcasting uses another client
-        // and retains its latency-ranked Alchemy-first order.
-        let rpc = self.rpc_client_for_chain(chain)?.prefer_non_alchemy_reads();
-        let (base_fee, network_priority) = self.preview_fees(chain).await?;
+        // Display previews use public nodes only. Explicit task save verifies
+        // funds/fees through the configured provider; public failure cannot
+        // prevent arming a task when the paid provider is healthy.
+        let rpc = if verify_funds {
+            self.rpc_client_for_chain(chain)?
+        } else {
+            public_read_rpc_for_chain(chain)?
+        };
+        let (base_fee, network_priority) = if verify_funds {
+            rpc.fee_history().await?
+        } else {
+            self.preview_fees(chain).await?
+        };
         let mut params = self.gas_params();
         params.base_fee_multiplier = mint_fee_cap_multiplier(chain);
         if let Some(raw) = priority_fee_gwei
@@ -3462,8 +3447,21 @@ impl Session {
             .max()
             .unwrap_or(default_quantity.max(1));
         let (historical, sample_count) = if manual_gas_limit.is_none() {
-            self.historical_mint_gas(&rpc, chain, contract, requested_qty, stage_type)
+            match public_read_rpc_for_chain(chain) {
+                Ok(history_rpc) => tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    self.historical_mint_gas(
+                        &history_rpc,
+                        chain,
+                        contract,
+                        requested_qty,
+                        stage_type,
+                    ),
+                )
                 .await
+                .unwrap_or((None, 0)),
+                Err(_) => (None, 0),
+            }
         } else {
             (None, 0)
         };
@@ -3491,7 +3489,7 @@ impl Session {
         let balance_slots = Arc::new(tokio::sync::Semaphore::new(32));
         static BALANCES: OnceLock<crate::preview_cache::PreviewCache<U256>> = OnceLock::new();
         let network_key = format!(
-            "{chain}:{:?}",
+            "{chain}:{verify_funds}:{:?}",
             collect_rpc_urls_for_chain(&self.env, Some(chain), &[])
         );
         for address in &wallet_addresses {
@@ -3504,12 +3502,16 @@ impl Session {
             let balance_key = format!("{network_key}:{normalized}");
             jobs.spawn(async move {
                 let _permit = balance_slots.acquire_owned().await.ok();
-                let balance = BALANCES
-                    .get_or_init(Default::default)
-                    .get(balance_key, std::time::Duration::from_secs(15), || {
-                        rpc.balance(&address_parsed)
-                    })
-                    .await;
+                let balance = if verify_funds {
+                    rpc.balance(&address_parsed).await
+                } else {
+                    BALANCES
+                        .get_or_init(Default::default)
+                        .get(balance_key, std::time::Duration::from_secs(30), || {
+                            rpc.balance(&address_parsed)
+                        })
+                        .await
+                };
                 (normalized, balance)
             });
         }
@@ -3551,7 +3553,8 @@ impl Session {
             native_symbol,
             wallet_count: wallet_addresses.len(),
             ready_wallets: ready,
-            insufficient_wallets: wallet_addresses.len().saturating_sub(ready),
+            insufficient_wallets: balances.len().saturating_sub(ready),
+            unknown_wallets: wallet_addresses.len().saturating_sub(balances.len()),
             gas_used_estimate: gas_used,
             gas_limit,
             gas_source,
@@ -3608,7 +3611,7 @@ impl Session {
             bail!("Amount must be greater than 0");
         }
 
-        let rpc = self.rpc_client_for_chain(chain)?;
+        let rpc = public_read_rpc_for_chain(chain)?;
         let chain_id = rpc.chain_id().await.context("Disperse quote chainId")?;
         if let Some(expected) = Self::expected_chain_id(chain)
             && chain_id != expected
@@ -3631,8 +3634,7 @@ impl Session {
         };
         let (fees, balance, usd_price) =
             tokio::join!(rpc.fee_history(), rpc.balance(&from_addr), price_future);
-        let (base_fee, network_priority) =
-            fees.unwrap_or_else(|_| (U256::from(1_000_000_000u64), U256::from(1_000_000_000u64)));
+        let (base_fee, network_priority) = fees.context("Disperse fee preview unavailable")?;
         let (max_fee, max_priority_fee) =
             crate::gas::calculate_fees(&self.gas_params(), base_fee, network_priority)?;
         let balance = balance.context("Disperse quote balance")?;
@@ -5198,6 +5200,18 @@ fn public_rpc_fallback(chain: &str) -> Vec<&'static str> {
         "blast" => vec!["https://rpc.blast.io"],
         _ => vec![],
     }
+}
+
+/// Free previews have no access to configured API keys or custom URLs.
+pub(crate) fn public_read_rpc_for_chain(chain: &str) -> Result<RpcClient> {
+    let urls: Vec<String> = public_rpc_fallback(chain.trim())
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if urls.is_empty() {
+        bail!("Public RPC preview unavailable for {chain}; live operations use configured RPC");
+    }
+    Ok(RpcClient::public_reads(urls))
 }
 
 /// Pull Alchemy API key from Settings field or from any `*.g.alchemy.com/v2/<key>` URL in env.

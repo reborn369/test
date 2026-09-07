@@ -896,7 +896,7 @@ pub(crate) fn fire_lag_ms_from_clock(start_ts: i64, now_ms: i64) -> u64 {
 ///
 /// Answers the two questions the operator actually has at T0: which endpoint
 /// leads (nonce, fees, hedged reads) and which endpoints a broadcast reaches.
-/// Endpoints the probe dropped are listed as EXCLUDED, and endpoints beyond the
+/// Failed probes retain their configured priority; endpoints beyond the
 /// fan-out width as `unused`, so a configured-but-idle node is never silent —
 /// notably the public fallback that is appended to every chain automatically.
 pub(crate) fn format_rpc_plan(
@@ -904,33 +904,32 @@ pub(crate) fn format_rpc_plan(
     probes: &[rpc::RpcNodeProbe],
     fanout_width: usize,
 ) -> Vec<String> {
-    let usable = probes.iter().filter(|p| p.ok).count();
-    let reach = fanout_width.min(usable);
+    let reach = fanout_width.min(probes.len());
     let mut out = vec![format!(
-        "RPC plan for {chain}: {usable} usable endpoint(s), broadcast reaches {reach}"
+        "RPC plan for {chain}: configured priority, broadcast reaches {reach}"
     )];
-    let mut rank = 0usize;
-    for p in probes {
+    for (index, p) in probes.iter().enumerate() {
+        let rank = index + 1;
+        let role = if rank == 1 {
+            "LEAD"
+        } else if rank <= reach {
+            "broadcast / fallback"
+        } else {
+            "unused"
+        };
+        let health = if p.ok {
+            "ready"
+        } else {
+            "probe failed; retained for retry"
+        };
         let ping = p
             .latency_ms
             .map(|ms| format!("{ms}ms"))
-            .unwrap_or_else(|| "not measured".to_string());
-        if p.ok {
-            rank += 1;
-            let role = if rank == 1 {
-                "LEAD"
-            } else if rank <= reach {
-                "broadcast"
-            } else {
-                "unused"
-            };
-            out.push(format!("  [{rank}] {role} — {} ping={ping}", p.url_short));
-        } else {
-            out.push(format!(
-                "  [x] EXCLUDED — {} (probe failed, {ping})",
-                p.url_short
-            ));
-        }
+            .unwrap_or_else(|| "not measured".into());
+        out.push(format!(
+            "  [{rank}] {role} — {} ping={ping} {health}",
+            p.url_short
+        ));
     }
     out
 }
@@ -1754,10 +1753,7 @@ async fn run_opensea_mint_inner(
             if any_urls.is_empty() {
                 bail!("No RPC URLs for auth. Configure Alchemy or RPC in Settings.");
             }
-            let mut any_rpc = rpc::RpcClient::new(any_urls);
-            if let Err(e) = any_rpc.sort_by_fastest_provider().await {
-                log_always(reporter.as_ref(), format!("RPC probe failed: {}", e));
-            }
+            let any_rpc = rpc::RpcClient::new(any_urls);
             let any_chain_id = any_rpc.chain_id().await.unwrap_or(1);
             // Same reason as the unauthenticated session above: this fallback
             // SIWE must not bypass the primary wallet's proxy.
@@ -1808,23 +1804,17 @@ async fn run_opensea_mint_inner(
         format!("Using {} RPC URL(s) for {}", urls.len(), chain_for_rpc),
     );
     let mut rpc = rpc::RpcClient::new(urls.clone());
-    // The resolved endpoint order decides which node serves nonce/fee reads and
-    // which nodes a broadcast fans out to. It used to be visible only through
-    // `rlog!`, which the desktop silences with QUIET=1 — so the operator could
-    // not tell a paid endpoint from the public fallback that is always appended.
-    // Report it through the reporter instead, where the UI and log file see it.
-    match rpc.sort_by_fastest_provider_report().await {
-        Ok(probes) => {
-            for line in format_rpc_plan(chain_for_rpc, &probes, rpc.fanout_width()) {
-                log_always(reporter.as_ref(), line);
-            }
-        }
-        Err(e) => log_always(reporter.as_ref(), format!("RPC probe failed: {}", e)),
+    // Explicit configuration determines priority. A faster public probe must
+    // never replace the paid provider or exclude it for the entire task.
+    let probes = rpc.probe_in_configured_order().await;
+    for line in format_rpc_plan(chain_for_rpc, &probes, rpc.fanout_width()) {
+        log_always(reporter.as_ref(), line);
     }
-    // Routine reads use the chain/public endpoint first to avoid spending paid
-    // Alchemy CUs. Alchemy remains the fallback, while transaction broadcasts
-    // keep the latency-ranked order above.
-    let read_rpc = rpc.prefer_non_alchemy_reads();
+    log_always(
+        reporter.as_ref(),
+        "RPC policy: configured provider for funds/nonce/fees/receipts; independent broadcast per wallet; UI previews use public RPC only",
+    );
+    let read_rpc = rpc.clone();
 
     let actual_chain_id = rpc
         .chain_id()
@@ -2965,12 +2955,9 @@ async fn run_opensea_mint_inner(
     let fee_snapshot = read_rpc
         .fee_history()
         .await
-        .unwrap_or((U256::from(1_000_000_000u64), U256::from(1_000_000_000u64)));
+        .context("Cannot prepare mint: configured RPC and fallbacks did not supply current fees")?;
     let (mut max_fee, mut max_priority_fee) =
-        gas::calculate_fees(&gas_params, fee_snapshot.0, fee_snapshot.1).unwrap_or((
-            fee_snapshot.0 * U256::from(2u64) + fee_snapshot.1,
-            fee_snapshot.1,
-        ));
+        gas::calculate_fees(&gas_params, fee_snapshot.0, fee_snapshot.1)?;
     // Resolve the same fixed live limit that workers sign with. A gas limit is
     // only a ceiling (unused gas is not charged), but the account must be able
     // to cover that ceiling for an RPC to accept the transaction.
@@ -3211,10 +3198,8 @@ async fn run_opensea_mint_inner(
         }
         let preopen_plan = scheduled_preopen_plan(&stage_type_owned, use_gql);
         let local_public_prefetch = preopen_plan == ScheduledPreopenPlan::ValidatePublicState;
-        // Non-public stages use the nonce and fee snapshot already collected
-        // during preparation. They must do no blockchain reads near T0. Public
-        // stages additionally validate their mutable on-chain configuration,
-        // but do so with a wide safety margin rather than in the final seconds.
+        // All stages refresh fees/nonces before the final signing pass below.
+        // Public stages also validate mutable contract terms before T0.
         let mut preopen_finalized = !local_public_prefetch;
         // PUBLIC_SALE can be built locally before T0. Signed phases deliberately
         // reserve their limited OpenSea mint-action requests for T0 because the
@@ -6172,7 +6157,7 @@ mod tests {
             ],
             3,
         );
-        assert!(plan[0].contains("2 usable endpoint(s)"), "{:?}", plan[0]);
+        assert!(plan[0].contains("configured priority"), "{:?}", plan[0]);
         assert!(plan[0].contains("broadcast reaches 2"), "{:?}", plan[0]);
         assert!(plan[1].contains("[1] LEAD") && plan[1].contains("paid.example"));
         assert!(plan[1].contains("ping=12ms"));
@@ -6197,9 +6182,8 @@ mod tests {
     }
 
     #[test]
-    fn rpc_plan_reports_excluded_nodes_without_ranking_them() {
-        // A failed probe is dropped from the run, but stays visible — and must
-        // never take a rank, or a dead node would read as the lead.
+    fn rpc_plan_retains_failed_probe_as_a_visible_fallback() {
+        // A temporary probe failure must not erase the configured fallback.
         let plan = format_rpc_plan(
             "base",
             &[
@@ -6208,9 +6192,9 @@ mod tests {
             ],
             3,
         );
-        assert!(plan[0].contains("1 usable endpoint(s)"));
+        assert!(plan[0].contains("broadcast reaches 2"));
         assert!(plan[1].contains("[1] LEAD") && plan[1].contains("good.example"));
-        assert!(plan[2].contains("[x] EXCLUDED") && plan[2].contains("dead.example"));
+        assert!(plan[2].contains("retained for retry") && plan[2].contains("dead.example"));
         assert!(!plan[2].contains("LEAD"));
     }
 
@@ -6219,7 +6203,7 @@ mod tests {
         // One URL short-circuits the latency sort, so there is no ping to show.
         // It must still be reported as the lead rather than silently omitted.
         let plan = format_rpc_plan("robinhood", &[probe("https://only.example", true, None)], 3);
-        assert!(plan[0].contains("1 usable endpoint(s)"));
+        assert!(plan[0].contains("broadcast reaches 1"));
         assert!(plan[1].contains("[1] LEAD"));
         assert!(plan[1].contains("not measured"));
     }

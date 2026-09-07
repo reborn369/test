@@ -214,14 +214,14 @@
             <div id="page-tasks" class="page hidden demo-tasks-page">
               <header class="demo-route-intro"><div><h2 data-i18n="tasks.mintTitle">Tasks</h2><p data-i18n="tasks.mintHint">Prepare, simulate and control mint executions without losing operational context.</p></div><div class="demo-route-actions"><span class="badge accent-badge">OpenSea</span><label class="task-template-label"><span class="sr-only" data-i18n="tasks.templates">Templates</span><select id="task-template" class="task-template-select"><option value="" data-i18n="tasks.templates">Templates…</option><option value="standard" data-i18n="tasks.tpl.sniper">Standard</option><option value="manualGas" data-i18n="tasks.tpl.manualGas">Manual gas</option><option value="multi" data-i18n="tasks.tpl.multi">Multi qty ×3</option></select></label><button type="button" id="btn-create-task" class="primary" data-i18n="tasks.create">Create task</button></div></header>
               <section class="panel demo-task-toolbar"><header class="panel-head"><h3 data-i18n="console.tasks.controls">Execution controls</h3></header><div class="panel-body">
-                <div class="bulk-bar" id="tasks-bulk">
+                <div class="toolbar bulk-bar" id="tasks-bulk">
                   <span class="bulk-count"><span class="bulk-pill" id="tasks-selected-label" data-i18n="tasks.ready">Ready</span></span>
                   <div class="bulk-actions"><button type="button" id="btn-warm-auth" data-i18n="tasks.warmAuth">Warm auth</button><button type="button" class="danger-btn btn-stop" id="btn-mint-stop" disabled data-i18n="tasks.stop">Stop</button></div>
                 </div>
               </div></section>
               <section class="panel demo-task-ledger">
                 <header class="panel-head"><div><h3 data-i18n="console.tasks.ledger">Mint task ledger</h3><p class="muted small" data-i18n="console.tasks.ledgerLead">Saved tasks appear here with their current execution state.</p></div></header>
-                <div class="panel-body"><div id="task-list" class="task-list"><div class="empty-tasks muted" id="task-list-empty">No tasks yet — create one.</div></div></div>
+                <div class="panel-body"><div class="table-wrap task-ledger-wrap"><div id="task-list" class="task-list"><div class="empty-tasks muted" id="task-list-empty">No tasks yet — create one.</div></div></div></div>
               </section>
               <section class="panel demo-task-live">
                 <header class="panel-head">
@@ -301,19 +301,19 @@
             <div id="page-raw" class="page hidden page-raw demo-raw-page">
               <header class="demo-route-intro"><div><h2 data-i18n="raw.title">Raw Mint</h2><p data-i18n="raw.hintSimple">Build an explicit contract call, inspect the decoded payload and simulate before going live.</p></div><span class="badge accent-badge" data-i18n="raw.badge">Contract mint</span></header>
 
-              <div class="raw-layout demo-raw-workbench">
+              <div class="form-layout raw-layout demo-raw-workbench">
                 <!-- LEFT: setup -->
-                <section class="panel demo-raw-composer"><header class="panel-head"><div><h3 data-i18n="console.raw.composer">Contract composer</h3><p class="muted small" data-i18n="console.raw.composerLead">Set the target, call parameters, timing, gas, and participating wallets.</p></div></header><div class="panel-body raw-col raw-col-setup">
-                  <div class="raw-card raw-card-mode">
+                <section class="panel demo-raw-composer"><header class="panel-head"><div><h3 data-i18n="console.raw.composer">Contract composer</h3><p class="muted small" data-i18n="console.raw.composerLead">Set the target, call parameters, timing, gas, and participating wallets.</p></div></header><div class="panel-body raw-col raw-col-setup form-section-stack">
+                  <section class="form-section raw-card raw-card-mode">
                     <div class="raw-mode-row" role="group" aria-label="Mode">
                       <button type="button" class="raw-mode-chip active" data-preset="auto" data-i18n="raw.modeAuto">Auto (safe)</button>
                       <button type="button" class="raw-mode-chip" data-preset="custom" data-i18n="raw.modeCustom">Custom</button>
                     </div>
                     <p id="raw-mode-hint" class="raw-mode-hint muted small" data-i18n="raw.modeHintSimple">mint(uint256) · qty from field · fixed ETH</p>
                     <input type="hidden" id="raw-preset" value="auto" />
-                  </div>
+                  </section>
 
-                  <div class="raw-card">
+                  <section class="form-section raw-card">
                     <div class="raw-card-label" data-i18n="raw.secTarget">Target</div>
                     <div class="raw-grid">
                       <label><span data-i18n="raw.chain">Network</span> <span class="req-star">*</span>
@@ -370,9 +370,9 @@
                         <input type="text" id="raw-params" placeholder="comma-separated, e.g. 1" autocomplete="off" />
                       </label>
                     </div>
-                  </div>
+                  </section>
 
-                  <div class="raw-card">
+                  <div class="form-section raw-card">
                     <div class="raw-card-label" data-i18n="raw.secTiming">Timing &amp; gas</div>
                     <div class="raw-grid">
                       <label><span data-i18n="raw.atUnix">Fire timestamp (unix sec)</span>
@@ -497,8 +497,11 @@
             <!-- DISPERSE -->
             <div id="page-disperse" class="page hidden demo-disperse-page">
               <header class="demo-route-intro"><div><h2 data-i18n="disperse.title">Disperse</h2><p data-i18n="console.disperse.lead">Stage a controlled distribution and inspect its quote before confirmation.</p></div><span class="badge warn-badge" data-i18n="disperse.badge">1 → many</span></header>
-              <div class="panel demo-disperse-workbench">
-                <p class="muted" data-i18n="disperse.hint">Send a fixed native amount from one vault wallet to many others on the selected chain.</p>
+              <div class="form-layout demo-disperse-layout">
+              <section class="panel demo-disperse-workbench">
+                <header class="panel-head"><div><h3 data-i18n="disperse.title">Disperse</h3><p class="muted small" data-i18n="disperse.hint">Send a fixed native amount from one vault wallet to many others on the selected chain.</p></div></header>
+                <div class="panel-body form-section-stack">
+                <section class="form-section">
                 <div class="flow-steps" id="flow-steps" role="list">
                   <div class="flow-step is-done" role="listitem"><span class="fs-n">1</span><span class="fs-t" data-i18n="disperse.step1">From</span></div>
                   <div class="flow-step" role="listitem"><span class="fs-n">2</span><span class="fs-t" data-i18n="disperse.step2">To</span></div>
@@ -531,7 +534,8 @@
                     </select>
                   </label>
                 </div>
-                <div class="pick-block">
+                </section>
+                <section class="form-section pick-block">
                   <div class="wallet-pick-head">
                     <span><span data-i18n="disperse.to">To wallets</span> <span id="disp-to-count" class="pick-count"></span></span>
                     <div class="wallet-pick-actions">
@@ -542,7 +546,13 @@
                   </div>
                   <p id="disp-source-hint" class="muted small">Uses wallets selected on the Wallets page.</p>
                   <div id="disp-to-list" class="task-wallet-list muted">Unlock vault to load wallets…</div>
+                </section>
                 </div>
+              </section>
+              <section class="panel demo-disperse-summary">
+                <header class="panel-head"><div><h3 data-i18n="disperse.run">Disperse</h3><p class="muted small">Review the quoted total before confirmation.</p></div></header>
+                <div class="panel-body form-section-stack">
+                <section class="form-section">
                 <div class="form-grid-2">
                   <label><span data-i18n="disperse.amount">Amount ETH (each)</span> <span class="req-star">*</span>
                     <input type="text" id="disp-amount" placeholder="0.001" autocomplete="off" inputmode="decimal" />
@@ -562,16 +572,21 @@
                   <button id="btn-disperse" class="spend-btn" type="button" data-i18n="disperse.run">Disperse</button>
                 </div>
                 <pre id="disp-out" class="code"></pre>
+                </section>
+                </div>
+              </section>
               </div>
             </div>
 
             <!-- MULTICALL -->
             <div id="page-multicall" class="page hidden demo-multicall-page">
               <header class="demo-route-intro"><div><h2 data-i18n="mc.title">Multicall</h2><p data-i18n="console.multicall.lead">Compose contract calls, inspect the payload, and send only after review.</p></div><span class="badge warn-badge" data-i18n="mc.badge">1 wallet · N calls</span></header>
-              <div class="panel demo-multicall-composer">
-                <p class="muted" data-i18n="mc.hint">Batch several contract calls into one transaction from a single vault wallet via Multicall3.</p>
+              <div class="form-layout demo-multicall-layout">
+              <section class="panel demo-multicall-composer">
+                <header class="panel-head"><div><h3 data-i18n="mc.title">Multicall</h3><p class="muted small" data-i18n="mc.hint">Batch several contract calls into one transaction from a single vault wallet via Multicall3.</p></div></header>
+                <div class="panel-body form-section-stack">
+                <section class="form-section settings-section">
                 <p class="muted small" data-i18n="mc.warn">Warning: target contracts see msg.sender = Multicall3 (not your EOA). Many NFT/OS mints will fail — use Raw / Flashbots for multi-wallet snipes.</p>
-                <div class="settings-section">
                   <label><span data-i18n="mc.chain">Network</span> <span class="req-star">*</span>
                     <select id="mc-chain" required>
                       <option value="" data-i18n="raw.chainPick">— select network —</option>
@@ -605,25 +620,37 @@
                     <button type="button" id="btn-mc-add" class="primary" data-i18n="mc.add">+ Add call</button>
                   </div>
                   <div id="mc-calls" class="mc-calls"></div>
+                </section>
+                </div>
+              </section>
+              <section class="panel demo-multicall-summary">
+                <header class="panel-head"><div><h3 data-i18n="mc.run">Multicall</h3><p class="muted small">Review and send the assembled batch.</p></div></header>
+                <div class="panel-body form-section-stack">
+                <section class="form-section">
                   <label class="check"><input type="checkbox" id="mc-dry" checked /> Dry run</label>
                   <button id="btn-multicall" class="spend-btn" type="button" data-i18n="mc.run">Multicall</button>
                   <pre id="mc-out" class="code"></pre>
+                </section>
                 </div>
+              </section>
               </div>
             </div>
 
             <!-- SWEEP -->
             <div id="page-sweep" class="page hidden demo-sweep-page">
               <header class="demo-route-intro"><div><h2 data-i18n="sweep.title">Sweep</h2><p data-i18n="console.sweep.lead">Consolidate native funds or NFTs while keeping the execution trail visible.</p></div><span class="badge warn-badge" data-i18n="sweep.badge">many → 1</span></header>
-              <div class="panel demo-sweep-workbench">
-                <p class="muted" data-i18n="sweep.hint">Collect native ETH or ERC-721 from all vault wallets to one destination on the selected chain.</p>
+              <section class="panel demo-sweep-workbench">
+                <header class="panel-head"><div><h3 data-i18n="sweep.title">Sweep</h3><p class="muted small" data-i18n="sweep.hint">Collect native ETH or ERC-721 from all vault wallets to one destination on the selected chain.</p></div></header>
+                <div class="panel-body form-section-stack">
 
                 <div class="seg-toggle" role="tablist" aria-label="Sweep mode">
                   <button type="button" class="seg-btn is-active" id="sweep-tab-eth" role="tab" aria-selected="true" data-i18n="sweep.tabEth">ETH</button>
                   <button type="button" class="seg-btn" id="sweep-tab-nft" role="tab" aria-selected="false" data-i18n="sweep.tabNft">NFT</button>
                 </div>
 
-                <div id="sweep-pane-eth" class="sweep-pane">
+                <div id="sweep-pane-eth" class="form-layout sweep-pane">
+                  <section class="panel sweep-source-panel"><div class="panel-body form-section-stack">
+                  <section class="form-section">
                   <div class="form-grid-2">
                     <label><span data-i18n="sweep.sources">Source wallets</span> <span class="req-star">*</span>
                       <select id="sweep-eth-source">
@@ -656,6 +683,10 @@
                     </label>
                   </div>
                   <p id="sweep-eth-source-hint" class="muted small"></p>
+                  </section>
+                  </div></section>
+                  <section class="panel sweep-summary-panel"><div class="panel-body form-section-stack">
+                  <section class="form-section">
                   <div id="sweep-eth-total" class="cost-card hidden">
                     <div class="cost-row"><span class="cost-k" id="sweep-eth-src">—</span><span class="cost-v" id="sweep-eth-gross">—</span></div>
                     <div class="cost-row"><span class="cost-k" data-i18n="sweep.gasReserve">Gas reserve</span><span class="cost-v" id="sweep-eth-gas">—</span></div>
@@ -684,9 +715,13 @@
                     </div>
                   </div>
                   <pre id="sweep-eth-out" class="code collapsible-log"></pre>
+                  </section>
+                  </div></section>
                 </div>
 
-                <div id="sweep-pane-nft" class="sweep-pane hidden">
+                <div id="sweep-pane-nft" class="form-layout sweep-pane hidden">
+                  <section class="panel sweep-source-panel"><div class="panel-body form-section-stack">
+                  <section class="form-section">
                   <div class="form-grid-2">
                     <label><span data-i18n="sweep.sources">Source wallets</span> <span class="req-star">*</span>
                       <select id="sweep-nft-source">
@@ -725,6 +760,10 @@
                     </div>
                   </div>
                   <p id="sweep-nft-source-hint" class="muted small"></p>
+                  </section>
+                  </div></section>
+                  <section class="panel sweep-summary-panel"><div class="panel-body form-section-stack">
+                  <section class="form-section">
                   <div class="cta-row">
                     <button id="btn-sweep-nft" class="spend-btn" type="button" data-i18n="sweep.runNft">Sweep NFTs</button>
                   </div>
@@ -746,15 +785,18 @@
                     </div>
                   </div>
                   <pre id="sweep-nft-out" class="code collapsible-log"></pre>
+                  </section>
+                  </div></section>
                 </div>
-              </div>
+                </div>
+              </section>
             </div>
 
             <!-- WL CHECK -->
             <div id="page-wl" class="page hidden wl-page demo-wl-page">
               <header class="demo-route-intro"><div><h2 data-i18n="wl.title">Whitelist check</h2><p data-i18n="wl.hint">Paste collection, pick wallets, check WL (uses vault + proxies). After check: results/wl_* / eligibility.csv + one .txt per WL phase. PUBLIC_SALE is never “eligible” — those wallets go to not_eligible.txt.</p></div><span class="badge accent-badge">OpenSea</span></header>
-              <div class="wl-layout demo-wl-workbench">
-                  <section class="panel wl-controls demo-wl-controls"><header class="panel-head"><div><h3 data-i18n="console.wl.controls">Batch control</h3><p class="muted small" data-i18n="console.wl.controlsLead">Choose a collection and the encrypted local wallets to inspect.</p></div></header><div class="panel-body">
+              <div class="form-layout wl-layout demo-wl-workbench">
+                  <section class="panel wl-controls demo-wl-controls"><header class="panel-head"><div><h3 data-i18n="console.wl.controls">Batch control</h3><p class="muted small" data-i18n="console.wl.controlsLead">Choose a collection and the encrypted local wallets to inspect.</p></div></header><div class="panel-body form-section-stack">
                     <label><span data-i18n="wl.slug">Collection slug or OpenSea URL</span>
                       <input type="text" id="wl-slug" placeholder="bfers" autocomplete="off" />
                     </label>
@@ -772,7 +814,7 @@
                       <p id="wl-msg" class="msg" style="margin:0"></p>
                     </div>
                   </div></section>
-                  <section class="panel demo-wl-results"><header class="panel-head"><div class="wl-results-head"><h3 data-i18n="wl.results">Results</h3><span id="wl-run-stats" class="stat-inline muted"></span></div></header><div class="panel-body">
+                  <section class="panel demo-wl-results"><header class="panel-head"><div class="wl-results-head"><h3 data-i18n="wl.results">Results</h3><span id="wl-run-stats" class="stat-inline muted"></span></div></header><div class="panel-body form-section-stack">
                   <div class="table-wrap" id="wl-table-wrap">
                     <table class="data-table" id="wl-table">
                       <thead>
@@ -813,14 +855,14 @@
                   <span id="wallet-search-count" class="search-count muted"></span>
                   <button type="button" id="wallet-search-close" class="search-close" aria-label="Close search">Esc</button>
                 </div>
-                <div class="wallet-filters">
+                <div class="toolbar wallet-filters">
                   <span class="muted small" data-i18n="wallets.filter">Filter</span>
                   <button type="button" class="chip filter-chip" data-filter="all" aria-pressed="true" data-i18n="wallets.fAll">All</button>
                   <span id="wallet-filter-groups"></span>
                   <button type="button" class="chip filter-chip" data-filter="funded" aria-pressed="false" data-i18n="wallets.fFunded">Funded</button>
                   <button type="button" id="btn-wallet-search-open" class="chip" title="Ctrl+F" aria-label="Search wallets">⌕</button>
                 </div>
-                <div class="wallet-toolbar">
+                <div class="toolbar wallet-toolbar">
                   <div class="wallet-group-btns">
                     <span class="muted small" data-i18n="wallets.group">Group</span>
                     <span id="wallet-group-chips"></span>
@@ -878,7 +920,7 @@
               <section class="panel demo-wallet-local-app">
                 <header class="panel-head"><div><h3 data-i18n="console.wallets.localImport">Local wallet import</h3><p class="muted small" data-i18n="console.wallets.localImportLead">Manage encrypted burner-wallet files on this device.</p></div></header>
                 <div class="panel-body">
-                <div id="wallet-dropzone" class="wallet-dropzone">
+                <section id="wallet-dropzone" class="form-section wallet-dropzone">
                   <p data-i18n="wallets.drop">Drop key files here (multi) or use Browse</p>
                   <div class="row wallet-import-row">
                     <label class="inline-field tight">
@@ -897,8 +939,8 @@
                     <button id="btn-import" data-i18n="wallets.import">Import path</button>
                     <input type="text" id="import-path" placeholder="privkeys.txt path" aria-label="Path to private key file" />
                   </div>
-                </div>
-                <div class="row wallet-import-row">
+                </section>
+                <div class="form-section row wallet-import-row">
                   <input type="text" id="remove-addr" aria-label="Wallet address to remove" placeholder="0x… to remove" />
                   <button id="btn-remove-wallet" class="danger-btn" data-i18n="wallets.remove">Remove</button>
                 </div>
@@ -910,11 +952,15 @@
             <!-- NFTS / RESULTS -->
             <div id="page-nfts" class="page hidden demo-history-page">
               <header class="demo-route-intro"><div><h2 data-i18n="nav.nfts">History</h2><p data-i18n="console.history.lead">Review persisted runs, wallet outcomes, and exported operational evidence.</p></div><span class="badge accent-badge" data-i18n="history.badge">All runs</span></header>
-              <div class="panel demo-history-layout">
+              <section class="panel demo-history-layout">
+                <header class="panel-head">
+                  <div><h3 data-i18n="console.history.ledger">Run ledger</h3><p class="muted small" data-i18n="console.history.ledgerLead">Persisted runs and their per-wallet outcomes.</p></div>
                   <div class="head-actions">
                     <button type="button" id="btn-open-results" data-i18n="nfts.openResults">Open results folder</button>
                     <button type="button" id="btn-open-logs" data-i18n="nfts.openLogs">Open logs folder</button>
                   </div>
+                </header>
+                <div class="panel-body">
                 <div id="run-history-cards" class="run-cards">
                   <p class="muted" data-i18n="history.empty">No runs yet.</p>
                 </div>
@@ -937,7 +983,8 @@
                   </table>
                 </div>
                 <pre id="nfts-export" class="code muted">Export paths appear after a mint with export enabled.</pre>
-              </div>
+                </div>
+              </section>
             </div>
 
             <!-- RPCS -->
@@ -946,7 +993,7 @@
               <section class="panel demo-rpc-health">
                 <header class="panel-head"><div><h3 data-i18n="console.rpc.health">Network health</h3><p class="muted small" data-i18n="console.rpc.healthLead">Select networks, then run a live availability check.</p></div></header>
                 <div class="panel-body">
-                <div class="row actions rpc-actions">
+                <div class="toolbar row actions rpc-actions">
                   <label class="check tight"><input type="checkbox" id="rpc-via-proxy" /> <span data-i18n="rpc.viaProxy">Via proxy</span></label>
                   <button id="btn-probe-networks" class="primary" data-i18n="rpc.pingNets">Ping networks</button>
                   <button id="btn-warm-latency" data-i18n="rpc.warmLatency">Warm ping</button>
@@ -1012,10 +1059,10 @@
             <!-- PROXIES -->
             <div id="page-proxies" class="page hidden demo-proxies-page">
               <header class="demo-route-intro"><div><h2 data-i18n="nav.proxies">Proxies</h2><p data-i18n="console.proxies.lead">Configure local transport routes and verify their current availability.</p></div><span id="proxy-count-hint" class="badge"></span></header>
-              <div class="demo-proxy-split">
+              <div class="form-layout demo-proxy-split">
               <section class="panel demo-proxy-editor">
                 <header class="panel-head"><div><h3 data-i18n="console.proxies.editor">Proxy editor</h3><p class="muted small" data-i18n="console.proxies.editorLead">One proxy per line. Saved with Settings → config.json + proxies.txt.</p></div></header>
-                <div class="panel-body">
+                <div class="panel-body form-section-stack">
                 <label>Proxy list
                   <textarea id="set-proxy" rows="12" spellcheck="false" style="-webkit-text-security:disc" placeholder="host:port:user:pass&#10;socks5://host:port&#10;http://user:pass@host:port"></textarea>
                 </label>
@@ -1031,7 +1078,7 @@
               </section>
               <section class="panel demo-proxy-health">
                 <header class="panel-head"><div><h3 data-i18n="console.proxies.output">Health output</h3><p class="muted small" data-i18n="console.proxies.outputLead">Probe results remain local to this application.</p></div></header>
-                <div class="panel-body">
+                <div class="panel-body form-section-stack">
                 <p id="proxy-msg" class="msg"></p>
                 <pre id="proxy-health-out" class="code"></pre>
                 </div>
@@ -1042,11 +1089,10 @@
             <!-- SETTINGS -->
             <div id="page-settings" class="page hidden demo-settings-page">
               <header class="demo-route-intro"><div><h2 data-i18n="nav.settings">Settings</h2><p data-i18n="console.settings.lead">Control local connectivity, execution defaults, and safety boundaries.</p></div></header>
+              <div class="form-layout demo-settings-layout">
               <section class="panel demo-settings-local-app">
                 <header class="panel-head"><div><h3 data-i18n="console.settings.localApp">Local application configuration</h3><p class="muted small" data-i18n="console.settings.localAppLead">Saved to config.json.</p></div></header>
-                <div class="panel-body">
-                <p id="settings-path" class="muted small"></p>
-
+                <div class="panel-body form-section-stack">
                 <details class="settings-acc" open>
                   <summary data-i18n="settings.secConnection">Connection</summary>
                   <div class="settings-acc-body">
@@ -1124,12 +1170,17 @@
                   </div>
                 </details>
 
-                <div class="row actions" style="margin-top:12px">
-                  <button id="btn-save-settings" class="primary">Save settings</button>
-                </div>
-                <p id="settings-msg" class="msg"></p>
                 </div>
               </section>
+              <aside class="panel demo-settings-summary">
+                <header class="panel-head"><div><h3 data-i18n="console.settings.localProfile">Local profile</h3><p class="muted small" data-i18n="console.settings.localProfileLead">Changes apply only to this device.</p></div></header>
+                <div class="panel-body form-section-stack">
+                  <section class="form-section"><p id="settings-path" class="muted small"></p></section>
+                  <section class="form-section summary-list"><div class="summary-row"><span data-i18n="console.settings.vault">Vault</span><strong data-i18n="console.settings.vaultLocal">Local encrypted</strong></div><div class="summary-row"><span data-i18n="console.settings.telemetry">Telemetry</span><strong data-i18n="console.settings.disabled">Disabled</strong></div></section>
+                  <section class="form-section"><div class="row actions"><button id="btn-save-settings" class="primary">Save settings</button></div><p id="settings-msg" class="msg"></p></section>
+                </div>
+              </aside>
+              </div>
             </div>
           </div>
         </div>

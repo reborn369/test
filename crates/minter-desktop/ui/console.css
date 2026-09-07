@@ -901,7 +901,7 @@ body.console-v2 {
 .console-v2 #page-home, .console-v2 .demo-tasks-page, .console-v2 .demo-raw-page, .console-v2 .demo-disperse-page, .console-v2 .demo-sweep-page, .console-v2 .demo-wl-page, .console-v2 .demo-multicall-page, .console-v2 .demo-history-page, .console-v2 .demo-wallets-page, .console-v2 .demo-rpcs-page, .console-v2 .demo-proxies-page, .console-v2 .demo-settings-page { display: grid; gap: 16px; }
 .console-v2 .overview-intro, .console-v2 .demo-route-intro { display: flex; align-items: end; justify-content: space-between; gap: 18px; }.console-v2 .overview-intro h2, .console-v2 .demo-route-intro h2 { margin: 0 0 6px; font-size: 22px; }.console-v2 .overview-intro p, .console-v2 .demo-route-intro p { margin: 0; color: var(--muted-2); font-size: 12px; }
 .console-v2 .overview-metrics { display:grid; grid-template-columns:repeat(4,1fr); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; }.console-v2 .overview-metric { padding:18px; border-right:1px solid var(--border-soft); }.console-v2 .overview-metric strong { display:block; margin:14px 0 5px; font:500 25px var(--mono); }.console-v2 .overview-metric small { color:var(--muted-2); }
-.console-v2 .overview-dashboard, .console-v2 .demo-raw-page .raw-layout, .console-v2 .demo-wl-page .wl-layout, .console-v2 .demo-multicall-composer { display:grid; grid-template-columns:minmax(0,1.65fr) minmax(280px,.8fr); gap:16px; }.console-v2 .overview-stack { display:grid; min-width:0; gap:16px; }.console-v2 .overview-panel, .console-v2 .demo-wl-page .wl-controls { min-width:0; border:1px solid var(--border); border-radius:var(--radius); background:var(--card); }.console-v2 .overview-panel-header { display:flex; flex-wrap:wrap; justify-content:space-between; gap:10px; padding:16px; border-bottom:1px solid var(--border-soft); }.console-v2 .overview-panel-header h3 { margin:0; font-size:12px; }.console-v2 .overview-live-execution, .console-v2 .overview-network-list, .console-v2 .overview-activity-list { padding:16px; }.console-v2 .overview-empty { color:var(--muted-2); }.console-v2 .overview-table-wrap { margin:0; border:0; overflow-x:auto; }
+.console-v2 .overview-dashboard, .console-v2 .demo-raw-page .raw-layout, .console-v2 .demo-wl-page .wl-layout { display:grid; grid-template-columns:minmax(0,1.65fr) minmax(280px,.8fr); gap:16px; }.console-v2 .overview-stack { display:grid; min-width:0; gap:16px; }.console-v2 .overview-panel, .console-v2 .demo-wl-page .wl-controls { min-width:0; border:1px solid var(--border); border-radius:var(--radius); background:var(--card); }.console-v2 .overview-panel-header { display:flex; flex-wrap:wrap; justify-content:space-between; gap:10px; padding:16px; border-bottom:1px solid var(--border-soft); }.console-v2 .overview-panel-header h3 { margin:0; font-size:12px; }.console-v2 .overview-live-execution, .console-v2 .overview-network-list, .console-v2 .overview-activity-list { padding:16px; }.console-v2 .overview-empty { color:var(--muted-2); }.console-v2 .overview-table-wrap { margin:0; border:0; overflow-x:auto; }
 .console-v2 .overview-network-row,
 .console-v2 .overview-activity,
 .console-v2 .overview-live-summary {
@@ -1100,8 +1100,7 @@ body.console-v2 {
 
 /* Shared workbenches intentionally retain production controls while following the demo form system. */
 .console-v2 .demo-raw-workbench,
-.console-v2 .demo-wl-workbench,
-.console-v2 .demo-multicall-composer {
+.console-v2 .demo-wl-workbench {
   grid-template-columns: minmax(0, 1.65fr) minmax(280px, .8fr);
   align-items: start;
   gap: 16px;
@@ -1109,7 +1108,6 @@ body.console-v2 {
 
 .console-v2 .demo-raw-workbench > .panel,
 .console-v2 .demo-wl-workbench > .panel,
-.console-v2 .demo-multicall-composer > .panel,
 .console-v2 .demo-disperse-workbench,
 .console-v2 .demo-sweep-workbench,
 .console-v2 .demo-proxy-split > .panel,
@@ -1199,7 +1197,6 @@ body.console-v2 {
 
 .console-v2 .demo-raw-page .raw-card,
 .console-v2 .demo-wl-page .wl-controls,
-.console-v2 .demo-multicall-composer .panel,
 .console-v2 .demo-disperse-workbench,
 .console-v2 .demo-sweep-workbench {
   border-color: var(--border-soft);
@@ -1297,7 +1294,7 @@ body.console-v2 {
 
 .console-v2 .demo-disperse-workbench,
 .console-v2 .demo-sweep-workbench { padding: 0; }
-.console-v2 .demo-disperse-workbench > *,
+.console-v2 .demo-disperse-workbench > .panel-body,
 .console-v2 .demo-sweep-workbench .sweep-pane > * { padding-inline: 17px; }
 .console-v2 .demo-sweep-workbench .sweep-pane { gap: 16px; }
 .console-v2 .demo-proxy-split { gap: 16px; }
@@ -1306,6 +1303,77 @@ body.console-v2 {
 .console-v2 .demo-proxy-editor textarea { min-height: 240px; resize: vertical; }
 .console-v2 .demo-proxy-health .code,
 .console-v2 .demo-raw-review .code { min-height: 160px; margin: 0; border-color: var(--border-soft); background: #0c0f14; }
+
+.console-v2 .page-raw,
+.console-v2 .demo-wl-workbench { max-width: none; }
+.console-v2 .demo-raw-page .raw-col-run { position: static; top: auto; }
+
+.console-v2 .demo-history-layout { padding: 0; overflow: hidden; }
+.console-v2 .demo-history-layout > .panel-head {
+  display: flex;
+  min-height: 52px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 17px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.console-v2 .demo-history-layout > .panel-head h3 { margin: 0; font-size: 12px; font-weight: 620; }
+.console-v2 .demo-history-layout > .panel-head p { margin: 3px 0 0; font-size: 10px; }
+.console-v2 .demo-history-layout > .panel-body { display: grid; gap: 16px; padding: 17px; }
+.console-v2 .demo-history-layout .run-cards { margin: 0; }
+.console-v2 .demo-history-layout .head-actions { justify-content: flex-end; }
+
+.console-v2 .form-section-stack {
+  display: grid;
+  gap: 16px;
+}
+
+.console-v2 .form-section {
+  min-width: 0;
+}
+
+.console-v2 .demo-disperse-layout,
+.console-v2 .demo-multicall-layout,
+.console-v2 .demo-settings-layout,
+.console-v2 .demo-sweep-page .sweep-pane {
+  display: grid;
+  grid-template-columns: minmax(0, 1.65fr) minmax(280px, .8fr);
+  align-items: start;
+  gap: 16px;
+}
+
+.console-v2 .demo-disperse-layout > .panel,
+.console-v2 .demo-multicall-layout > .panel,
+.console-v2 .demo-settings-layout > .panel,
+.console-v2 .demo-sweep-page .sweep-pane > .panel { min-width: 0; }
+
+.console-v2 #disp-to-list {
+  max-height: 176px;
+  min-height: 96px;
+  overflow-y: auto;
+}
+
+.console-v2 .demo-settings-summary .summary-list {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+}
+.console-v2 .demo-settings-summary .summary-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  min-height: 38px;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+.console-v2 .demo-settings-summary .summary-row:last-child { border-bottom: 0; }
+
+.console-v2 .task-ledger-wrap {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+}
 
 .console-v2 .demo-settings-page > .panel { padding: 0; }
 .console-v2 .demo-settings-local-app .panel-body { display: grid; gap: 12px; }
@@ -1330,9 +1398,10 @@ body.console-v2 {
   .console-v2 .overview-dashboard,
   .console-v2 .demo-raw-workbench,
   .console-v2 .demo-wl-workbench,
-  .console-v2 .demo-multicall-composer,
   .console-v2 .demo-proxy-split,
-  .console-v2 .demo-disperse-workbench,
+  .console-v2 .demo-disperse-layout,
+  .console-v2 .demo-multicall-layout,
+  .console-v2 .demo-settings-layout,
   .console-v2 .demo-sweep-workbench .sweep-pane { grid-template-columns: 1fr; }
   .console-v2 .demo-disperse-workbench > *,
   .console-v2 .demo-sweep-workbench .sweep-pane > * { grid-column: 1 !important; }

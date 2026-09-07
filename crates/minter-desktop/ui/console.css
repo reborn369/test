@@ -382,6 +382,446 @@ body.console-v2 {
   margin: 0 auto;
 }
 
+/* Page-level composition shared by the retained production forms and tables. */
+.console-v2 .presentation-page {
+  display: grid;
+  gap: 18px;
+}
+
+.console-v2 .presentation-page > * {
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+.console-v2 .presentation-intro {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 0;
+}
+
+.console-v2 .presentation-intro > div { min-width: 0; }
+
+.console-v2 .presentation-eyebrow {
+  display: none;
+}
+
+.console-v2 .presentation-intro h2 {
+  margin: 0 0 6px;
+  color: var(--text);
+  font-size: 22px;
+  font-weight: 620;
+  letter-spacing: -0.035em;
+}
+
+.console-v2 .presentation-intro p {
+  max-width: 650px;
+  margin: 0;
+  color: #687184;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.console-v2 .presentation-rule {
+  width: min(18vw, 230px);
+  height: 1px;
+  margin-bottom: 9px;
+  background: linear-gradient(90deg, transparent, #5f56ad, transparent);
+}
+
+.console-v2 .presentation-intro-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.console-v2 .presentation-intro-actions .badge {
+  order: 2;
+}
+
+.console-v2 .presentation-intro-actions .head-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.console-v2 .presentation-actions {
+  display: flex;
+  min-height: 60px;
+  align-items: center;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+}
+
+.console-v2 .presentation-actions .page-subhead-title { margin-right: auto; }
+
+.console-v2 .presentation-surface,
+.console-v2 .presentation-page > .panel,
+.console-v2 .presentation-page > .group-card {
+  position: relative;
+  overflow: hidden;
+  border-color: var(--border);
+  box-shadow: 0 12px 35px rgba(0, 0, 0, 0.12);
+}
+
+.console-v2 .presentation-surface::before,
+.console-v2 .presentation-page > .panel::before,
+.console-v2 .presentation-page > .group-card::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 2px;
+  opacity: 0.68;
+  background: linear-gradient(90deg, var(--accent), transparent 38%);
+  pointer-events: none;
+}
+
+.console-v2 .presentation-page > .muted:not(.small),
+.console-v2 .presentation-page > .page-subhead + .muted {
+  padding: 0 4px;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.console-v2 .presentation-page .panel-head,
+.console-v2 .presentation-page .group-card-head {
+  min-height: 58px;
+  padding-inline: 18px;
+}
+
+.console-v2 .presentation-page .form-grid-2,
+.console-v2 .presentation-page .raw-grid,
+.console-v2 .presentation-page .settings-grid {
+  gap: 14px;
+}
+
+.console-v2 .presentation-page .table-wrap {
+  border-color: var(--border-soft);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.018);
+}
+
+.console-v2 .presentation-page .data-table thead { background: #0a0d12; }
+
+/* Overview */
+.console-v2 .presentation-home-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.55fr) minmax(310px, 0.8fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.console-v2 .presentation-launch-panel {
+  padding: 0;
+}
+
+.console-v2 .presentation-launch-panel > .section-label {
+  display: flex;
+  min-height: 54px;
+  align-items: center;
+  margin: 0;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.console-v2 .presentation-launch-panel .home-launch-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0;
+  margin: 0;
+}
+
+.console-v2 .presentation-launch-panel .home-launch-card {
+  min-height: 230px;
+  border: 0;
+  border-radius: 0;
+}
+
+.console-v2 .presentation-launch-panel .home-launch-card + .home-launch-card {
+  border-left: 1px solid var(--border-soft);
+}
+
+.console-v2 .presentation-home .last-run-panel {
+  min-height: 285px;
+}
+
+.console-v2 .presentation-home .last-run-panel .panel-title {
+  min-height: 54px;
+  margin: 0;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.console-v2 .presentation-home .home-history,
+.console-v2 .presentation-home #home-last-mint {
+  margin: 14px;
+}
+
+/* Tasks */
+.console-v2 .presentation-tasks > #task-list {
+  min-height: 88px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+}
+
+.console-v2 .presentation-tasks .task-card {
+  margin: 0;
+  border: 0;
+  border-bottom: 1px solid var(--border-soft);
+  border-radius: 0;
+  background: transparent;
+}
+
+.console-v2 .presentation-tasks .task-card:last-child {
+  border-bottom: 0;
+}
+
+.console-v2 .presentation-tasks .group-card {
+  margin-top: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+}
+
+.console-v2 .presentation-tasks .group-card > .panel.nest {
+  margin: 0 14px 14px;
+}
+
+.console-v2 .presentation-tasks > details.collapsible {
+  margin: 0;
+}
+
+/* Contract and funds workflows */
+.console-v2 .presentation-raw .raw-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(340px, 0.75fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.console-v2 .presentation-raw .raw-col {
+  gap: 14px;
+}
+
+.console-v2 .presentation-raw .raw-card {
+  margin: 0;
+  padding: 18px;
+}
+
+.console-v2 .presentation-disperse > .panel,
+.console-v2 .presentation-multicall > .panel,
+.console-v2 .presentation-sweep > .panel,
+.console-v2 .presentation-wl > .panel,
+.console-v2 .presentation-wallets > .panel,
+.console-v2 .presentation-nfts > .panel,
+.console-v2 .presentation-rpcs > .panel,
+.console-v2 .presentation-proxies > .panel,
+.console-v2 .presentation-settings > .panel {
+  padding: 18px;
+}
+
+.console-v2 .presentation-disperse .flow-steps {
+  margin: 0 0 18px;
+  padding: 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: #0c0f15;
+}
+
+.console-v2 .presentation-disperse .pick-block,
+.console-v2 .presentation-sweep .sweep-pane,
+.console-v2 .presentation-multicall .settings-section {
+  padding: 18px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: #0c0f15;
+}
+
+.console-v2 .presentation-disperse .cost-card,
+.console-v2 .presentation-sweep .cost-card {
+  border-color: rgba(139, 124, 246, 0.28);
+  background: var(--accent-soft);
+}
+
+.console-v2 .presentation-sweep .seg-toggle {
+  width: fit-content;
+  margin: 0 0 16px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #0a0d12;
+}
+
+.console-v2 .presentation-sweep .sweep-pane {
+  min-height: 300px;
+}
+
+.console-v2 .presentation-multicall .settings-section {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.console-v2 .presentation-multicall .wallet-pick-head,
+.console-v2 .presentation-multicall #mc-calls,
+.console-v2 .presentation-multicall #btn-multicall,
+.console-v2 .presentation-multicall #mc-out {
+  grid-column: 1 / -1;
+}
+
+/* Access and data surfaces */
+.console-v2 .presentation-wl .wl-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.7fr) minmax(0, 1.5fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.console-v2 .presentation-wl .wl-controls {
+  grid-row: 1 / span 3;
+  padding: 16px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: #0c0f15;
+}
+
+.console-v2 .presentation-wl .wl-results-head,
+.console-v2 .presentation-rpcs .rpc-net-head {
+  min-height: 40px;
+  margin: 0;
+}
+
+.console-v2 .presentation-wallets .wallet-filters,
+.console-v2 .presentation-wallets .wallet-toolbar,
+.console-v2 .presentation-rpcs .rpc-actions {
+  margin: 0 0 12px;
+  padding: 11px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: #0c0f15;
+}
+
+.console-v2 .presentation-wallets #wallet-count-hint {
+  min-height: 46px;
+  display: flex;
+  align-items: center;
+  margin: -18px -18px 16px;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--border-soft);
+  color: var(--text-2);
+  font-family: var(--mono);
+}
+
+.console-v2 .presentation-wallets .wallet-dropzone {
+  margin-top: 16px;
+  border-color: var(--border);
+  background: #0c0f15;
+}
+
+.console-v2 .presentation-nfts .run-cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 18px;
+}
+
+.console-v2 .presentation-nfts > .panel > h3,
+.console-v2 .presentation-rpcs .rpc-subhead {
+  margin: 22px 0 10px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.console-v2 .presentation-rpcs .rpc-chain-picker {
+  margin-bottom: 16px;
+  padding: 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: #0c0f15;
+}
+
+.console-v2 .presentation-rpcs .rpc-url-list {
+  border-color: var(--border);
+  border-radius: 8px;
+  background: #0c0f15;
+}
+
+.console-v2 .presentation-proxies > .panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(300px, 0.75fr);
+  gap: 12px 18px;
+  align-items: start;
+}
+
+.console-v2 .presentation-proxies > .panel > label:first-of-type {
+  grid-row: 1 / span 4;
+}
+
+.console-v2 .presentation-proxies #set-proxy {
+  min-height: 330px;
+}
+
+.console-v2 .presentation-proxies #proxy-health-out {
+  grid-column: 2;
+  min-height: 220px;
+  margin: 0;
+}
+
+/* Settings */
+.console-v2 .presentation-settings > .panel {
+  display: block;
+  columns: 2 420px;
+  column-gap: 12px;
+  border: 0;
+  background: transparent;
+}
+
+.console-v2 .presentation-settings > .panel > p,
+.console-v2 .presentation-settings > .panel > .row.actions,
+.console-v2 .presentation-settings > .panel > button {
+  column-span: all;
+}
+
+.console-v2 .presentation-settings .settings-acc {
+  break-inside: avoid;
+  margin: 0;
+  margin-bottom: 12px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+}
+
+.console-v2 .presentation-settings .settings-acc > summary {
+  min-height: 50px;
+  padding: 0 16px;
+  border-bottom: 1px solid transparent;
+}
+
+.console-v2 .presentation-settings .settings-acc[open] > summary {
+  border-bottom-color: var(--border-soft);
+}
+
+.console-v2 .presentation-settings .settings-acc-body {
+  padding: 16px;
+}
+
+.console-v2 .presentation-wallets .wallet-toolbar,
+.console-v2 .presentation-rpcs .rpc-toolbar,
+.console-v2 .presentation-wl .wl-toolbar {
+  padding: 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: #0c0f15;
+}
+
 .console-v2 .page-subhead {
   margin-bottom: 18px;
 }
@@ -721,6 +1161,22 @@ body.console-v2 {
   .console-v2 .home-st-item:nth-child(n + 4) {
     border-top: 1px solid var(--border-soft);
   }
+
+  .console-v2 .presentation-home-grid,
+  .console-v2 .presentation-raw .raw-layout,
+  .console-v2 .presentation-wl .wl-layout,
+  .console-v2 .presentation-proxies > .panel {
+    grid-template-columns: 1fr;
+  }
+
+  .console-v2 .presentation-wl .wl-controls,
+  .console-v2 .presentation-proxies > .panel > label:first-of-type {
+    grid-row: auto;
+  }
+
+  .console-v2 .presentation-proxies #proxy-health-out {
+    grid-column: 1;
+  }
 }
 
 @media (max-width: 900px) and (min-width: 761px) {
@@ -858,6 +1314,38 @@ body.console-v2 {
     padding: 20px 16px 74px;
   }
 
+  .console-v2 .presentation-intro {
+    min-height: 0;
+    align-items: flex-start;
+    flex-direction: column;
+    padding: 0;
+  }
+
+  .console-v2 .presentation-intro-actions {
+    width: 100%;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .console-v2 .presentation-rule {
+    display: none;
+  }
+
+  .console-v2 .presentation-launch-panel .home-launch-grid,
+  .console-v2 .presentation-multicall .settings-section,
+  .console-v2 .presentation-nfts .run-cards {
+    grid-template-columns: 1fr;
+  }
+
+  .console-v2 .presentation-settings > .panel {
+    columns: 1;
+  }
+
+  .console-v2 .presentation-launch-panel .home-launch-card + .home-launch-card {
+    border-top: 1px solid var(--border-soft);
+    border-left: 0;
+  }
+
   .console-v2 .home-status-strip {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -922,5 +1410,209 @@ body.console-v2 {
     transition-duration: 0.01ms !important;
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
+  }
+}
+
+/* Route compositions mirror the demo's workbench, ledger, and split-panel pages. */
+.console-v2 .operator-surface {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+}
+
+.console-v2 .operator-task-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.72fr) minmax(0, 1.7fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.console-v2 .operator-task-index > #task-list {
+  min-height: 420px;
+  border: 0;
+  border-radius: 0;
+}
+
+.console-v2 .operator-task-index .task-card {
+  margin: 0;
+  border: 0;
+  border-bottom: 1px solid var(--border-soft);
+  border-radius: 0;
+  background: transparent;
+}
+
+.console-v2 .operator-live-run > .group-card {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.console-v2 .operator-live-run .panel.nest {
+  margin: 0;
+  border-width: 1px 0 0;
+  border-radius: 0;
+}
+
+.console-v2 .operator-tool-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.65fr) minmax(280px, 0.75fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.console-v2 .operator-tool-main,
+.console-v2 .operator-tool-aside {
+  padding: 18px;
+}
+
+.console-v2 .operator-tool-main .flow-steps {
+  margin: -18px -18px 18px;
+  border-width: 0 0 1px;
+  border-radius: 0;
+}
+
+.console-v2 .operator-tool-aside {
+  position: sticky;
+  top: 18px;
+  display: grid;
+  gap: 14px;
+  min-height: 250px;
+}
+
+.console-v2 .operator-tool-aside::before {
+  content: "REVIEW & EXECUTE";
+  color: #6e778a;
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+}
+
+.console-v2 .operator-tool-aside .cost-card,
+.console-v2 .operator-tool-aside .cta-row,
+.console-v2 .operator-tool-aside .code {
+  margin: 0;
+}
+
+.console-v2 .operator-wallet-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 18px;
+  align-items: start;
+}
+
+.console-v2 .operator-wallet-ledger,
+.console-v2 .operator-wallet-import {
+  padding: 0;
+}
+
+.console-v2 .operator-wallet-ledger > #wallet-count-hint {
+  min-height: 62px;
+  margin: 0;
+  padding: 19px 18px;
+  border-bottom: 1px solid var(--border-soft);
+  color: var(--text);
+  font: 600 13px/1.5 var(--mono);
+}
+
+.console-v2 .operator-wallet-ledger .wallet-filters,
+.console-v2 .operator-wallet-ledger .wallet-toolbar {
+  margin: 0;
+  border-width: 0 0 1px;
+  border-radius: 0;
+}
+
+.console-v2 .operator-wallet-ledger .table-wrap {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+}
+
+.console-v2 .operator-wallet-import {
+  position: sticky;
+  top: 18px;
+}
+
+.console-v2 .operator-wallet-import .wallet-dropzone {
+  margin: 0;
+  border: 0;
+  border-bottom: 1px solid var(--border-soft);
+  border-radius: 0;
+}
+
+.console-v2 .operator-wallet-import > .wallet-import-row,
+.console-v2 .operator-wallet-import > .msg {
+  margin: 14px;
+}
+
+.console-v2 .operator-history-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.72fr) minmax(0, 1.45fr);
+  gap: 18px;
+}
+
+.console-v2 .operator-history-runs,
+.console-v2 .operator-history-wallets {
+  padding: 16px;
+}
+
+.console-v2 .operator-history-runs .run-cards {
+  grid-template-columns: 1fr;
+}
+
+.console-v2 .operator-history-wallets > h3 {
+  margin: 2px 2px 16px;
+}
+
+.console-v2 .operator-rpc-layout {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.console-v2 .operator-rpc-controls,
+.console-v2 .operator-rpc-results {
+  padding: 16px;
+}
+
+.console-v2 .operator-rpc-controls {
+  position: sticky;
+  top: 18px;
+}
+
+.console-v2 .operator-rpc-controls .rpc-actions {
+  display: grid;
+  margin: 0 0 18px;
+  border: 0;
+}
+
+.console-v2 .operator-rpc-controls .rpc-actions > * {
+  width: 100%;
+}
+
+.console-v2 .operator-rpc-controls .rpc-chain-picker {
+  grid-template-columns: 1fr 1fr;
+}
+
+.console-v2 .operator-rpc-results > .table-wrap:first-child {
+  margin-top: 0;
+}
+
+@media (max-width: 1180px) {
+  .console-v2 .operator-task-layout,
+  .console-v2 .operator-tool-layout,
+  .console-v2 .operator-wallet-layout,
+  .console-v2 .operator-history-layout,
+  .console-v2 .operator-rpc-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .console-v2 .operator-tool-aside,
+  .console-v2 .operator-wallet-import,
+  .console-v2 .operator-rpc-controls {
+    position: static;
   }
 }

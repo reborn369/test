@@ -824,6 +824,250 @@ const PAGE_KICKERS = {
   settings: "System",
 };
 
+const PRESENTATION_COPY = {
+  en: {
+    home: ["Workspace", "Readiness, recent execution, and the quickest way to start an operation."],
+    tasks: ["Minting", "Create a collection run, then monitor every wallet through its execution phases."],
+    raw: ["Minting", "Configure a direct contract call with the same review and execution safeguards."],
+    wallets: ["Wallets & funds", "Organize burner wallets, routes, balances, and bulk maintenance in one ledger."],
+    disperse: ["Wallets & funds", "Stage a controlled distribution and inspect its quote before confirmation."],
+    sweep: ["Wallets & funds", "Consolidate native funds or NFTs while keeping the execution trail visible."],
+    rpcs: ["Network & access", "Measure the network paths available to critical execution without changing their order."],
+    proxies: ["Network & access", "Manage private routing and verify health without exposing credentials."],
+    wl: ["Network & access", "Check collection access across the selected burner set as a live batch."],
+    multicall: ["Tools", "Compose contract calls, inspect the payload, and send only after review."],
+    nfts: ["Tools", "Review persisted runs, wallet outcomes, and exported operational evidence."],
+    settings: ["System", "Tune network, execution, and safety defaults for this local operator console."],
+  },
+  ru: {
+    home: ["Рабочее пространство", "Готовность системы, последние операции и быстрый запуск нового действия."],
+    tasks: ["Минтинг", "Создайте запуск коллекции и отслеживайте каждый кошелёк по этапам выполнения."],
+    raw: ["Минтинг", "Настройте прямой вызов контракта с проверкой и защитой перед отправкой."],
+    wallets: ["Кошельки и средства", "Управляйте burner-кошельками, маршрутами, балансами и массовыми действиями."],
+    disperse: ["Кошельки и средства", "Подготовьте распределение и проверьте расчёт до подтверждения."],
+    sweep: ["Кошельки и средства", "Соберите нативные средства или NFT с прозрачным журналом выполнения."],
+    rpcs: ["Сеть и доступ", "Проверьте доступные сетевые маршруты, не изменяя их приоритет."],
+    proxies: ["Сеть и доступ", "Управляйте приватными маршрутами и проверяйте их без раскрытия данных."],
+    wl: ["Сеть и доступ", "Проверьте доступ к коллекции для выбранного набора кошельков."],
+    multicall: ["Инструменты", "Соберите вызовы контрактов, проверьте payload и отправьте после ревью."],
+    nfts: ["Инструменты", "Просматривайте сохранённые запуски, результаты кошельков и экспорты."],
+    settings: ["Система", "Настройте сеть, выполнение и защитные параметры локальной консоли."],
+  },
+};
+
+function createOperatorSurface(className, nodes) {
+  const surface = document.createElement("section");
+  surface.className = `operator-surface ${className}`;
+  surface.append(...nodes.filter(Boolean));
+  return surface;
+}
+
+function installRouteCompositions() {
+  const tasks = $("page-tasks");
+  if (tasks && !tasks.querySelector(":scope > .operator-task-layout")) {
+    const layout = document.createElement("div");
+    layout.className = "operator-task-layout";
+    layout.append(
+      createOperatorSurface("operator-task-index", [$("task-list")]),
+      createOperatorSurface("operator-live-run", [tasks.querySelector(":scope > .group-card")]),
+    );
+    tasks.querySelector(":scope > .presentation-intro")?.after(layout);
+  }
+
+  const dispersePanel = $("page-disperse")?.querySelector(":scope > .panel");
+  if (dispersePanel && !dispersePanel.querySelector(":scope > .operator-tool-layout")) {
+    const forms = [...dispersePanel.querySelectorAll(":scope > .form-grid-2")];
+    const layout = document.createElement("div");
+    layout.className = "operator-tool-layout";
+    layout.append(
+      createOperatorSurface("operator-tool-main", [$("flow-steps"), forms[0], dispersePanel.querySelector(":scope > .pick-block"), forms[1]]),
+      createOperatorSurface("operator-tool-aside", [$("disp-total"), $("disp-summary"), $("btn-disperse")?.closest(".cta-row"), $("disp-out")]),
+    );
+    dispersePanel.append(layout);
+  }
+
+  const walletsPanel = $("page-wallets")?.querySelector(":scope > .panel");
+  if (walletsPanel && !walletsPanel.querySelector(":scope > .operator-wallet-layout")) {
+    const layout = document.createElement("div");
+    layout.className = "operator-wallet-layout";
+    const importRows = [...walletsPanel.querySelectorAll(":scope > .row.wallet-import-row")];
+    layout.append(
+      createOperatorSurface("operator-wallet-ledger", [
+        $("wallet-count-hint"),
+        $("wallet-search-bar"),
+        walletsPanel.querySelector(":scope > .wallet-filters"),
+        walletsPanel.querySelector(":scope > .wallet-toolbar"),
+        $("wallet-table-wrap"),
+        $("wallet-bulk-bar"),
+        $("wallet-list"),
+      ]),
+      createOperatorSurface("operator-wallet-import", [$("wallet-dropzone"), ...importRows, $("wallet-msg")]),
+    );
+    walletsPanel.append(layout);
+  }
+
+  const historyPanel = $("page-nfts")?.querySelector(":scope > .panel");
+  if (historyPanel && !historyPanel.querySelector(":scope > .operator-history-layout")) {
+    const tables = [...historyPanel.querySelectorAll(":scope > .table-wrap")];
+    const lastRunTitle = [...historyPanel.children].find((node) => node.matches?.("h3"));
+    const layout = document.createElement("div");
+    layout.className = "operator-history-layout";
+    layout.append(
+      createOperatorSurface("operator-history-runs", [$("run-history-cards"), $("run-history-wrap")]),
+      createOperatorSurface("operator-history-wallets", [lastRunTitle, tables.find((node) => node.id !== "run-history-wrap"), $("nfts-export")]),
+    );
+    historyPanel.append(layout);
+  }
+
+  const rpcPanel = $("page-rpcs")?.querySelector(":scope > .panel");
+  if (rpcPanel && !rpcPanel.querySelector(":scope > .operator-rpc-layout")) {
+    const layout = document.createElement("div");
+    layout.className = "operator-rpc-layout";
+    layout.append(
+      createOperatorSurface("operator-rpc-controls", [
+        rpcPanel.querySelector(":scope > .rpc-actions"),
+        rpcPanel.querySelector(":scope > .rpc-net-head"),
+        $("rpc-chain-picker"),
+      ]),
+      createOperatorSurface("operator-rpc-results", [
+        $("rpc-net-wrap"),
+        ...[...rpcPanel.children].filter((node) => node.matches?.(".rpc-subhead, .rpc-url-list, .code")),
+      ]),
+    );
+    rpcPanel.append(layout);
+  }
+
+  $("page-raw")?.querySelector(".raw-layout")?.classList.add("operator-form-workbench");
+  $("page-sweep")?.querySelectorAll(".sweep-pane").forEach((node) => node.classList.add("operator-surface"));
+  $("page-wl")?.querySelector(".wl-layout")?.classList.add("operator-batch-workbench");
+  $("page-multicall")?.querySelector(".settings-section")?.classList.add("operator-call-workbench");
+  $("page-proxies")?.querySelector(":scope > .panel")?.classList.add("operator-access-workbench");
+  $("page-settings")?.querySelector(":scope > .panel")?.classList.add("operator-settings-workbench");
+}
+
+function installPresentationLayout() {
+  Object.entries(PRESENTATION_COPY.en).forEach(([name, [, fallbackDescription]]) => {
+    const page = $("page-" + name);
+    if (!page || page.querySelector(":scope > .presentation-intro")) return;
+    page.classList.add("presentation-page", `presentation-${name}`);
+
+    const directHead = page.querySelector(":scope > .page-subhead");
+    const surface = page.querySelector(":scope > .panel");
+    const panelHead = surface?.querySelector(":scope > .panel-head");
+    const sourceHead = directHead || panelHead;
+    const existingTitle = sourceHead?.querySelector(":scope > h2");
+    const directLead = page.querySelector(":scope > p.muted");
+    const panelLead = surface?.querySelector(":scope > p.muted");
+    const existingLead = directLead || panelLead;
+
+    const intro = document.createElement("header");
+    intro.className = "presentation-intro";
+    const copy = document.createElement("div");
+    const eyebrow = document.createElement("span");
+    eyebrow.className = "presentation-eyebrow";
+    eyebrow.dataset.presentationEyebrow = name;
+    const title = existingTitle || document.createElement("h2");
+    title.dataset.presentationTitle = name;
+    title.textContent = t("page." + name) || name;
+    const description = existingLead || document.createElement("p");
+    description.dataset.presentationDescription = name;
+    if (!existingLead) description.textContent = fallbackDescription;
+    copy.append(eyebrow, title, description);
+    intro.append(copy);
+
+    const actionNodes = sourceHead
+      ? [...sourceHead.children].filter((node) => node !== existingTitle)
+      : [];
+    if (actionNodes.length) {
+      const actions = document.createElement("div");
+      actions.className = "presentation-intro-actions";
+      actions.append(...actionNodes);
+      intro.append(actions);
+    } else {
+      const rule = document.createElement("span");
+      rule.className = "presentation-rule";
+      rule.setAttribute("aria-hidden", "true");
+      intro.append(rule);
+    }
+
+    sourceHead?.remove();
+    page.prepend(intro);
+
+    page.querySelectorAll(":scope > .panel, :scope > .group-card, :scope > .raw-card, :scope > .task-section").forEach((surface) => {
+      surface.classList.add("presentation-surface");
+    });
+  });
+
+  const home = $("page-home");
+  if (home && !home.querySelector(":scope > .presentation-home-grid")) {
+    const launchLabel = home.querySelector(":scope > .section-label");
+    const launchGrid = home.querySelector(":scope > .home-launch-grid");
+    const lastRun = home.querySelector(":scope > .last-run-panel");
+    if (launchLabel && launchGrid && lastRun) {
+      const dashboard = document.createElement("div");
+      dashboard.className = "presentation-home-grid";
+      const launchPanel = document.createElement("section");
+      launchPanel.className = "panel presentation-launch-panel";
+      launchPanel.append(launchLabel, launchGrid);
+      dashboard.append(launchPanel, lastRun);
+      home.append(dashboard);
+    }
+  }
+
+  installRouteCompositions();
+
+  const nav = $("sidebar-nav");
+  if (!nav || nav.dataset.presentationGrouped) return;
+  const groups = [
+    ["Workspace", ["home"]],
+    ["Minting", ["tasks", "raw"]],
+    ["Wallets & funds", ["wallets", "disperse", "sweep"]],
+    ["Network & access", ["rpcs", "proxies", "wl"]],
+    ["Tools", ["multicall", "nfts"]],
+  ];
+  const buttons = new Map([...nav.querySelectorAll(".nav-item[data-page]")].map((button) => [button.dataset.page, button]));
+  nav.replaceChildren(...groups.map(([label, pages]) => {
+    const group = document.createElement("div");
+    group.className = "nav-group";
+    const title = document.createElement("div");
+    title.className = "nav-group-label presentation-nav-label";
+    title.textContent = label;
+    group.append(title, ...pages.map((page) => buttons.get(page)).filter(Boolean));
+    return group;
+  }));
+  nav.dataset.presentationGrouped = "true";
+  refreshPresentationCopy();
+}
+
+function refreshPresentationCopy() {
+  const lang = getLang() === "ru" ? "ru" : "en";
+  const copy = PRESENTATION_COPY[lang];
+  Object.entries(copy).forEach(([name, [eyebrow, fallbackDescription]]) => {
+    const page = $("page-" + name);
+    const eyebrowNode = page?.querySelector(`[data-presentation-eyebrow="${name}"]`);
+    const titleNode = page?.querySelector(`[data-presentation-title="${name}"]`);
+    const descriptionNode = page?.querySelector(`[data-presentation-description="${name}"]`);
+    if (eyebrowNode) eyebrowNode.textContent = eyebrow;
+    if (titleNode) titleNode.textContent = t("page." + name) || name;
+    if (descriptionNode && !descriptionNode.hasAttribute("data-i18n")) {
+      descriptionNode.textContent = fallbackDescription;
+    }
+  });
+
+  const navLabels = lang === "ru"
+    ? ["Рабочее пространство", "Минтинг", "Кошельки и средства", "Сеть и доступ", "Инструменты"]
+    : ["Workspace", "Minting", "Wallets & funds", "Network & access", "Tools"];
+  document.querySelectorAll(".presentation-nav-label").forEach((node, index) => {
+    node.textContent = navLabels[index] || "";
+  });
+
+  const activePage = document.querySelector(".nav-item.active")?.dataset.page;
+  const kicker = $("page-kicker");
+  if (activePage && kicker) kicker.textContent = copy[activePage]?.[0] || PAGE_KICKERS[activePage] || "Workspace";
+}
+
+installPresentationLayout();
+
 function setSidebarOpen(open) {
   const sidebar = $("app-sidebar");
   const backdrop = $("sidebar-backdrop");
@@ -845,7 +1089,8 @@ function showPage(name) {
   const title = $("page-title");
   if (title) title.textContent = t("page." + name) || name;
   const kicker = $("page-kicker");
-  if (kicker) kicker.textContent = PAGE_KICKERS[name] || "Workspace";
+  const lang = getLang() === "ru" ? "ru" : "en";
+  if (kicker) kicker.textContent = PRESENTATION_COPY[lang][name]?.[0] || PAGE_KICKERS[name] || "Workspace";
   setSidebarOpen(false);
 }
 
@@ -1079,10 +1324,15 @@ armIdleLockListeners();
 $("lang-chip")?.addEventListener("click", () => {
   setLang(getLang() === "en" ? "ru" : "en");
   applyI18n();
+  refreshPresentationCopy();
   const title = $("page-title");
   const active = document.querySelector(".nav-item.active");
   if (title && active?.dataset.page) {
     title.textContent = t("page." + active.dataset.page);
+    const introTitle = $("page-" + active.dataset.page)?.querySelector(
+      ":scope > .presentation-intro h2"
+    );
+    if (introTitle) introTitle.textContent = t("page." + active.dataset.page);
   }
   renderWalletsVirtual();
   scheduleMintTableRender();

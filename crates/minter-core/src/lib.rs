@@ -61,8 +61,7 @@ pub use api::{
     GeneratedBurnersInfo, LatencyReport, LatencyRpcRow, MintCostQuote, MintOptions,
     MulticallStepInput, NetworkFeeSnapshot, NetworkProbeRow, ProxyHealthRow, ProxyListItem,
     RawProbeRow, RawSniperInput, RpcProbeResult, SecurityStatus, Session, StageRow, SweepResultRow,
-    WalletBalanceRow, WalletEligibilityReport, WalletEligibilityRow, WalletInfo, WalletNftCountRow,
-    WarmRpcLatencyRow,
+    WalletBalanceRow, WalletEligibilityReport, WalletEligibilityRow, WalletInfo, WarmRpcLatencyRow,
 };
 
 /// When true, suppress noisy `println!` in core (desktop sets QUIET=1 by default).

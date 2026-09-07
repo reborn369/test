@@ -919,26 +919,6 @@ async fn wallet_balances(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct WalletNftCountsInput {
-    wallet_addresses: Option<Vec<String>>,
-    chain: String,
-}
-
-#[tauri::command]
-async fn wallet_nft_counts(
-    state: State<'_, Arc<AppState>>,
-    input: WalletNftCountsInput,
-) -> Result<Vec<minter_core::WalletNftCountRow>, String> {
-    let _slot = net_slot(&state).await?;
-    let session = state.session.lock().clone();
-    session
-        .wallet_nft_counts(input.wallet_addresses, &input.chain)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ProbeNetworksInput {
     /// Chain names e.g. ethereum, base, polygon. Empty → common set.
     chains: Option<Vec<String>>,
@@ -2792,7 +2772,6 @@ pub fn run() {
             import_keys_text,
             list_proxies,
             wallet_balances,
-            wallet_nft_counts,
             probe_networks,
             warm_rpc_latency,
             measure_fire_lag,

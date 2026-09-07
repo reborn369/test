@@ -1192,36 +1192,6 @@ async fn discover_wallet_assets(
     bail!("NFT discovery failed: {}", errors.join(" | "))
 }
 
-pub(crate) async fn count_wallet_assets(
-    _rpc: &RpcClient,
-    chain_id: u64,
-    owner: Address,
-    alchemy_api_key: Option<&str>,
-) -> Result<usize> {
-    // The Wallets page only needs a count. Prefer the free explorer here: the
-    // Alchemy NFT endpoint costs hundreds of CUs per wallet and made a single
-    // 100-wallet refresh disproportionately expensive. Sweep discovery keeps
-    // its existing Alchemy-first order because correctness there moves assets.
-    let mut errors = Vec::new();
-    if let Some(base_url) = blockscout_nft_base(chain_id) {
-        // A failed free inventory refresh must not silently spend paid CUs.
-        return fetch_assets_blockscout(base_url, owner, None)
-            .await
-            .map(|assets| assets.len())
-            .context("Free NFT indexer unavailable; count unknown");
-    }
-    if let (Some(api_key), Some(domain)) = (alchemy_api_key, alchemy_nft_domain(chain_id)) {
-        match fetch_assets_alchemy_v3(api_key, domain, owner, None).await {
-            Ok(assets) => return Ok(assets.len()),
-            Err(error) => errors.push(format!("Alchemy: {error}")),
-        }
-    }
-    if errors.is_empty() {
-        bail!("NFT count is unavailable for this network")
-    }
-    bail!("NFT count failed: {}", errors.join(" | "))
-}
-
 async fn nft_owner_of(rpc: &RpcClient, contract: Address, token_id: U256) -> Result<Address> {
     let mut data = function_selector("ownerOf(uint256)").to_vec();
     data.extend(encode_u256(token_id));

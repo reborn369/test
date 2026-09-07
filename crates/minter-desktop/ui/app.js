@@ -1238,7 +1238,7 @@ function paintWalletRow(i) {
   }
   const bal =
     w.balanceEth != null
-      ? `<span class="wallet-assets-line"><span class="${w.balanceOk ? "ok" : "warn"}">${escapeHtml(w.balanceEth)} ${escapeHtml(w.nativeSymbol || "ETH")}</span><span class="muted">$${escapeHtml(w.balanceUsd ?? "—")}</span><span class="wallet-nft-count" title="${escapeHtml(w.nftError || "NFTs on selected network")}">NFT ${escapeHtml(w.nftCount ?? "—")}</span></span>`
+      ? `<span class="wallet-assets-line"><span class="${w.balanceOk ? "ok" : "warn"}">${escapeHtml(w.balanceEth)} ${escapeHtml(w.nativeSymbol || "ETH")}</span><span class="muted">$${escapeHtml(w.balanceUsd ?? "—")}</span></span>`
       : `<span class="muted">—</span>`;
   tr.innerHTML = `
     <td><input type="checkbox" class="wallet-cb" data-addr="${escapeHtml(w.address)}" ${sel ? "checked" : ""} /></td>
@@ -1314,8 +1314,6 @@ async function loadWallets() {
         balanceUsd: w.balanceUsd,
         usdPrice: w.usdPrice,
         nativeSymbol: w.nativeSymbol,
-        nftCount: w.nftCount,
-        nftError: w.nftError,
       }])
   );
   walletData = (list || []).map((w) => {
@@ -1328,8 +1326,6 @@ async function loadWallets() {
       balanceUsd: b?.balanceUsd,
       usdPrice: b?.usdPrice,
       nativeSymbol: b?.nativeSymbol,
-      nftCount: b?.nftCount,
-      nftError: b?.nftError,
     };
   });
   // keep selection only for still-present addresses
@@ -1577,18 +1573,9 @@ $("btn-wallets-balances")?.addEventListener("click", async () => {
     const addrs = walletSelection.size
       ? [...walletSelection]
       : walletData.map((w) => w.address);
-    const balancesPromise = invoke("wallet_balances", {
+    const rows = await invoke("wallet_balances", {
       input: { walletAddresses: addrs, chain },
     });
-    const nftPromise = chain
-      ? invoke("wallet_nft_counts", {
-          input: { walletAddresses: addrs, chain },
-        }).catch((error) => {
-          console.warn("wallet NFT counts", error);
-          return [];
-        })
-      : Promise.resolve([]);
-    const rows = await balancesPromise;
     const map = new Map(rows.map((r) => [addrKey(r.address), r]));
     for (const w of walletData) {
       const r = map.get(addrKey(w.address));
@@ -1599,18 +1586,6 @@ $("btn-wallets-balances")?.addEventListener("click", async () => {
         w.usdPrice = r.usdPrice;
         w.nativeSymbol = r.nativeSymbol || "ETH";
         w.balanceChain = r.chain || chain;
-      }
-    }
-    renderWalletsVirtual();
-    const nftRows = await nftPromise;
-    const nftMap = new Map(
-      nftRows.filter((row) => row.address).map((row) => [addrKey(row.address), row])
-    );
-    for (const w of walletData) {
-      const row = nftMap.get(addrKey(w.address));
-      if (row) {
-        w.nftCount = row.count;
-        w.nftError = row.error || "";
       }
     }
     renderWalletsVirtual();

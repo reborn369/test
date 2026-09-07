@@ -2883,15 +2883,6 @@ input[type="checkbox"] {
   white-space: nowrap;
 }
 
-.wallet-nft-count {
-  padding: 2px 6px;
-  border: 1px solid var(--border-soft);
-  border-radius: 999px;
-  color: var(--text);
-  background: var(--card-2);
-  font-size: 0.7rem;
-}
-
 .wallet-table-align .wallet-proxy-sel {
   width: 100%;
   max-width: 130px;

@@ -707,17 +707,17 @@ function shortAddr(a) {
 }
 
 function renderHomeStatusStrip(s) {
-  const strip = $("home-status-strip");
-  if (!strip || !s) return;
-  const vaultCls = s.unlocked ? "ok" : "warn";
-  const rpcCls = s.rpc_ok ? "ok" : "warn";
-  strip.innerHTML = `
-    <div class="home-st-item"><span class="k">Vault</span><span class="v ${vaultCls}">${escapeHtml(s.vault_label)}</span></div>
-    <div class="home-st-item"><span class="k">Wallets</span><span class="v ok">${s.wallet_count}</span></div>
-    <div class="home-st-item"><span class="k">Network</span><span class="v ${rpcCls}">${escapeHtml(s.network || "—")}</span></div>
-    <div class="home-st-item"><span class="k">RPC</span><span class="v ${rpcCls}">${escapeHtml(s.rpc || "—")}</span></div>
-    <div class="home-st-item"><span class="k">Mode</span><span class="v ${s.dry_run ? "ok" : "warn"}">${s.dry_run ? "Dry" : "LIVE"}</span></div>
-  `;
+  if (!s) return;
+  const set = (id, text) => { const node = $(id); if (node) node.textContent = text; };
+  set("home-wallet-count", String(s.wallet_count ?? 0));
+  set("home-wallet-count-meta", t("console.home.vaultState", { state: t(s.unlocked ? "console.home.unlocked" : "console.home.locked") }));
+  set("home-network-name", s.network || "—");
+  set("home-network-meta", s.rpc ? `RPC · ${s.rpc}` : t("console.home.noRpc"));
+  const state = $("home-network-state");
+  if (state) { state.textContent = t(s.rpc_ok ? "console.home.operational" : "console.home.attention"); state.className = `overview-status ${s.rpc_ok ? "ok" : "warn"}`; }
+  const pulse = $("home-network-pulse");
+  if (pulse) pulse.innerHTML = `<div class="overview-network-row"><span><strong>${escapeHtml(s.network || t("console.home.noNetwork"))}</strong><small>${escapeHtml(s.rpc || t("console.home.noRpc"))}</small></span><span class="${s.rpc_ok ? "ok" : "warn"}">${t(s.rpc_ok ? "console.home.available" : "console.home.unavailable")}</span></div>`;
+  renderHomeDashboard();
 }
 
 function renderHomeHistory() {
@@ -727,37 +727,49 @@ function renderHomeHistory() {
   hist.innerHTML = "";
   const runs = mintRunHistory || [];
   if (!runs.length) {
-    if (pre) {
-      pre.classList.remove("hidden");
-      if (pre.dataset.hasRun !== "1") {
-        pre.textContent = t("home.noMint") || "No mint run yet.";
-      }
-    }
+    hist.innerHTML = `<p class="overview-empty">${escapeHtml(t("home.noMint") || "No mint run yet.")}</p>`;
+    if (pre) pre.classList.add("hidden");
     return;
   }
-  if (pre) {
-    // keep detailed last run in pre if session filled it; else use history[0]
-    if (pre.dataset.hasRun !== "1") {
-      const r = runs[0];
-      pre.dataset.hasRun = "1";
-      pre.textContent = [
-        `${r.slug || "run"} · ${r.phase || "—"} · ${r.chain || "—"}`,
-        `ok=${r.confirmed ?? 0} fail=${r.failed ?? 0} dry=${!!r.dryRun} ${r.elapsedMs ?? "—"}ms`,
-      ].join("\n");
-    }
-    pre.classList.remove("hidden");
-  }
-  // up to 3 short rows
   for (const r of runs.slice(0, 3)) {
     const row = document.createElement("div");
-    row.className = "home-history-row";
+    row.className = "overview-activity";
     row.innerHTML = `
-      <span class="hh-main">${escapeHtml(r.slug || "mint")}${r.phase ? " · " + escapeHtml(r.phase) : ""}</span>
-      <span class="hh-meta">${escapeHtml(r.chain || "—")} · ok ${r.confirmed ?? 0}/${(r.confirmed ?? 0) + (r.failed ?? 0)}${r.dryRun ? " · dry" : ""}</span>
+      <span class="overview-activity-icon">✓</span>
+      <span><strong>${escapeHtml(r.slug || "mint")}${r.phase ? " · " + escapeHtml(r.phase) : ""}</strong><small>${escapeHtml(r.chain || "—")} · ${t("console.home.confirmed", { n: r.confirmed ?? 0 })}${r.failed ? ` · ${t("console.home.failed", { n: r.failed })}` : ""}${r.dryRun ? ` · ${t("console.home.dryRun")}` : ""}</small></span>
+      <time>${r.at ? new Date(r.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—"}</time>
     `;
     row.addEventListener("click", () => navigate("nfts"));
     hist.appendChild(row);
   }
+  if (pre) pre.classList.add("hidden");
+}
+
+function renderHomeDashboard() {
+  const tasks = mintTasks || [];
+  const active = tasks.filter((task) => taskDisplayStatus(task) === "running" || taskDisplayStatus(task) === "queued");
+  const confirmed = (mintRunHistory || []).reduce((total, run) => total + (Number(run.confirmed) || 0), 0);
+  const set = (id, text) => { const node = $(id); if (node) node.textContent = text; };
+  set("home-active-tasks", String(active.length));
+  set("home-active-tasks-meta", active.length ? t("console.home.activeMeta", { n: active.length }) : t("console.home.noExecution"));
+  set("home-confirmed-count", String(confirmed));
+  set("home-confirmed-meta", (mintRunHistory || []).length ? t("console.home.runsMeta", { n: (mintRunHistory || []).length }) : t("console.home.noRuns"));
+  const liveLabel = $("home-live-label"); const live = $("home-live-execution");
+  const activeTask = tasks.find((task) => task.id === activeTaskId) || active[0];
+  if (liveLabel) liveLabel.textContent = activeTask ? t("console.home.live") : t("console.home.idle");
+  if (live) live.innerHTML = activeTask ? `<div class="overview-live-summary"><strong>${escapeHtml(activeTask.name || activeTask.slug || t("console.home.mintTask"))}</strong><span>${escapeHtml(activeTask.chainOverride || t("console.home.autoNetwork"))} · ${t("console.home.walletCount", { n: activeTask.wallets?.length || 0 })} · ${escapeHtml(t(`console.home.status.${taskDisplayStatus(activeTask)}`))}</span></div>` : `<p class="overview-empty">${escapeHtml(t("console.home.noActiveExecution"))}</p>`;
+  const queue = $("home-queue");
+  if (queue) {
+    queue.innerHTML = "";
+    const queued = tasks.filter((task) => task !== activeTask).slice(0, 5);
+    if (!queued.length) queue.innerHTML = `<tr><td colspan="5" class="overview-empty-cell">${escapeHtml(t("console.home.noQueuedTasks"))}</td></tr>`;
+    for (const task of queued) {
+      const display = taskDisplayStatus(task); const row = document.createElement("tr");
+      row.innerHTML = `<td>${escapeHtml(task.name || task.slug || t("console.home.untitledTask"))}</td><td>${escapeHtml(task.chainOverride || t("console.home.auto"))}</td><td>${task.wallets?.length || 0}</td><td>${escapeHtml(task.atTime || t("console.home.manual"))}</td><td><span class="overview-status ${display === "ready" ? "ok" : display === "error" || display === "blocked" ? "warn" : ""}">${escapeHtml(t(`console.home.status.${display}`))}</span></td>`;
+      row.addEventListener("click", () => navigate("tasks")); queue.appendChild(row);
+    }
+  }
+  renderHomeHistory();
 }
 
 async function refreshStatus() {
@@ -824,250 +836,6 @@ const PAGE_KICKERS = {
   settings: "System",
 };
 
-const PRESENTATION_COPY = {
-  en: {
-    home: ["Workspace", "Readiness, recent execution, and the quickest way to start an operation."],
-    tasks: ["Minting", "Create a collection run, then monitor every wallet through its execution phases."],
-    raw: ["Minting", "Configure a direct contract call with the same review and execution safeguards."],
-    wallets: ["Wallets & funds", "Organize burner wallets, routes, balances, and bulk maintenance in one ledger."],
-    disperse: ["Wallets & funds", "Stage a controlled distribution and inspect its quote before confirmation."],
-    sweep: ["Wallets & funds", "Consolidate native funds or NFTs while keeping the execution trail visible."],
-    rpcs: ["Network & access", "Measure the network paths available to critical execution without changing their order."],
-    proxies: ["Network & access", "Manage private routing and verify health without exposing credentials."],
-    wl: ["Network & access", "Check collection access across the selected burner set as a live batch."],
-    multicall: ["Tools", "Compose contract calls, inspect the payload, and send only after review."],
-    nfts: ["Tools", "Review persisted runs, wallet outcomes, and exported operational evidence."],
-    settings: ["System", "Tune network, execution, and safety defaults for this local operator console."],
-  },
-  ru: {
-    home: ["Рабочее пространство", "Готовность системы, последние операции и быстрый запуск нового действия."],
-    tasks: ["Минтинг", "Создайте запуск коллекции и отслеживайте каждый кошелёк по этапам выполнения."],
-    raw: ["Минтинг", "Настройте прямой вызов контракта с проверкой и защитой перед отправкой."],
-    wallets: ["Кошельки и средства", "Управляйте burner-кошельками, маршрутами, балансами и массовыми действиями."],
-    disperse: ["Кошельки и средства", "Подготовьте распределение и проверьте расчёт до подтверждения."],
-    sweep: ["Кошельки и средства", "Соберите нативные средства или NFT с прозрачным журналом выполнения."],
-    rpcs: ["Сеть и доступ", "Проверьте доступные сетевые маршруты, не изменяя их приоритет."],
-    proxies: ["Сеть и доступ", "Управляйте приватными маршрутами и проверяйте их без раскрытия данных."],
-    wl: ["Сеть и доступ", "Проверьте доступ к коллекции для выбранного набора кошельков."],
-    multicall: ["Инструменты", "Соберите вызовы контрактов, проверьте payload и отправьте после ревью."],
-    nfts: ["Инструменты", "Просматривайте сохранённые запуски, результаты кошельков и экспорты."],
-    settings: ["Система", "Настройте сеть, выполнение и защитные параметры локальной консоли."],
-  },
-};
-
-function createOperatorSurface(className, nodes) {
-  const surface = document.createElement("section");
-  surface.className = `operator-surface ${className}`;
-  surface.append(...nodes.filter(Boolean));
-  return surface;
-}
-
-function installRouteCompositions() {
-  const tasks = $("page-tasks");
-  if (tasks && !tasks.querySelector(":scope > .operator-task-layout")) {
-    const layout = document.createElement("div");
-    layout.className = "operator-task-layout";
-    layout.append(
-      createOperatorSurface("operator-task-index", [$("task-list")]),
-      createOperatorSurface("operator-live-run", [tasks.querySelector(":scope > .group-card")]),
-    );
-    tasks.querySelector(":scope > .presentation-intro")?.after(layout);
-  }
-
-  const dispersePanel = $("page-disperse")?.querySelector(":scope > .panel");
-  if (dispersePanel && !dispersePanel.querySelector(":scope > .operator-tool-layout")) {
-    const forms = [...dispersePanel.querySelectorAll(":scope > .form-grid-2")];
-    const layout = document.createElement("div");
-    layout.className = "operator-tool-layout";
-    layout.append(
-      createOperatorSurface("operator-tool-main", [$("flow-steps"), forms[0], dispersePanel.querySelector(":scope > .pick-block"), forms[1]]),
-      createOperatorSurface("operator-tool-aside", [$("disp-total"), $("disp-summary"), $("btn-disperse")?.closest(".cta-row"), $("disp-out")]),
-    );
-    dispersePanel.append(layout);
-  }
-
-  const walletsPanel = $("page-wallets")?.querySelector(":scope > .panel");
-  if (walletsPanel && !walletsPanel.querySelector(":scope > .operator-wallet-layout")) {
-    const layout = document.createElement("div");
-    layout.className = "operator-wallet-layout";
-    const importRows = [...walletsPanel.querySelectorAll(":scope > .row.wallet-import-row")];
-    layout.append(
-      createOperatorSurface("operator-wallet-ledger", [
-        $("wallet-count-hint"),
-        $("wallet-search-bar"),
-        walletsPanel.querySelector(":scope > .wallet-filters"),
-        walletsPanel.querySelector(":scope > .wallet-toolbar"),
-        $("wallet-table-wrap"),
-        $("wallet-bulk-bar"),
-        $("wallet-list"),
-      ]),
-      createOperatorSurface("operator-wallet-import", [$("wallet-dropzone"), ...importRows, $("wallet-msg")]),
-    );
-    walletsPanel.append(layout);
-  }
-
-  const historyPanel = $("page-nfts")?.querySelector(":scope > .panel");
-  if (historyPanel && !historyPanel.querySelector(":scope > .operator-history-layout")) {
-    const tables = [...historyPanel.querySelectorAll(":scope > .table-wrap")];
-    const lastRunTitle = [...historyPanel.children].find((node) => node.matches?.("h3"));
-    const layout = document.createElement("div");
-    layout.className = "operator-history-layout";
-    layout.append(
-      createOperatorSurface("operator-history-runs", [$("run-history-cards"), $("run-history-wrap")]),
-      createOperatorSurface("operator-history-wallets", [lastRunTitle, tables.find((node) => node.id !== "run-history-wrap"), $("nfts-export")]),
-    );
-    historyPanel.append(layout);
-  }
-
-  const rpcPanel = $("page-rpcs")?.querySelector(":scope > .panel");
-  if (rpcPanel && !rpcPanel.querySelector(":scope > .operator-rpc-layout")) {
-    const layout = document.createElement("div");
-    layout.className = "operator-rpc-layout";
-    layout.append(
-      createOperatorSurface("operator-rpc-controls", [
-        rpcPanel.querySelector(":scope > .rpc-actions"),
-        rpcPanel.querySelector(":scope > .rpc-net-head"),
-        $("rpc-chain-picker"),
-      ]),
-      createOperatorSurface("operator-rpc-results", [
-        $("rpc-net-wrap"),
-        ...[...rpcPanel.children].filter((node) => node.matches?.(".rpc-subhead, .rpc-url-list, .code")),
-      ]),
-    );
-    rpcPanel.append(layout);
-  }
-
-  $("page-raw")?.querySelector(".raw-layout")?.classList.add("operator-form-workbench");
-  $("page-sweep")?.querySelectorAll(".sweep-pane").forEach((node) => node.classList.add("operator-surface"));
-  $("page-wl")?.querySelector(".wl-layout")?.classList.add("operator-batch-workbench");
-  $("page-multicall")?.querySelector(".settings-section")?.classList.add("operator-call-workbench");
-  $("page-proxies")?.querySelector(":scope > .panel")?.classList.add("operator-access-workbench");
-  $("page-settings")?.querySelector(":scope > .panel")?.classList.add("operator-settings-workbench");
-}
-
-function installPresentationLayout() {
-  Object.entries(PRESENTATION_COPY.en).forEach(([name, [, fallbackDescription]]) => {
-    const page = $("page-" + name);
-    if (!page || page.querySelector(":scope > .presentation-intro")) return;
-    page.classList.add("presentation-page", `presentation-${name}`);
-
-    const directHead = page.querySelector(":scope > .page-subhead");
-    const surface = page.querySelector(":scope > .panel");
-    const panelHead = surface?.querySelector(":scope > .panel-head");
-    const sourceHead = directHead || panelHead;
-    const existingTitle = sourceHead?.querySelector(":scope > h2");
-    const directLead = page.querySelector(":scope > p.muted");
-    const panelLead = surface?.querySelector(":scope > p.muted");
-    const existingLead = directLead || panelLead;
-
-    const intro = document.createElement("header");
-    intro.className = "presentation-intro";
-    const copy = document.createElement("div");
-    const eyebrow = document.createElement("span");
-    eyebrow.className = "presentation-eyebrow";
-    eyebrow.dataset.presentationEyebrow = name;
-    const title = existingTitle || document.createElement("h2");
-    title.dataset.presentationTitle = name;
-    title.textContent = t("page." + name) || name;
-    const description = existingLead || document.createElement("p");
-    description.dataset.presentationDescription = name;
-    if (!existingLead) description.textContent = fallbackDescription;
-    copy.append(eyebrow, title, description);
-    intro.append(copy);
-
-    const actionNodes = sourceHead
-      ? [...sourceHead.children].filter((node) => node !== existingTitle)
-      : [];
-    if (actionNodes.length) {
-      const actions = document.createElement("div");
-      actions.className = "presentation-intro-actions";
-      actions.append(...actionNodes);
-      intro.append(actions);
-    } else {
-      const rule = document.createElement("span");
-      rule.className = "presentation-rule";
-      rule.setAttribute("aria-hidden", "true");
-      intro.append(rule);
-    }
-
-    sourceHead?.remove();
-    page.prepend(intro);
-
-    page.querySelectorAll(":scope > .panel, :scope > .group-card, :scope > .raw-card, :scope > .task-section").forEach((surface) => {
-      surface.classList.add("presentation-surface");
-    });
-  });
-
-  const home = $("page-home");
-  if (home && !home.querySelector(":scope > .presentation-home-grid")) {
-    const launchLabel = home.querySelector(":scope > .section-label");
-    const launchGrid = home.querySelector(":scope > .home-launch-grid");
-    const lastRun = home.querySelector(":scope > .last-run-panel");
-    if (launchLabel && launchGrid && lastRun) {
-      const dashboard = document.createElement("div");
-      dashboard.className = "presentation-home-grid";
-      const launchPanel = document.createElement("section");
-      launchPanel.className = "panel presentation-launch-panel";
-      launchPanel.append(launchLabel, launchGrid);
-      dashboard.append(launchPanel, lastRun);
-      home.append(dashboard);
-    }
-  }
-
-  installRouteCompositions();
-
-  const nav = $("sidebar-nav");
-  if (!nav || nav.dataset.presentationGrouped) return;
-  const groups = [
-    ["Workspace", ["home"]],
-    ["Minting", ["tasks", "raw"]],
-    ["Wallets & funds", ["wallets", "disperse", "sweep"]],
-    ["Network & access", ["rpcs", "proxies", "wl"]],
-    ["Tools", ["multicall", "nfts"]],
-  ];
-  const buttons = new Map([...nav.querySelectorAll(".nav-item[data-page]")].map((button) => [button.dataset.page, button]));
-  nav.replaceChildren(...groups.map(([label, pages]) => {
-    const group = document.createElement("div");
-    group.className = "nav-group";
-    const title = document.createElement("div");
-    title.className = "nav-group-label presentation-nav-label";
-    title.textContent = label;
-    group.append(title, ...pages.map((page) => buttons.get(page)).filter(Boolean));
-    return group;
-  }));
-  nav.dataset.presentationGrouped = "true";
-  refreshPresentationCopy();
-}
-
-function refreshPresentationCopy() {
-  const lang = getLang() === "ru" ? "ru" : "en";
-  const copy = PRESENTATION_COPY[lang];
-  Object.entries(copy).forEach(([name, [eyebrow, fallbackDescription]]) => {
-    const page = $("page-" + name);
-    const eyebrowNode = page?.querySelector(`[data-presentation-eyebrow="${name}"]`);
-    const titleNode = page?.querySelector(`[data-presentation-title="${name}"]`);
-    const descriptionNode = page?.querySelector(`[data-presentation-description="${name}"]`);
-    if (eyebrowNode) eyebrowNode.textContent = eyebrow;
-    if (titleNode) titleNode.textContent = t("page." + name) || name;
-    if (descriptionNode && !descriptionNode.hasAttribute("data-i18n")) {
-      descriptionNode.textContent = fallbackDescription;
-    }
-  });
-
-  const navLabels = lang === "ru"
-    ? ["Рабочее пространство", "Минтинг", "Кошельки и средства", "Сеть и доступ", "Инструменты"]
-    : ["Workspace", "Minting", "Wallets & funds", "Network & access", "Tools"];
-  document.querySelectorAll(".presentation-nav-label").forEach((node, index) => {
-    node.textContent = navLabels[index] || "";
-  });
-
-  const activePage = document.querySelector(".nav-item.active")?.dataset.page;
-  const kicker = $("page-kicker");
-  if (activePage && kicker) kicker.textContent = copy[activePage]?.[0] || PAGE_KICKERS[activePage] || "Workspace";
-}
-
-installPresentationLayout();
-
 function setSidebarOpen(open) {
   const sidebar = $("app-sidebar");
   const backdrop = $("sidebar-backdrop");
@@ -1089,8 +857,7 @@ function showPage(name) {
   const title = $("page-title");
   if (title) title.textContent = t("page." + name) || name;
   const kicker = $("page-kicker");
-  const lang = getLang() === "ru" ? "ru" : "en";
-  if (kicker) kicker.textContent = PRESENTATION_COPY[lang][name]?.[0] || PAGE_KICKERS[name] || "Workspace";
+  if (kicker) kicker.textContent = PAGE_KICKERS[name] || "Workspace";
   setSidebarOpen(false);
 }
 
@@ -1160,6 +927,7 @@ async function loadRunsHistoryFromDisk() {
       .filter((r) => r.slug || r.at);
     if (mintRunHistory.length > 100) mintRunHistory.length = 100;
     runsHistoryLoaded = true;
+    renderHomeDashboard();
     // Restore home "last mint" from newest run if empty
     const home = $("home-last-mint");
     if (home && mintRunHistory.length && home.dataset.hasRun !== "1") {
@@ -1177,6 +945,7 @@ async function loadRunsHistoryFromDisk() {
   } catch (e) {
     console.warn("load_runs_history", e);
     runsHistoryLoaded = true;
+    renderHomeDashboard();
   }
 }
 
@@ -1324,16 +1093,13 @@ armIdleLockListeners();
 $("lang-chip")?.addEventListener("click", () => {
   setLang(getLang() === "en" ? "ru" : "en");
   applyI18n();
-  refreshPresentationCopy();
   const title = $("page-title");
   const active = document.querySelector(".nav-item.active");
   if (title && active?.dataset.page) {
     title.textContent = t("page." + active.dataset.page);
-    const introTitle = $("page-" + active.dataset.page)?.querySelector(
-      ":scope > .presentation-intro h2"
-    );
-    if (introTitle) introTitle.textContent = t("page." + active.dataset.page);
   }
+  if (lastUiStatus) renderHomeStatusStrip(lastUiStatus);
+  else renderHomeDashboard();
   renderWalletsVirtual();
   scheduleMintTableRender();
   if (tasksLoaded) renderTaskList();
@@ -5513,10 +5279,12 @@ async function loadTasksFromDisk() {
     }
     tasksLoaded = true;
     renderTaskList();
+    renderHomeDashboard();
     ensureCountdownTimer();
   } catch (e) {
     console.warn("load_tasks", e);
     tasksLoaded = true;
+    renderHomeDashboard();
   }
 }
 

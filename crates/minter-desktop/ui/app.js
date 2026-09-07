@@ -792,6 +792,10 @@ async function refreshStatus() {
   );
   const proxyCount = s.proxy_count ?? 0;
   const proxyCls = proxyCount > 0 ? "" : "warn";
+  const networkStatusName = $("network-status-name");
+  const networkStatus = $("network-status");
+  if (networkStatusName) networkStatusName.textContent = s.network || "—";
+  if (networkStatus) networkStatus.setAttribute("aria-label", `${s.network || "Network"} — open RPC health`);
   $("status-bar").innerHTML = `
     <span class="sb-cell"><span class="sb-k">${escapeHtml(t("status.wallets") || "Wallets")}</span><span class="sb-v">${s.wallet_count}</span></span>
     <span class="sb-cell"><span class="sb-k">${escapeHtml(t("status.network") || "Network")}</span><span class="sb-v ${rpcCls}">${escapeHtml(s.network || "—")}</span></span>

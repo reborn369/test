@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>MINTER — Interface Concept</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="demo-ribbon">Interactive concept · mock data only</div>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Primary navigation">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+          <div><strong>MINTER</strong><small>Operator console</small></div>
+        </div>
+
+        <nav class="nav" id="main-nav">
+          <div class="nav-section">
+            <span class="nav-label">Workspace</span>
+            <button class="nav-item active" data-route="overview" data-icon="overview"><span>Overview</span></button>
+          </div>
+          <div class="nav-section">
+            <span class="nav-label">Minting</span>
+            <button class="nav-item" data-route="tasks" data-icon="tasks"><span>Mint tasks</span><b class="nav-count">3</b></button>
+            <button class="nav-item" data-route="raw" data-icon="code"><span>Raw mint</span></button>
+          </div>
+          <div class="nav-section">
+            <span class="nav-label">Wallets & funds</span>
+            <button class="nav-item" data-route="wallets" data-icon="wallet"><span>Wallets</span><b class="nav-count">24</b></button>
+            <button class="nav-item" data-route="disperse" data-icon="disperse"><span>Disperse</span></button>
+            <button class="nav-item" data-route="sweep" data-icon="sweep"><span>Sweep</span></button>
+          </div>
+          <div class="nav-section">
+            <span class="nav-label">Network & access</span>
+            <button class="nav-item" data-route="rpcs" data-icon="network"><span>RPC health</span><i class="health-dot"></i></button>
+            <button class="nav-item" data-route="proxies" data-icon="proxy"><span>Proxies</span></button>
+            <button class="nav-item" data-route="wl" data-icon="check"><span>WL check</span></button>
+          </div>
+          <div class="nav-section">
+            <span class="nav-label">Tools</span>
+            <button class="nav-item" data-route="multicall" data-icon="layers"><span>Multicall</span></button>
+            <button class="nav-item" data-route="history" data-icon="history"><span>History</span></button>
+          </div>
+        </nav>
+
+        <div class="sidebar-footer">
+          <button class="nav-item" data-route="settings" data-icon="settings"><span>Settings</span></button>
+          <button class="profile" id="profile-button" aria-label="Open vault menu">
+            <span class="avatar">Q</span><span><strong>Local vault</strong><small>Unlocked · encrypted</small></span><i data-icon="chevron"></i>
+          </button>
+        </div>
+      </aside>
+
+      <section class="workspace">
+        <header class="topbar">
+          <div class="page-identity">
+            <button class="icon-button mobile-menu" id="mobile-menu" aria-label="Toggle menu" data-icon="menu"></button>
+            <div><span id="page-kicker">Workspace</span><h1 id="page-title">Overview</h1></div>
+          </div>
+          <div class="topbar-actions">
+            <button class="command-trigger" id="command-trigger" aria-label="Search or run a command"><i data-icon="search"></i><span>Search or run a command</span><kbd>⌘ K</kbd></button>
+            <div class="network-select">
+              <button id="network-trigger" aria-expanded="false" aria-label="Active network: Ethereum"><i class="network-orb"></i><span id="network-name">Ethereum</span><span id="network-symbol" aria-hidden="true">ETH</span><i data-icon="chevron"></i></button>
+              <div class="popover network-menu hidden" id="network-menu">
+                <span class="popover-label">Active network</span>
+                <button class="network-option selected" data-network="Ethereum" data-symbol="ETH"><i class="network-orb"></i><span><strong>Ethereum</strong><small>12.4 Gwei</small></span><i data-icon="tick"></i></button>
+                <button class="network-option" data-network="Base" data-symbol="BASE"><i class="network-orb base"></i><span><strong>Base</strong><small>0.08 Gwei</small></span><i data-icon="tick"></i></button>
+                <button class="network-option" data-network="Robinhood" data-symbol="RHC"><i class="network-orb robinhood"></i><span><strong>Robinhood</strong><small>0.01 Gwei</small></span><i data-icon="tick"></i></button>
+              </div>
+            </div>
+            <button class="icon-button notification-button" id="notifications-button" aria-label="Notifications" data-icon="bell"><span></span></button>
+          </div>
+        </header>
+
+        <main class="page-container" id="page-content" tabindex="-1"></main>
+      </section>
+    </div>
+
+    <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
+
+    <div class="overlay hidden" id="command-overlay" role="dialog" aria-modal="true" aria-label="Command palette">
+      <div class="command-panel">
+        <div class="command-input"><i data-icon="search"></i><input id="command-input" aria-label="Search pages and actions" placeholder="Jump to a page or run an action…" autocomplete="off" /><kbd>Esc</kbd></div>
+        <div id="command-results" class="command-results"></div>
+        <div class="command-footer"><span><kbd>↑</kbd><kbd>↓</kbd> Navigate</span><span><kbd>↵</kbd> Open</span></div>
+      </div>
+    </div>
+
+    <div class="overlay hidden" id="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div class="modal" id="modal-content"></div>
+    </div>
+
+    <aside class="drawer hidden" id="drawer" aria-label="Details panel"></aside>
+    <div class="drawer-backdrop hidden" id="drawer-backdrop"></div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

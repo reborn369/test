@@ -707,17 +707,17 @@ function shortAddr(a) {
 }
 
 function renderHomeStatusStrip(s) {
-  const strip = $("home-status-strip");
-  if (!strip || !s) return;
-  const vaultCls = s.unlocked ? "ok" : "warn";
-  const rpcCls = s.rpc_ok ? "ok" : "warn";
-  strip.innerHTML = `
-    <div class="home-st-item"><span class="k">Vault</span><span class="v ${vaultCls}">${escapeHtml(s.vault_label)}</span></div>
-    <div class="home-st-item"><span class="k">Wallets</span><span class="v ok">${s.wallet_count}</span></div>
-    <div class="home-st-item"><span class="k">Network</span><span class="v ${rpcCls}">${escapeHtml(s.network || "—")}</span></div>
-    <div class="home-st-item"><span class="k">RPC</span><span class="v ${rpcCls}">${escapeHtml(s.rpc || "—")}</span></div>
-    <div class="home-st-item"><span class="k">Mode</span><span class="v ${s.dry_run ? "ok" : "warn"}">${s.dry_run ? "Dry" : "LIVE"}</span></div>
-  `;
+  if (!s) return;
+  const set = (id, text) => { const node = $(id); if (node) node.textContent = text; };
+  set("home-wallet-count", String(s.wallet_count ?? 0));
+  set("home-wallet-count-meta", t("console.home.vaultState", { state: t(s.unlocked ? "console.home.unlocked" : "console.home.locked") }));
+  set("home-network-name", s.network || "—");
+  set("home-network-meta", s.rpc ? `RPC · ${s.rpc}` : t("console.home.noRpc"));
+  const state = $("home-network-state");
+  if (state) { state.textContent = t(s.rpc_ok ? "console.home.operational" : "console.home.attention"); state.className = `overview-status ${s.rpc_ok ? "ok" : "warn"}`; }
+  const pulse = $("home-network-pulse");
+  if (pulse) pulse.innerHTML = `<div class="overview-network-row"><span><strong>${escapeHtml(s.network || t("console.home.noNetwork"))}</strong><small>${escapeHtml(s.rpc || t("console.home.noRpc"))}</small></span><span class="${s.rpc_ok ? "ok" : "warn"}">${t(s.rpc_ok ? "console.home.available" : "console.home.unavailable")}</span></div>`;
+  renderHomeDashboard();
 }
 
 function renderHomeHistory() {
@@ -727,37 +727,49 @@ function renderHomeHistory() {
   hist.innerHTML = "";
   const runs = mintRunHistory || [];
   if (!runs.length) {
-    if (pre) {
-      pre.classList.remove("hidden");
-      if (pre.dataset.hasRun !== "1") {
-        pre.textContent = t("home.noMint") || "No mint run yet.";
-      }
-    }
+    hist.innerHTML = `<p class="overview-empty">${escapeHtml(t("home.noMint") || "No mint run yet.")}</p>`;
+    if (pre) pre.classList.add("hidden");
     return;
   }
-  if (pre) {
-    // keep detailed last run in pre if session filled it; else use history[0]
-    if (pre.dataset.hasRun !== "1") {
-      const r = runs[0];
-      pre.dataset.hasRun = "1";
-      pre.textContent = [
-        `${r.slug || "run"} · ${r.phase || "—"} · ${r.chain || "—"}`,
-        `ok=${r.confirmed ?? 0} fail=${r.failed ?? 0} dry=${!!r.dryRun} ${r.elapsedMs ?? "—"}ms`,
-      ].join("\n");
-    }
-    pre.classList.remove("hidden");
-  }
-  // up to 3 short rows
   for (const r of runs.slice(0, 3)) {
     const row = document.createElement("div");
-    row.className = "home-history-row";
+    row.className = "overview-activity";
     row.innerHTML = `
-      <span class="hh-main">${escapeHtml(r.slug || "mint")}${r.phase ? " · " + escapeHtml(r.phase) : ""}</span>
-      <span class="hh-meta">${escapeHtml(r.chain || "—")} · ok ${r.confirmed ?? 0}/${(r.confirmed ?? 0) + (r.failed ?? 0)}${r.dryRun ? " · dry" : ""}</span>
+      <span class="overview-activity-icon">✓</span>
+      <span><strong>${escapeHtml(r.slug || "mint")}${r.phase ? " · " + escapeHtml(r.phase) : ""}</strong><small>${escapeHtml(r.chain || "—")} · ${t("console.home.confirmed", { n: r.confirmed ?? 0 })}${r.failed ? ` · ${t("console.home.failed", { n: r.failed })}` : ""}${r.dryRun ? ` · ${t("console.home.dryRun")}` : ""}</small></span>
+      <time>${r.at ? new Date(r.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—"}</time>
     `;
     row.addEventListener("click", () => navigate("nfts"));
     hist.appendChild(row);
   }
+  if (pre) pre.classList.add("hidden");
+}
+
+function renderHomeDashboard() {
+  const tasks = mintTasks || [];
+  const active = tasks.filter((task) => taskDisplayStatus(task) === "running" || taskDisplayStatus(task) === "queued");
+  const confirmed = (mintRunHistory || []).reduce((total, run) => total + (Number(run.confirmed) || 0), 0);
+  const set = (id, text) => { const node = $(id); if (node) node.textContent = text; };
+  set("home-active-tasks", String(active.length));
+  set("home-active-tasks-meta", active.length ? t("console.home.activeMeta", { n: active.length }) : t("console.home.noExecution"));
+  set("home-confirmed-count", String(confirmed));
+  set("home-confirmed-meta", (mintRunHistory || []).length ? t("console.home.runsMeta", { n: (mintRunHistory || []).length }) : t("console.home.noRuns"));
+  const liveLabel = $("home-live-label"); const live = $("home-live-execution");
+  const activeTask = tasks.find((task) => task.id === activeTaskId) || active[0];
+  if (liveLabel) liveLabel.textContent = activeTask ? t("console.home.live") : t("console.home.idle");
+  if (live) live.innerHTML = activeTask ? `<div class="overview-live-summary"><strong>${escapeHtml(activeTask.name || activeTask.slug || t("console.home.mintTask"))}</strong><span>${escapeHtml(activeTask.chainOverride || t("console.home.autoNetwork"))} · ${t("console.home.walletCount", { n: activeTask.wallets?.length || 0 })} · ${escapeHtml(t(`console.home.status.${taskDisplayStatus(activeTask)}`))}</span></div>` : `<p class="overview-empty">${escapeHtml(t("console.home.noActiveExecution"))}</p>`;
+  const queue = $("home-queue");
+  if (queue) {
+    queue.innerHTML = "";
+    const queued = tasks.filter((task) => task !== activeTask).slice(0, 5);
+    if (!queued.length) queue.innerHTML = `<tr><td colspan="5" class="overview-empty-cell">${escapeHtml(t("console.home.noQueuedTasks"))}</td></tr>`;
+    for (const task of queued) {
+      const display = taskDisplayStatus(task); const row = document.createElement("tr");
+      row.innerHTML = `<td>${escapeHtml(task.name || task.slug || t("console.home.untitledTask"))}</td><td>${escapeHtml(task.chainOverride || t("console.home.auto"))}</td><td>${task.wallets?.length || 0}</td><td>${escapeHtml(task.atTime || t("console.home.manual"))}</td><td><span class="overview-status ${display === "ready" ? "ok" : display === "error" || display === "blocked" ? "warn" : ""}">${escapeHtml(t(`console.home.status.${display}`))}</span></td>`;
+      row.addEventListener("click", () => navigate("tasks")); queue.appendChild(row);
+    }
+  }
+  renderHomeHistory();
 }
 
 async function refreshStatus() {
@@ -780,6 +792,10 @@ async function refreshStatus() {
   );
   const proxyCount = s.proxy_count ?? 0;
   const proxyCls = proxyCount > 0 ? "" : "warn";
+  const networkStatusName = $("network-status-name");
+  const networkStatus = $("network-status");
+  if (networkStatusName) networkStatusName.textContent = s.network || "—";
+  if (networkStatus) networkStatus.setAttribute("aria-label", `${s.network || "Network"} — open RPC health`);
   $("status-bar").innerHTML = `
     <span class="sb-cell"><span class="sb-k">${escapeHtml(t("status.wallets") || "Wallets")}</span><span class="sb-v">${s.wallet_count}</span></span>
     <span class="sb-cell"><span class="sb-k">${escapeHtml(t("status.network") || "Network")}</span><span class="sb-v ${rpcCls}">${escapeHtml(s.network || "—")}</span></span>
@@ -915,6 +931,7 @@ async function loadRunsHistoryFromDisk() {
       .filter((r) => r.slug || r.at);
     if (mintRunHistory.length > 100) mintRunHistory.length = 100;
     runsHistoryLoaded = true;
+    renderHomeDashboard();
     // Restore home "last mint" from newest run if empty
     const home = $("home-last-mint");
     if (home && mintRunHistory.length && home.dataset.hasRun !== "1") {
@@ -932,6 +949,7 @@ async function loadRunsHistoryFromDisk() {
   } catch (e) {
     console.warn("load_runs_history", e);
     runsHistoryLoaded = true;
+    renderHomeDashboard();
   }
 }
 
@@ -1084,6 +1102,8 @@ $("lang-chip")?.addEventListener("click", () => {
   if (title && active?.dataset.page) {
     title.textContent = t("page." + active.dataset.page);
   }
+  if (lastUiStatus) renderHomeStatusStrip(lastUiStatus);
+  else renderHomeDashboard();
   renderWalletsVirtual();
   scheduleMintTableRender();
   if (tasksLoaded) renderTaskList();
@@ -5263,10 +5283,12 @@ async function loadTasksFromDisk() {
     }
     tasksLoaded = true;
     renderTaskList();
+    renderHomeDashboard();
     ensureCountdownTimer();
   } catch (e) {
     console.warn("load_tasks", e);
     tasksLoaded = true;
+    renderHomeDashboard();
   }
 }
 
@@ -7133,6 +7155,7 @@ function applyMintSummary(summary) {
   if (mintRunHistory.length > 100) mintRunHistory.length = 100;
   scheduleSaveRunsHistory();
   renderNftsPage();
+  renderHomeDashboard();
   const home = $("home-last-mint");
   if (home) {
     home.dataset.hasRun = "1";
@@ -7269,6 +7292,7 @@ function setMintUiRunning(running) {
   }
   syncMissionControlActions();
   renderTaskList();
+  renderHomeDashboard();
 }
 
 $("btn-mint-stop")?.addEventListener("click", () => requestCancelMint());
